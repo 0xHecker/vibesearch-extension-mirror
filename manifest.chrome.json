@@ -5,6 +5,11 @@
   },
   "host_permissions": [
     "https://huggingface.co/*",
+    "https://vibesearch-api.watermelons.workers.dev/*",
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://*.reddit.com/*",
+    "https://www.instagram.com/*",
     "https://metadata-worker.watermelons.workers.dev/*",
     "https://meta.vibesearch.app/*",
     "https://share-worker.watermelons.workers.dev/*",

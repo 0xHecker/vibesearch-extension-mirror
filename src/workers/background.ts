@@ -36,6 +36,29 @@ import type {
 } from "@src/services/browser-bookmark-import";
 import type { GitHubStar, GitHubStarsImportResult } from "@src/services/github-stars-import";
 import { collectGitHubStarsPages } from "@src/services/github-stars-api";
+import { captureSingleFileSnapshot } from "@src/content/capture-snapshot";
+import type { CaptureSnapshotOptions, CaptureSnapshotResult } from "@src/content/capture-snapshot";
+import { uploadArchiveSnapshot, ArchiveAuthError } from "@src/services/archive.service";
+import { pushSingleItem, type CapturedItem } from "@src/services/cloud-sync.service";
+import {
+  connect as connectConnector,
+  disconnect as disconnectConnector,
+  syncConnector,
+  syncAllConnected,
+  cancelConnectorSync,
+  listConnectors,
+  setAutoSync as setConnectorAutoSync,
+  setupConnectorScheduler,
+  onConnectorAlarm,
+  CONNECTOR_SYNC_ALARM,
+} from "@src/services/connectors/registry";
+import {
+  signInWithGoogle,
+  signInWithTestCredentials,
+  signOutCloud,
+  getCloudAccount,
+} from "@src/services/cloud-auth.service";
+import type { ConnectorPlatform } from "@src/services/connectors/types";
 
 const SYNC_ALARM_NAME = "vector-sync-alarm";
 const EMBEDDING_ALARM_NAME = "embedding-alarm";
@@ -82,6 +105,7 @@ const MENU_SAVE_VIDEO_ID = "vs:save:video";
 const MENU_SAVE_LINK_ID = "vs:save:link";
 const MENU_SAVE_SELECTION_ID = "vs:save:selection";
 const MENU_SAVE_PAGE_ID = "vs:save:page";
+const MENU_SAVE_SNAPSHOT_ID = "vs:save:snapshot";
 const MENU_EXTRACT_TEXT_ID = "vs:extract:text";
 // Screenshot actions
 const MENU_SHOT_VISIBLE_ID = "vs:shot:visible";
@@ -2632,6 +2656,12 @@ const refreshContextMenus = async () => {
       contexts: [chrome.contextMenus.ContextType.PAGE, chrome.contextMenus.ContextType.FRAME] 
     });
     await add({
+      id: MENU_SAVE_SNAPSHOT_ID,
+      parentId: MENU_ROOT_ID,
+      title: "Archive full-page snapshot",
+      contexts: [chrome.contextMenus.ContextType.PAGE, chrome.contextMenus.ContextType.FRAME],
+    });
+    await add({
       id: MENU_IMPORT_SHARED_ID,
       parentId: MENU_ROOT_ID,
       title: "Import shared VibeSearch link",
@@ -2893,6 +2923,12 @@ const runImportAction = async (
   await recordFolderToLru(folderId, spaceId, autoFolderName(context, target.mode));
   sendProcessStatus(job.id, job.label, "success", "Imported.");
   scheduleContextMenuRefresh("low");
+
+  // Quick-saving the page you're on → auto-archive it + sync to the web app
+  // (best-effort, non-blocking; only when the saved URL is the current tab).
+  if (target.mode === "save" && isArchivableTab(tab) && sameUrl(prepared.primaryUrl, tab?.url)) {
+    void autoArchiveAndSyncSave(inserted, tab, context);
+  }
 
   const savedActions = [
     { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl } },
@@ -3238,6 +3274,197 @@ setInterval(() => {
   }
 }, 60 * 1000).unref?.();
 
+const formatArchiveBytes = (bytes: number): string => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 KB";
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+};
+
+const isArchivableTab = (tab?: chrome.tabs.Tab): boolean =>
+  typeof tab?.id === "number" && /^https?:\/\//i.test(tab?.url || "");
+
+/**
+ * Ensure the current tab exists as a saved item and return its id, reusing the
+ * exact quick-save create flow (prepareImportContent → addToFolder) so an
+ * archived page looks like any other saved item.
+ */
+const ensureTabSavedAsItem = async (
+  context: ImportClickContext,
+  tab: chrome.tabs.Tab | undefined,
+  job: { id: string; label: string }
+): Promise<{ itemId: string; primaryUrl: string }> => {
+  const target: ImportTarget = { mode: "save", spaceId: PUBLIC_SPACE_ID };
+  const prepared = await prepareImportContent(target, context, tab, job);
+  const { folderId, spaceId } = await resolveQuickSaveTarget(target, context, "save");
+  const inserted = await sendForwardedToOffscreen<ItemDocType>({
+    service: "items",
+    type: "addToFolder",
+    payload: toItemPayload({
+      id: prepared.itemId,
+      context,
+      mode: "save",
+      primaryUrl: prepared.primaryUrl,
+      folderId,
+      parentId: null,
+      title: prepared.title,
+      textContent: prepared.textContent,
+      source: prepared.source,
+      iconUrl: prepared.iconUrl,
+      media: prepared.media,
+      displayImageUrl: prepared.displayImageUrl,
+      shouldFetchMetadata: prepared.shouldFetchMetadata,
+      isMetaFetched: prepared.isMetaFetched,
+      deferBackgroundProcessing: false,
+    }),
+  });
+  await recordFolderToLru(folderId, spaceId, autoFolderName(context, "save"));
+  return { itemId: inserted.id, primaryUrl: prepared.primaryUrl };
+};
+
+/** Loosely compare two URLs (ignore hash + trailing slash) — "is this the same page?". */
+const sameUrl = (a?: string, b?: string): boolean => {
+  if (!a || !b) return false;
+  const norm = (u: string) => u.split("#")[0].replace(/\/+$/, "").toLowerCase();
+  return norm(a) === norm(b);
+};
+
+/** Map a saved local item to the neutral shape the cloud push expects. */
+const itemDocToCaptured = (item: ItemDocType): CapturedItem => ({
+  externalId: `save:${item.id}`,
+  url: item.url,
+  title: item.title || item.url,
+  textContent: item.textContent || "",
+  source: (item.source as string) || "web",
+  type: ["twitter", "reddit", "instagram", "tiktok", "linkedin", "substack"].includes((item.source as string) || "")
+    ? "social"
+    : (item.media || []).some((m) => m.type === "video")
+      ? "video"
+      : (item.media || []).some((m) => m.type === "image")
+        ? "image"
+        : "link",
+  authorUsername: item.authorUsername,
+  media: (item.media || [])
+    .map((m) => ({ type: m.type, url: m.s3Url || m.originalUrl || "", thumbnailUrl: m.thumbnailUrl }))
+    .filter((m) => !!m.url),
+  folderId: item.folderId,
+  fields: { externalId: `save:${item.id}`, savedFrom: "extension-quicksave" },
+});
+
+/**
+ * Quick-saving the page you're on → also forward it to the web app AND store a
+ * full self-contained snapshot against the cloud item. Best-effort + non-blocking:
+ * a signed-out user still gets the normal local save (with a gentle hint).
+ */
+const autoArchiveAndSyncSave = async (
+  item: ItemDocType,
+  tab: chrome.tabs.Tab | undefined,
+  context: ImportClickContext
+): Promise<void> => {
+  const job = { id: `autosync-${item.id}`, label: `Sync & archive • ${pickHostLabel(context)}` };
+  try {
+    sendProcessStatus(job.id, job.label, "processing", "Syncing this page to Vibesearch…");
+    const cloud = await pushSingleItem(itemDocToCaptured(item));
+    if (!cloud) {
+      sendProcessStatus(job.id, job.label, "success", "Saved locally. Sign in to Vibesearch to sync + archive to the cloud.");
+      return;
+    }
+    sendProcessStatus(job.id, job.label, "processing", "Archiving a full, offline copy…");
+    const capture = await executeScriptInTab<CaptureSnapshotResult>(tab, captureSingleFileSnapshot, [
+      { capturedAtIso: new Date(context.capturedAt || Date.now()).toISOString() },
+    ]).catch(() => null);
+    if (capture?.html) {
+      await uploadArchiveSnapshot(cloud.id, capture.html);
+      sendProcessStatus(job.id, job.label, "success", "Synced + archived to Vibesearch.");
+    } else {
+      sendProcessStatus(job.id, job.label, "success", "Synced to Vibesearch (full snapshot skipped).");
+    }
+  } catch {
+    sendProcessStatus(job.id, job.label, "success", "Saved locally; cloud sync will retry later.");
+  }
+};
+
+/**
+ * First-class archive path: save the tab as an item, capture the live DOM as a
+ * single self-contained HTML file inside the tab, then upload it to the cloud
+ * archive API. Robust by design — a single failed resource never aborts the
+ * capture, and every failure mode degrades to a friendly toast + status.
+ */
+const runArchiveSnapshotAction = async (
+  context: ImportClickContext,
+  tab?: chrome.tabs.Tab
+): Promise<void> => {
+  const job = {
+    id: `archive-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    label: `Archive • ${pickHostLabel(context)}`,
+  };
+
+  if (!isArchivableTab(tab)) {
+    sendProcessStatus(
+      job.id,
+      job.label,
+      "error",
+      "This page can't be archived. Open a normal web page (http/https) and try again."
+    );
+    await showBrandedToast(tab, "This page can't be archived");
+    return;
+  }
+
+  sendProcessStatus(job.id, job.label, "processing", "Capturing the full page…");
+  try {
+    // 1) Capture the live rendered DOM as ONE self-contained HTML file and
+    //    download it locally. This is the first-class path and needs no account.
+    const hostLabel = pickHostLabel(context) || "page";
+    const stamp = new Date(context.capturedAt || Date.now()).toISOString().slice(0, 10);
+    const downloadFilename = `${hostLabel.replace(/[^a-z0-9.-]+/gi, "-").slice(0, 60) || "page"}-${stamp}.html`;
+    const captureOptions: CaptureSnapshotOptions = {
+      capturedAtIso: new Date(context.capturedAt || Date.now()).toISOString(),
+      downloadFilename,
+    };
+    const capture = await executeScriptInTab<CaptureSnapshotResult>(
+      tab,
+      captureSingleFileSnapshot,
+      [captureOptions]
+    );
+    if (!capture || !capture.html) {
+      throw new Error(capture?.error || "Could not capture this page.");
+    }
+    const sizeLabel = formatArchiveBytes(capture.byteSize);
+    const trunc = capture.truncated ? " Some very large media was skipped to stay within limits." : "";
+
+    // 2) Best-effort cloud sync to R2 (needs a signed-in, cloud-synced item).
+    //    Never blocks the local export; failures degrade quietly.
+    let cloud = false;
+    let cloudHint = "";
+    try {
+      const { itemId } = await ensureTabSavedAsItem(context, tab, job);
+      sendProcessStatus(job.id, job.label, "processing", `Syncing to the cloud (${sizeLabel})…`);
+      await uploadArchiveSnapshot(itemId, capture.html);
+      cloud = true;
+    } catch (err) {
+      if (err instanceof ArchiveAuthError) cloudHint = " Sign in to Vibesearch to also keep it in the cloud.";
+    }
+
+    const detail = cloud
+      ? `Archived (${sizeLabel}) — saved to your downloads and synced to the cloud.${trunc}`
+      : `Saved a full, self-contained HTML copy (${sizeLabel}) to your downloads.${cloudHint}${trunc}`;
+    sendProcessStatus(job.id, job.label, "success", detail);
+    await showBrandedToast(
+      tab,
+      cloud ? "Page archived + synced" : "Saved a full-page HTML copy",
+      [{ label: "Open", action: "OPEN_SEARCH" }],
+      4000
+    );
+    scheduleContextMenuRefresh("low");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Archiving failed.";
+    sendProcessStatus(job.id, job.label, "error", detail);
+    await showBrandedToast(tab, `Couldn't archive this page: ${detail}`);
+  }
+};
+
 const runTargetAction = async (
   target: ImportTarget,
   context: ImportClickContext,
@@ -3545,6 +3772,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
       await importSharedLink(sharedUrl, PUBLIC_SPACE_ID);
       return;
     }
+
+    // Full-page offline archive (self-contained, highest-fidelity snapshot).
+    if (menuId === MENU_SAVE_SNAPSHOT_ID) {
+      await runArchiveSnapshotAction(context, tab);
+      return;
+    }
     
     // Content-aware primary actions (instant save to Public/auto-folder)
     if (menuId === MENU_SAVE_IMAGE_ID || menuId === MENU_SAVE_VIDEO_ID || 
@@ -3604,6 +3837,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(SYNC_ALARM_NAME, { periodInMinutes: 6 * 60 });
   chrome.alarms.create(EMBEDDING_ALARM_NAME, { periodInMinutes: 5 });
   chrome.alarms.create(METADATA_RETRY_ALARM_NAME, { periodInMinutes: 30 });
+  void setupConnectorScheduler();
   void retryStoredFailedMetadataUrls().catch(() => {});
   scheduleContextMenuRefresh("high");
 });
@@ -3639,6 +3873,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       });
     } else if (alarm.name === METADATA_RETRY_ALARM_NAME) {
       await retryStoredFailedMetadataUrls();
+    } else if (alarm.name === CONNECTOR_SYNC_ALARM) {
+      await onConnectorAlarm();
     } else if (alarm.name === "opfs-promote-alarm") {
       triggerOpfsPromotion();
     }
@@ -3925,6 +4161,143 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await runImportAction({ mode: "save", spaceId: PUBLIC_SPACE_ID }, context, tab);
     })();
     return;
+  }
+
+  if (message?.target === "background" && message?.type === "QUICK_ARCHIVE_PAGE") {
+    void (async () => {
+      const tab = await getActiveTab();
+      if (!tab?.id) return;
+      const context = collectContextFromTab(tab);
+      await runArchiveSnapshotAction(context, tab);
+    })();
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "RUN_CONNECTOR_SYNC") {
+    const source = String(message?.payload?.source || "");
+    const LABELS: Record<string, string> = { x: "X (Twitter)", reddit: "Reddit", instagram: "Instagram" };
+    const nice = LABELS[source] || "connectors";
+    void (async () => {
+      const job = { id: `connector-${source || "all"}-${Date.now()}`, label: `Sync • ${nice}` };
+      const report = (detail: string) => {
+        console.log(`[Vibesearch · Sync${source ? " · " + nice : ""}] ${detail}`);
+        sendProcessStatus(job.id, job.label, "processing", detail);
+      };
+      report(source ? `Connecting to ${nice}…` : "Syncing your connected accounts…");
+      try {
+        if (source) {
+          const state = await connectConnector(source as ConnectorPlatform);
+          const who = state.handle.startsWith("id:") ? "your account" : `@${state.handle}`;
+          report(`Connected as ${who}. Reading your saved items…`);
+          const r = await syncConnector(source as ConnectorPlatform, state.accountId, report);
+          sendProcessStatus(
+            job.id,
+            job.label,
+            r.error ? "error" : "success",
+            r.error
+              ? r.error
+              : r.cancelled
+                ? `${who}: cancelled — ${r.pushed} synced before stopping.`
+                : r.fetched === 0
+                  ? `${who}: already up to date — nothing new to sync.`
+                  : `${who}: ${r.pushed} new item${r.pushed === 1 ? "" : "s"} synced${r.skipped ? `, ${r.skipped} already saved` : ""}${r.failed ? `, ${r.failed} failed` : ""}.`,
+          );
+        } else {
+          const results = await syncAllConnected(report);
+          const pushed = results.reduce((n, r) => n + r.pushed, 0);
+          sendProcessStatus(job.id, job.label, "success", `Synced ${results.length} account${results.length === 1 ? "" : "s"} — ${pushed} new item${pushed === 1 ? "" : "s"} to Vibesearch.`);
+        }
+        sendResponse({ ok: true });
+      } catch (err) {
+        if (err instanceof ArchiveAuthError) {
+          sendProcessStatus(job.id, job.label, "error", "Sign in to Vibesearch to sync connectors to the cloud.");
+        } else {
+          sendProcessStatus(job.id, job.label, "error", err instanceof Error ? err.message : "Sync failed.");
+        }
+        sendResponse({ ok: false });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CANCEL_CONNECTOR_SYNC") {
+    const source = String(message?.payload?.source || "");
+    if (source) cancelConnectorSync(source as ConnectorPlatform);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CONNECTOR_LIST") {
+    void (async () => sendResponse({ ok: true, connectors: await listConnectors() }))().catch(() =>
+      sendResponse({ ok: false, connectors: [] }),
+    );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CONNECTOR_CONNECT") {
+    void (async () => {
+      try {
+        const state = await connectConnector(String(message?.payload?.platform) as ConnectorPlatform);
+        sendResponse({ ok: true, state });
+      } catch (err) {
+        sendResponse({ ok: false, error: err instanceof Error ? err.message : "Connect failed." });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CONNECTOR_DISCONNECT") {
+    void (async () => {
+      await disconnectConnector(
+        String(message?.payload?.platform) as ConnectorPlatform,
+        String(message?.payload?.accountId),
+      );
+      sendResponse({ ok: true });
+    })().catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CONNECTOR_SET_AUTOSYNC") {
+    void (async () => {
+      await setConnectorAutoSync(
+        String(message?.payload?.platform) as ConnectorPlatform,
+        String(message?.payload?.accountId),
+        !!message?.payload?.on,
+      );
+      sendResponse({ ok: true });
+    })().catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_STATUS") {
+    void (async () => sendResponse({ ok: true, account: await getCloudAccount() }))().catch(() =>
+      sendResponse({ ok: false, account: null }),
+    );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_SIGN_IN") {
+    void (async () => {
+      try {
+        const mode = message?.payload?.mode;
+        const session =
+          mode === "test"
+            ? await signInWithTestCredentials(String(message?.payload?.email), String(message?.payload?.password))
+            : await signInWithGoogle(true);
+        sendResponse({ ok: true, account: { uid: session.uid, email: session.email } });
+      } catch (err) {
+        sendResponse({ ok: false, error: err instanceof Error ? err.message : "Sign-in failed." });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_SIGN_OUT") {
+    void (async () => {
+      await signOutCloud();
+      sendResponse({ ok: true });
+    })().catch(() => sendResponse({ ok: false }));
+    return true;
   }
 
   if (message?.target === "background" && message?.type === "QUICK_SCREENSHOT") {

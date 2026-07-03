@@ -6,6 +6,7 @@ import { showErrorToast, showSuccessToast } from "@src/utils/toast-feedback";
 import { getGoogleAccessToken, clearGoogleAccessToken } from "@src/services/google-auth";
 import { SectionHeading, SettingGroup, SettingRow } from "../SettingsPrimitives";
 import { GitHubIcon, GoogleIcon } from "../BrandIcons";
+import { SocialConnectors } from "./SocialConnectors";
 
 /** chrome.storage.local key for the persisted GitHub personal access token. */
 export const GITHUB_TOKEN_STORAGE_KEY = "vibesearch:githubToken";
@@ -196,6 +197,8 @@ export function TokensSection() {
           )}
         </SettingRow>
       </SettingGroup>
+
+      <SocialConnectors />
     </div>
   );
 }

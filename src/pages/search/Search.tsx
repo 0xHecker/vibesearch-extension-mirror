@@ -324,11 +324,8 @@ const SearchInner = () => {
   const [githubStarsImporting, setGithubStarsImporting] = useState(false);
   const [githubStarsError, setGithubStarsError] = useState<string | null>(null);
 
-  // Warn before a reload/close interrupts an in-progress bulk import. The write
-  // itself runs in the offscreen document and survives a reload, but reloading
-  // drops this page's progress UI and closing the tab can interrupt in-flight
-  // writes and the background metadata pass.
-  useBeforeUnloadGuard(browserBookmarksImporting || githubStarsImporting);
+  // Warn before a reload/close interrupts in-progress background work. The guard
+  // is installed below (see `hasBackgroundProcessing`), once that state is known.
   const [folders, setFolders] = useState<FolderDocType[]>([]);
   const [binSpaces, setBinSpaces] = useState<SpaceListItem[]>([]);
   const [items, setItems] = useState<ItemDocType[]>([]);
@@ -448,6 +445,12 @@ const SearchInner = () => {
     () => processStatuses.some((status) => status.state === "processing" && status.id !== "search-query"),
     [processStatuses]
   );
+
+  // Warn before a reload/close interrupts in-progress background work (imports,
+  // connector syncs, archiving). The work runs in the service worker and largely
+  // survives, but closing the tab drops this progress UI and can interrupt
+  // in-flight uploads.
+  useBeforeUnloadGuard(browserBookmarksImporting || githubStarsImporting || hasBackgroundProcessing);
 
   const upsertProcessStatus = useCallback((status: SearchProcessStatusItem) => {
     setProcessStatusById((prev) => {

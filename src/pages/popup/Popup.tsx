@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
 import { Checkbox } from "@src/components/ui/checkbox";
-import { ArrowRight, Bookmark, Globe, Camera, Crop, FileText, Zap } from "lucide-react";
+import { ArrowRight, Archive, Bookmark, Globe, Camera, Crop, FileText, Zap } from "lucide-react";
 import { 
   SiInstagram, 
   SiX, 
@@ -930,6 +930,13 @@ const SaveTabsPopup = () => {
     window.close();
   };
 
+  const quickArchive = async () => {
+    try {
+      await chrome.runtime.sendMessage({ target: "background", type: "QUICK_ARCHIVE_PAGE" });
+    } catch {}
+    window.close();
+  };
+
   const savePastedUrl = async () => {
     const trimmed = pastedUrl.trim();
     if (!trimmed) return;
@@ -1035,6 +1042,28 @@ const SaveTabsPopup = () => {
           </button>
         ))}
       </div>
+
+      <button
+        type="button"
+        onClick={() => void quickArchive()}
+        className="group mt-2 flex w-full items-center gap-3 rounded-lg border border-border-accent-faded bg-gradient-to-r from-accent-faded to-background-neutral px-3 py-2.5 text-left transition-all hover:border-border-accent hover:to-accent-faded active:scale-[0.98]"
+      >
+        <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-accent-faded text-accent transition-transform group-hover:scale-105">
+          <Archive size={16} />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-xs font-sans-bold tracking-[-0.01em] text-foreground-neutral">
+            Archive this page
+          </span>
+          <span className="block text-[11px] text-foreground-secondary">
+            Save a full, self-contained offline copy
+          </span>
+        </span>
+        <ArrowRight
+          size={15}
+          className="shrink-0 text-foreground-tertiary transition-transform group-hover:translate-x-0.5 group-hover:text-accent"
+        />
+      </button>
 
       <div className="mt-3 flex items-center gap-2">
         <input
