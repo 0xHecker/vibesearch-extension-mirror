@@ -30,7 +30,7 @@ const collection = <T,>(rows: T[]) => ({
   }),
   findOne: (query: any) => ({
     exec: async () => {
-m      if (typeof query === "string") {
+      if (typeof query === "string") {
         const found = rows.find((row: any) => row.id === query);
         return found ? doc(found) : null;
       }
