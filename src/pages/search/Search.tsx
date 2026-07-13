@@ -1511,7 +1511,7 @@ const SearchInner = () => {
       }, 0);
       setBrowserBookmarksDialogOpen(false);
       showSuccessToast(
-        `${result.bookmarkCount.toLocaleString()} bookmarks synced across ${result.spaceIds.length.toLocaleString()} spaces.`,
+        `${result.bookmarkCount.toLocaleString()} bookmarks imported across ${result.spaceIds.length.toLocaleString()} spaces.`,
         { id: toastId }
       );
     } catch (importError) {
@@ -1526,7 +1526,7 @@ const SearchInner = () => {
   const importGitHubStars = useCallback(async () => {
     setGithubStarsError(null);
     setGithubStarsImporting(true);
-    const toastId = showLoadingToast("Syncing GitHub stars — keep this tab open…");
+    const toastId = showLoadingToast("Importing GitHub stars — keep this tab open…");
     try {
       const response = await chrome.runtime.sendMessage({
         target: "background",
@@ -1544,7 +1544,7 @@ const SearchInner = () => {
       setGithubStarsDialogOpen(false);
       setRefreshToken((value) => value + 1);
       showSuccessToast(
-        `${result.importedCount.toLocaleString()} GitHub stars synced across ${result.spaceIds.length.toLocaleString()} spaces.`,
+        `${result.importedCount.toLocaleString()} GitHub stars imported across ${result.spaceIds.length.toLocaleString()} spaces.`,
         { id: toastId }
       );
     } catch (importError) {

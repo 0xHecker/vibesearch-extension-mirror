@@ -10,6 +10,7 @@
     "https://share-worker.watermelons.workers.dev/*",
     "https://share.watermelons.workers.dev/*",
     "https://share.vibesearch.app/*",
+    "https://vibesearch-api.watermelons.workers.dev/*",
     "https://bucket.vibesearch.app/*",
     "https://preview-bucket.vibesearch.app/*",
     "https://accounts.google.com/*",

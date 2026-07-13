@@ -13,6 +13,8 @@ import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordin
 import { queryRankerService } from "@src/services/query-ranker.service";
 import { browserBookmarkImportService } from "@src/services/browser-bookmark-import";
 import { githubStarsImportService } from "@src/services/github-stars-import";
+import { cloudSyncService } from "@src/services/cloud-sync";
+import { cloudAuthService } from "@src/services/cloud-auth";
 import { ocrService, OCR_MODEL_VERSION } from "@src/services/ocr.service";
 import {
   isEmbeddingStateOnlyItemChange,
@@ -216,6 +218,9 @@ const ocrController = {
 };
 
 const browserBookmarkImportController = {
+  async hasImported() {
+    return browserBookmarkImportService.hasImported();
+  },
   async importTree(payload: Parameters<typeof browserBookmarkImportService.importTree>[0]) {
     dbChangeSuppressionDepth += 1;
     try {
@@ -247,6 +252,30 @@ const githubStarsImportController = {
   },
 };
 
+const cloudSyncController = {
+  async status() {
+    return cloudSyncService.status();
+  },
+  async drain(payload: Parameters<typeof cloudSyncService.drain>[0]) {
+    return cloudSyncService.drain(payload);
+  },
+  async pushItem(payload: { itemId?: string }) {
+    return cloudSyncService.pushItem(typeof payload?.itemId === "string" ? payload.itemId : "");
+  },
+};
+
+const cloudAuthController = {
+  async status(payload?: { refresh?: boolean }) {
+    return cloudAuthService.status(payload);
+  },
+  async connect() {
+    return cloudAuthService.connect();
+  },
+  async disconnect() {
+    return cloudAuthService.disconnect();
+  },
+};
+
 // Register all the services that the offscreen document will manage.
 router.registerService("dbManager", databaseManager, {
   methods: [
@@ -263,10 +292,16 @@ router.registerService("dbManager", databaseManager, {
   ],
 });
 router.registerService("browserBookmarks", browserBookmarkImportController, {
-  methods: ["importTree"],
+  methods: ["hasImported", "importTree"],
 });
 router.registerService("githubStars", githubStarsImportController, {
   methods: ["importStars"],
+});
+router.registerService("cloudSync", cloudSyncController, {
+  methods: ["status", "drain", "pushItem"],
+});
+router.registerService("cloudAuth", cloudAuthController, {
+  methods: ["status", "connect", "disconnect"],
 });
 router.registerService("sync", syncService, {
   methods: ["rebuildAndCompact"],

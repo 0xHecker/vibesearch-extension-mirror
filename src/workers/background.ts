@@ -39,10 +39,39 @@ import type {
   BrowserBookmarkImportResult,
   BrowserBookmarkNode,
 } from "@src/services/browser-bookmark-import";
+import {
+  BROWSER_BOOKMARK_RESYNC_ALARM_NAME,
+  BrowserBookmarkResyncScheduler,
+} from "@src/services/browser-bookmark-resync";
+import {
+  CLOUD_SYNC_CONTINUATION_DELAY_MS,
+  shouldScheduleCloudSyncContinuation,
+} from "@src/services/cloud-sync-continuation";
+import {
+  ARCHIVE_OUTBOX_ALARM_NAME,
+  ARCHIVE_OUTBOX_DRAIN_LIMIT,
+  ArchiveOutbox,
+  createChromeArchiveOutboxStorage,
+  createOpfsArchiveOutboxFiles,
+} from "@src/services/archive-outbox";
+import { ArchiveCaptureSessionManager } from "@src/services/archive-capture-session";
+import {
+  PAGE_ARCHIVE_ABORT_MESSAGE,
+  PAGE_ARCHIVE_CAPTURE_MESSAGE,
+  PAGE_ARCHIVE_CAPTURE_TIMEOUT_MS,
+  PAGE_ARCHIVE_CHUNK_CODE_UNITS,
+  PAGE_ARCHIVE_CHUNK_MESSAGE,
+  PAGE_ARCHIVE_FINISH_MESSAGE,
+  type ArchiveProtocolResponse,
+} from "@src/services/archive-capture-protocol";
+import { CLOUD_SYNC_TOKEN_KEY } from "@src/services/cloud-sync";
 import type { GitHubStar, GitHubStarsImportResult } from "@src/services/github-stars-import";
 import { collectGitHubStarsPages } from "@src/services/github-stars-api";
 
 const SYNC_ALARM_NAME = "vector-sync-alarm";
+const CLOUD_SYNC_ALARM_NAME = "cloud-sync-alarm";
+const CLOUD_SYNC_CONTINUATION_ALARM_NAME = "cloud-sync-continuation";
+const ARCHIVE_OUTBOX_RETRY_ALARM_NAME = "archive-outbox-retry";
 const EMBEDDING_ALARM_NAME = "embedding-alarm";
 const METADATA_RETRY_ALARM_NAME = "metadata-retry-alarm";
 const FORCE_DEV_OFFSCREEN_RESET = (import.meta as any)?.env?.VITE_FORCE_DEV_OFFSCREEN_RESET === "1";
@@ -66,6 +95,7 @@ const INTERNAL_ONLY_OFFSCREEN_METHODS = new Set<string>(["items:saveFetchedMetad
 const IMPORT_SETTINGS_KEY = "vs_import_settings_v1";
 const IMPORT_DRAFTS_KEY = "vs_import_drafts_v1";
 const IMPORT_LRU_FOLDERS_KEY = "vs_import_lru_folders_v1";
+const BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY = "vibesearch:browserBookmarkAutoSyncEnabled:v1";
 const IMPORT_LRU_MAX = 5;
 const IMPORT_MAX_DRAFTS = 24;
 const IMPORT_FAILED_ATTEMPTS_MAX = 20;
@@ -171,6 +201,8 @@ type PreparedImportContent = {
   tags: string[];
   shouldFetchMetadata: boolean;
   isMetaFetched: boolean;
+  archiveUrl?: string;
+  liveArchiveUrl?: string;
 };
 
 type ScreenshotRegionSelection = {
@@ -231,6 +263,8 @@ type ImportDraft = {
   ocrSourceHash?: string;
   shouldFetchMetadata?: boolean;
   isMetaFetched?: boolean;
+  archiveUrl?: string;
+  liveArchiveUrl?: string;
   context: ImportClickContext;
   target: { spaceId: string; folderId?: string; parentId?: string | null; newFolderName?: string };
 };
@@ -648,6 +682,152 @@ const sendForwardedToOffscreen = async <T = unknown>(request: {
   return response.payload as T;
 };
 
+type CloudSyncPushItemResponse = {
+  ready?: boolean;
+  reason?: string;
+};
+
+const archiveOutboxFiles = createOpfsArchiveOutboxFiles();
+const archiveOutbox = new ArchiveOutbox({
+  storage: createChromeArchiveOutboxStorage(),
+  files: archiveOutboxFiles,
+  ensureItem: async (itemId) => {
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      return { ready: false, reason: "OFFLINE", retryAfterMs: 60_000 };
+    }
+    const result = await sendForwardedToOffscreen<CloudSyncPushItemResponse>({
+      service: "cloudSync",
+      type: "pushItem",
+      payload: { itemId },
+    });
+    return result?.ready
+      ? { ready: true }
+      : {
+          ready: false,
+          reason: result?.reason || "ITEM_NOT_SYNCED",
+          retryAfterMs: result?.reason === "missing-local-item" ? 5 * 60_000 : 30_000,
+        };
+  },
+});
+const archiveCaptureSessions = new ArchiveCaptureSessionManager({
+  outbox: archiveOutbox,
+});
+const cancelledArchiveItems = new Map<string, number>();
+
+const markArchiveItemCancelled = async (itemId: string): Promise<void> => {
+  if (!itemId) return;
+  cancelledArchiveItems.set(itemId, Date.now());
+  for (const [id, cancelledAt] of cancelledArchiveItems) {
+    if (Date.now() - cancelledAt > 60 * 60 * 1000) cancelledArchiveItems.delete(id);
+  }
+  await archiveCaptureSessions.cancelItem(itemId);
+  await archiveOutbox.discardItem(itemId);
+};
+
+const scheduleArchiveOutboxRetry = async (): Promise<void> => {
+  const jobs = await archiveOutbox.list();
+  if (jobs.length === 0) {
+    await chrome.alarms.clear(ARCHIVE_OUTBOX_RETRY_ALARM_NAME);
+    return;
+  }
+  const nextAttemptAt = Math.min(...jobs.map((job) => job.nextAttemptAt));
+  await chrome.alarms.create(ARCHIVE_OUTBOX_RETRY_ALARM_NAME, {
+    when: Math.max(Date.now() + 30_000, nextAttemptAt),
+  });
+};
+
+const triggerArchiveOutboxDrain = async (): Promise<void> => {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+  try {
+    const result = await archiveOutbox.drain(ARCHIVE_OUTBOX_DRAIN_LIMIT);
+    if (result.remaining > 0 && result.reason !== "missing-token") await scheduleArchiveOutboxRetry();
+  } catch (error) {
+    console.warn("[archive] outbox drain skipped", error);
+    await scheduleArchiveOutboxRetry().catch(() => {});
+  }
+};
+
+const queueServerArchive = async (itemId: string, archiveUrl: string): Promise<void> => {
+  if (cancelledArchiveItems.has(itemId)) return;
+  await archiveOutbox.enqueueServerCapture(itemId, archiveUrl);
+  sendProcessStatus(`archive-${itemId}`, "Offline preview", "processing", "Queued for capture.");
+  void triggerArchiveOutboxDrain();
+};
+
+const capturePageArchiveForItem = async (input: {
+  itemId: string;
+  archiveUrl: string;
+  liveArchiveUrl?: string;
+  tab?: chrome.tabs.Tab;
+}): Promise<void> => {
+  cancelledArchiveItems.delete(input.itemId);
+  const tabId = input.tab?.id;
+  const liveUrl = normalizeHttpUrl(input.liveArchiveUrl || null);
+  if (typeof tabId !== "number" || !liveUrl) {
+    await queueServerArchive(input.itemId, input.archiveUrl);
+    return;
+  }
+
+  const statusId = `archive-${input.itemId}`;
+  sendProcessStatus(statusId, "Offline preview", "processing", "Capturing this page in the background...");
+  let sessionId = "";
+  try {
+    const currentTab = await chrome.tabs.get(tabId);
+    const currentUrl = normalizeHttpUrl(currentTab.url || null);
+    if (!currentUrl || currentUrl !== liveUrl) throw new Error("ARCHIVE_PAGE_NAVIGATED");
+
+    const deadlineAt = Date.now() + PAGE_ARCHIVE_CAPTURE_TIMEOUT_MS;
+    // The service worker can be terminated unexpectedly even while Chrome would
+    // normally keep this message alive. A delayed server job is the durable
+    // fallback; a completed local capture replaces it with the OPFS upload.
+    await archiveOutbox.enqueueServerCapture(input.itemId, input.archiveUrl, {
+      notBefore: deadlineAt + 2_000,
+    });
+    await scheduleArchiveOutboxRetry();
+    const opened = await archiveCaptureSessions.open({
+      itemId: input.itemId,
+      tabId,
+      sourceUrl: liveUrl,
+      deadlineAt,
+    });
+    sessionId = opened.sessionId;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error("ARCHIVE_CAPTURE_DEADLINE")), PAGE_ARCHIVE_CAPTURE_TIMEOUT_MS + 2_000);
+    });
+    let response: ArchiveProtocolResponse;
+    try {
+      response = (await Promise.race([
+        chrome.tabs.sendMessage(tabId, {
+          type: PAGE_ARCHIVE_CAPTURE_MESSAGE,
+          payload: {
+            sessionId,
+            expectedUrl: liveUrl,
+            deadlineAt,
+            maxHtmlBytes: opened.maxHtmlBytes,
+          },
+        }),
+        timeoutPromise,
+      ])) as ArchiveProtocolResponse;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+    if (!response?.success) throw new Error(response?.error || "ARCHIVE_CAPTURE_FAILED");
+    if (archiveCaptureSessions.isOpen(sessionId)) throw new Error("ARCHIVE_CAPTURE_INCOMPLETE");
+    if (cancelledArchiveItems.has(input.itemId)) {
+      await archiveOutbox.discardItem(input.itemId);
+      return;
+    }
+    sendProcessStatus(statusId, "Offline preview", "processing", "Captured locally; waiting to sync.");
+    void triggerArchiveOutboxDrain();
+  } catch (error) {
+    if (sessionId) await archiveCaptureSessions.abort(sessionId, tabId).catch(() => {});
+    if (cancelledArchiveItems.has(input.itemId)) return;
+    console.warn("[archive] live page capture fell back to server capture", error);
+    await queueServerArchive(input.itemId, input.archiveUrl);
+  }
+};
+
 const retryPendingLocalMetadataUrls = async (): Promise<number> => {
   const result = await sendForwardedToOffscreen<{ urls?: string[] }>({
     service: "items",
@@ -671,6 +851,8 @@ const retryPendingLocalMetadataUrls = async (): Promise<number> => {
 
 let browserBookmarkImportInFlight: Promise<BrowserBookmarkImportResult> | null = null;
 let githubStarsImportInFlight: Promise<GitHubStarsImportResult> | null = null;
+let browserBookmarkAutoSyncEnabled: boolean | null = null;
+let browserBookmarkAutoSyncEnabledLoad: Promise<boolean> | null = null;
 
 const fetchGitHubStars = async (accessToken: string): Promise<GitHubStar[]> => {
   const token = accessToken.trim();
@@ -696,17 +878,79 @@ const fetchGitHubStars = async (accessToken: string): Promise<GitHubStar[]> => {
   });
 };
 
-const importBrowserBookmarks = async (): Promise<BrowserBookmarkImportResult> => {
-  if (browserBookmarkImportInFlight) return browserBookmarkImportInFlight;
+const markBrowserBookmarkAutoSyncEnabled = async (): Promise<void> => {
+  try {
+    await setStorageValue(BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY, true);
+    browserBookmarkAutoSyncEnabled = true;
+  } catch (error) {
+    console.warn("[browserBookmarks] could not persist automatic sync preference", error);
+  }
+};
+
+const isBrowserBookmarkAutoSyncEnabled = async (): Promise<boolean> => {
+  if (browserBookmarkAutoSyncEnabled !== null) return browserBookmarkAutoSyncEnabled;
+  if (browserBookmarkAutoSyncEnabledLoad) return browserBookmarkAutoSyncEnabledLoad;
+
+  const load = (async () => {
+    try {
+      const stored = await chrome.storage.local.get(BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY);
+      const explicitValue = stored[BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY];
+      if (explicitValue === true || explicitValue === false) return explicitValue;
+
+      // Upgrade existing imports once. A fresh profile stays opt-in until the
+      // person explicitly imports browser bookmarks from the app.
+      const imported = await sendForwardedToOffscreen<boolean>({
+        service: "browserBookmarks",
+        type: "hasImported",
+      });
+      await setStorageValue(BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY, imported);
+      return imported;
+    } catch (error) {
+      console.warn("[browserBookmarks] automatic sync availability check failed", error);
+      return false;
+    }
+  })();
+  browserBookmarkAutoSyncEnabledLoad = load;
+  try {
+    const enabled = await load;
+    browserBookmarkAutoSyncEnabled = enabled;
+    return enabled;
+  } finally {
+    if (browserBookmarkAutoSyncEnabledLoad === load) browserBookmarkAutoSyncEnabledLoad = null;
+  }
+};
+
+type BrowserBookmarkImportOptions = {
+  silent?: boolean;
+  afterInFlight?: boolean;
+};
+
+const importBrowserBookmarks = async (
+  options: BrowserBookmarkImportOptions = {}
+): Promise<BrowserBookmarkImportResult> => {
+  if (browserBookmarkImportInFlight) {
+    if (!options.afterInFlight) return browserBookmarkImportInFlight;
+    try {
+      await browserBookmarkImportInFlight;
+    } catch {
+      // Read a fresh tree below so a failed overlapping import cannot discard
+      // a browser mutation that arrived while it was running.
+    }
+    return importBrowserBookmarks({ ...options, afterInFlight: false });
+  }
 
   const run = (async () => {
     if (!chrome.bookmarks?.getTree) {
       throw new Error("Browser bookmark access is not available in this browser.");
     }
 
-    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Reading your bookmark folders...");
+    if (!options.silent) {
+      sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Reading your bookmark folders...");
+    }
     const tree = (await chrome.bookmarks.getTree()) as BrowserBookmarkNode[];
-    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Preserving folders and importing bookmarks...");
+    if (!options.silent) {
+      sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Preserving folders and importing bookmarks...");
+    }
     const result = await sendForwardedToOffscreen<BrowserBookmarkImportResult>({
       service: "browserBookmarks",
       type: "importTree",
@@ -714,21 +958,33 @@ const importBrowserBookmarks = async (): Promise<BrowserBookmarkImportResult> =>
     });
     const metadataUrls = result.metadataUrls;
     if (metadataUrls.length > 0) {
+      if (!options.silent) {
+        sendProcessStatus(
+          "browser-bookmarks",
+          "Browser bookmarks",
+          "processing",
+          `Queueing metadata for ${metadataUrls.length.toLocaleString()} bookmarks...`
+        );
+      }
+      scheduleForProcessing(metadataUrls, false);
+    }
+    await markBrowserBookmarkAutoSyncEnabled();
+    scheduleContextMenuRefresh("high");
+    if (
+      result.updatedFolderCount === 0 &&
+      result.updatedBookmarkCount === 0 &&
+      result.removedBookmarkCount === 0
+    ) {
+      void triggerCloudSync();
+    }
+    if (!options.silent) {
       sendProcessStatus(
         "browser-bookmarks",
         "Browser bookmarks",
-        "processing",
-        `Queueing metadata for ${metadataUrls.length.toLocaleString()} bookmarks...`
+        "success",
+        `Imported ${result.bookmarkCount.toLocaleString()} bookmarks across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${metadataUrls.length.toLocaleString()}.`
       );
-      scheduleForProcessing(metadataUrls, false);
     }
-    scheduleContextMenuRefresh("high");
-    sendProcessStatus(
-      "browser-bookmarks",
-      "Browser bookmarks",
-      "success",
-      `Synced ${result.bookmarkCount.toLocaleString()} bookmarks across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${metadataUrls.length.toLocaleString()}.`
-    );
     return result;
   })();
 
@@ -737,11 +993,31 @@ const importBrowserBookmarks = async (): Promise<BrowserBookmarkImportResult> =>
     return await run;
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Browser bookmark import failed.";
-    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "error", detail);
+    if (!options.silent) sendProcessStatus("browser-bookmarks", "Browser bookmarks", "error", detail);
     throw error;
   } finally {
     browserBookmarkImportInFlight = null;
   }
+};
+
+const browserBookmarkResyncScheduler = new BrowserBookmarkResyncScheduler({
+  isEnabled: isBrowserBookmarkAutoSyncEnabled,
+  runSync: async () => {
+    await importBrowserBookmarks({ silent: true, afterInFlight: true });
+  },
+  createFallbackAlarm: async (when) => {
+    await chrome.alarms.create(BROWSER_BOOKMARK_RESYNC_ALARM_NAME, { when });
+  },
+  clearFallbackAlarm: async () => {
+    await chrome.alarms.clear(BROWSER_BOOKMARK_RESYNC_ALARM_NAME);
+  },
+  onError: (error) => {
+    console.warn("[browserBookmarks] automatic resync failed", error);
+  },
+});
+
+const requestBrowserBookmarkResync = (): void => {
+  void browserBookmarkResyncScheduler.request();
 };
 
 const importGitHubStars = async (accessToken: string): Promise<GitHubStarsImportResult> => {
@@ -750,7 +1026,7 @@ const importGitHubStars = async (accessToken: string): Promise<GitHubStarsImport
   const run = (async () => {
     sendProcessStatus("github-stars", "GitHub stars", "processing", "Reading starred repositories...");
     const stars = await fetchGitHubStars(accessToken);
-    sendProcessStatus("github-stars", "GitHub stars", "processing", "Syncing starred repositories...");
+    sendProcessStatus("github-stars", "GitHub stars", "processing", "Importing starred repositories...");
     const result = await sendForwardedToOffscreen<GitHubStarsImportResult>({
       service: "githubStars",
       type: "importStars",
@@ -770,7 +1046,7 @@ const importGitHubStars = async (accessToken: string): Promise<GitHubStarsImport
       "github-stars",
       "GitHub stars",
       "success",
-      `Synced ${result.importedCount.toLocaleString()} starred repositories across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${result.metadataUrls.length.toLocaleString()}.`
+      `Imported ${result.importedCount.toLocaleString()} starred repositories across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${result.metadataUrls.length.toLocaleString()}.`
     );
     return result;
   })();
@@ -1917,6 +2193,22 @@ const resolveSaveContentKind = (context: ImportClickContext): SaveContentKind =>
 const resolveSavePrimaryUrl = (context: ImportClickContext) =>
   context.pageUrl || context.frameUrl || context.tabUrl || context.linkUrl || context.mediaUrl || null;
 
+const resolveLiveArchiveUrl = (
+  context: ImportClickContext,
+  tab: chrome.tabs.Tab | undefined,
+): string | undefined => {
+  if (
+    typeof tab?.id !== "number" ||
+    context.linkUrl ||
+    context.mediaUrl ||
+    context.selectionText ||
+    (context.frameUrl && context.frameUrl !== context.tabUrl)
+  ) {
+    return undefined;
+  }
+  return normalizeHttpUrl(tab.url || context.tabUrl || context.pageUrl) || undefined;
+};
+
 const resolveSavePrimaryUrlOrFallback = (
   context: ImportClickContext,
   mode: ImportMode
@@ -2486,6 +2778,7 @@ const prepareImportContent = async (
   const shouldFetchMetadata = isMetadataFetchablePageUrl(primaryUrl);
 
   return {
+    itemId: crypto.randomUUID(),
     primaryUrl,
     title,
     textContent,
@@ -2496,6 +2789,8 @@ const prepareImportContent = async (
     tags: suggestedTags(context, source),
     shouldFetchMetadata,
     isMetaFetched: !shouldFetchMetadata,
+    archiveUrl: primaryUrl,
+    liveArchiveUrl: resolveLiveArchiveUrl(context, tab),
   };
 };
 
@@ -2857,6 +3152,8 @@ const createDraftFromAction = async (
     ocrSourceHash: prepared.ocrSourceHash,
     shouldFetchMetadata: prepared.shouldFetchMetadata,
     isMetaFetched: prepared.isMetaFetched,
+    archiveUrl: prepared.archiveUrl,
+    liveArchiveUrl: prepared.liveArchiveUrl,
     context,
     target: {
       spaceId: target.spaceId || PUBLIC_SPACE_ID,
@@ -2867,6 +3164,17 @@ const createDraftFromAction = async (
   };
   const drafts = await loadDrafts();
   await saveDrafts([draft, ...drafts.filter((entry) => entry.id !== draft.id)]);
+  if (draft.itemId && draft.archiveUrl) {
+    void capturePageArchiveForItem({
+      itemId: draft.itemId,
+      archiveUrl: draft.archiveUrl,
+      liveArchiveUrl: draft.liveArchiveUrl,
+      tab,
+    }).catch((error) => {
+      console.warn("[archive] draft capture could not be queued", error);
+      sendProcessStatus(`archive-${draft.itemId}`, "Offline preview", "error", "Could not queue this preview.");
+    });
+  }
   return draft;
 };
 
@@ -2934,6 +3242,18 @@ const runImportAction = async (
     }),
   });
 
+  if (prepared.archiveUrl) {
+    void capturePageArchiveForItem({
+      itemId: inserted.id,
+      archiveUrl: prepared.archiveUrl,
+      liveArchiveUrl: prepared.liveArchiveUrl,
+      tab,
+    }).catch((error) => {
+      console.warn("[archive] page capture could not be queued", error);
+      sendProcessStatus(`archive-${inserted.id}`, "Offline preview", "error", "Could not queue this preview.");
+    });
+  }
+
   // Saved images (right-click → save image, image links, etc.) are OCR'd like
   // screenshots so their text becomes searchable; OCR then re-embeds them. The
   // explicit per-item trigger is reliable even in a large library.
@@ -2951,7 +3271,7 @@ const runImportAction = async (
   scheduleContextMenuRefresh("low");
 
   const savedActions = [
-    { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl } },
+    { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl, itemId: inserted.id } },
     { label: "Open", action: "OPEN_SEARCH" },
   ];
 
@@ -3473,7 +3793,10 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
   if (message.type === "IMPORT_DELETE_DRAFT") {
     const draftId = (message?.payload?.draftId || "").trim();
     if (!draftId) return { success: false, error: "MISSING_DRAFT_ID" };
-    await saveDrafts((await loadDrafts()).filter((entry) => entry.id !== draftId));
+    const drafts = await loadDrafts();
+    const removed = drafts.find((entry) => entry.id === draftId);
+    await saveDrafts(drafts.filter((entry) => entry.id !== draftId));
+    if (removed?.itemId) await markArchiveItemCancelled(removed.itemId);
     return { success: true, payload: { deleted: true } };
   }
   if (message.type === "IMPORT_SUBMIT_DRAFT") {
@@ -3572,6 +3895,17 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
     }
 
     await saveDrafts(drafts.filter((entry) => entry.id !== draft.id));
+    if (draft.archiveUrl) {
+      if (didPrimaryUrlChange || (draft.itemId && inserted.id !== draft.itemId)) {
+        if (draft.itemId) await markArchiveItemCancelled(draft.itemId);
+        cancelledArchiveItems.delete(inserted.id);
+        void queueServerArchive(inserted.id, primaryUrl).catch((error) =>
+          console.warn("[archive] edited draft preview could not be queued", error),
+        );
+      } else {
+        void triggerArchiveOutboxDrain();
+      }
+    }
     if (draft.mode === "shot" && !didPrimaryUrlChange) {
       scheduleScreenshotPostImportWork(inserted.id, primaryUrl);
     }
@@ -3656,12 +3990,15 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   });
 });
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create(SYNC_ALARM_NAME, { periodInMinutes: 6 * 60 });
+  chrome.alarms.create(CLOUD_SYNC_ALARM_NAME, { periodInMinutes: 15 });
   chrome.alarms.create(EMBEDDING_ALARM_NAME, { periodInMinutes: 5 });
   chrome.alarms.create(METADATA_RETRY_ALARM_NAME, { periodInMinutes: 30 });
+  chrome.alarms.create(ARCHIVE_OUTBOX_ALARM_NAME, { periodInMinutes: 10 });
   void retryStoredFailedMetadataUrls().catch(() => {});
   void retryPendingLocalMetadataUrls().catch(() => {});
+  if (details.reason !== "install") requestBrowserBookmarkResync();
   scheduleContextMenuRefresh("high");
 });
 
@@ -3675,20 +4012,48 @@ chrome.runtime.onStartup.addListener(() => {
     });
     await retryStoredFailedMetadataUrls();
     await retryPendingLocalMetadataUrls();
+    await triggerCloudSync();
+    await archiveOutbox.cleanup();
+    await triggerArchiveOutboxDrain();
+    requestBrowserBookmarkResync();
   })().catch(() => {});
   scheduleContextMenuRefresh("high");
 });
 
+const onBrowserBookmarkMutation = () => {
+  requestBrowserBookmarkResync();
+};
+
+chrome.bookmarks.onCreated.addListener(onBrowserBookmarkMutation);
+chrome.bookmarks.onChanged.addListener(onBrowserBookmarkMutation);
+chrome.bookmarks.onMoved.addListener(onBrowserBookmarkMutation);
+chrome.bookmarks.onRemoved.addListener(onBrowserBookmarkMutation);
+chrome.bookmarks.onChildrenReordered.addListener(onBrowserBookmarkMutation);
+chrome.bookmarks.onImportBegan.addListener(() => {
+  void browserBookmarkResyncScheduler.onImportBegan();
+});
+chrome.bookmarks.onImportEnded.addListener(() => {
+  void browserBookmarkResyncScheduler.onImportEnded();
+});
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   void (async () => {
+    if (alarm.name === BROWSER_BOOKMARK_RESYNC_ALARM_NAME) {
+      await browserBookmarkResyncScheduler.onFallbackAlarm();
+      return;
+    }
     await setupOffscreenDocument();
     if (alarm.name === SYNC_ALARM_NAME) {
       await chrome.runtime.sendMessage({
         service: "sync",
         type: "rebuildAndCompact",
         target: "offscreen",
-        isForwarded: true,
-      });
+          isForwarded: true,
+        });
+    } else if (alarm.name === CLOUD_SYNC_ALARM_NAME) {
+      await triggerCloudSync();
+    } else if (alarm.name === CLOUD_SYNC_CONTINUATION_ALARM_NAME) {
+      await triggerCloudSync();
     } else if (alarm.name === EMBEDDING_ALARM_NAME) {
       await chrome.runtime.sendMessage({
         type: "TRIGGER_EMBEDDING",
@@ -3698,6 +4063,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     } else if (alarm.name === METADATA_RETRY_ALARM_NAME) {
       await retryStoredFailedMetadataUrls();
       await retryPendingLocalMetadataUrls();
+    } else if (alarm.name === ARCHIVE_OUTBOX_ALARM_NAME || alarm.name === ARCHIVE_OUTBOX_RETRY_ALARM_NAME) {
+      await triggerArchiveOutboxDrain();
     } else if (alarm.name === "opfs-promote-alarm") {
       triggerOpfsPromotion();
     }
@@ -3706,6 +4073,46 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 const isOnline = (): boolean =>
   typeof navigator !== "undefined" ? navigator.onLine : true;
+
+let cloudSyncInFlight: Promise<void> | null = null;
+let cloudSyncRequestVersion = 0;
+
+const scheduleCloudSyncContinuation = async (): Promise<void> => {
+  try {
+    await chrome.alarms.create(CLOUD_SYNC_CONTINUATION_ALARM_NAME, {
+      when: Date.now() + CLOUD_SYNC_CONTINUATION_DELAY_MS,
+    });
+  } catch (error) {
+    console.warn("[cloudSync] continuation alarm was not scheduled", error);
+  }
+};
+
+const triggerCloudSync = (): Promise<void> => {
+  if (!isOnline()) return Promise.resolve();
+  cloudSyncRequestVersion += 1;
+  if (cloudSyncInFlight) return cloudSyncInFlight;
+
+  const runVersion = cloudSyncRequestVersion;
+  const run = (async () => {
+    try {
+      const result = await sendForwardedToOffscreen({
+        service: "cloudSync",
+        type: "drain",
+        payload: { maxBatches: 10 },
+      });
+      if (shouldScheduleCloudSyncContinuation(result) || cloudSyncRequestVersion > runVersion) {
+        await scheduleCloudSyncContinuation();
+      }
+    } catch (error) {
+      console.warn("[cloudSync] upload skipped", error);
+      if (cloudSyncRequestVersion > runVersion) await scheduleCloudSyncContinuation();
+    }
+  })().finally(() => {
+    cloudSyncInFlight = null;
+  });
+  cloudSyncInFlight = run;
+  return run;
+};
 
 const promoteOpfsMediaToR2 = async (): Promise<void> => {
   if (!isOnline()) return;
@@ -3812,13 +4219,26 @@ const forwardProcessingTriggerToOffscreen = async (
 
 // Attempt promotion on startup
 void triggerOpfsPromotion();
+void triggerCloudSync();
+void archiveOutbox.cleanup().then(() => triggerArchiveOutboxDrain()).catch(() => {});
 
 // Listen for connectivity regain (service worker context: self)
 if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
-  self.addEventListener("online", () => triggerOpfsPromotion());
+  self.addEventListener("online", () => {
+    void triggerOpfsPromotion();
+    void triggerCloudSync();
+    void triggerArchiveOutboxDrain();
+  });
 }
 
 chrome.alarms.create("opfs-promote-alarm", { periodInMinutes: 30 });
+chrome.alarms.create(ARCHIVE_OUTBOX_ALARM_NAME, { periodInMinutes: 10 });
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "local" && changes[CLOUD_SYNC_TOKEN_KEY]?.newValue) {
+    void triggerArchiveOutboxDrain();
+  }
+});
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   hoverSaveTargetsByTab.delete(tabId);
@@ -3861,6 +4281,78 @@ if (chrome.commands?.onCommand) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const archiveSenderTabId =
+    sender?.id === chrome.runtime.id && typeof sender.tab?.id === "number" ? sender.tab.id : null;
+
+  if (message?.target === "background" && message?.type === PAGE_ARCHIVE_CHUNK_MESSAGE) {
+    if (archiveSenderTabId === null) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_ARCHIVE_SENDER" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    const sessionId = typeof message?.payload?.sessionId === "string" ? message.payload.sessionId : "";
+    const sequence = Number.isSafeInteger(message?.payload?.sequence) ? Number(message.payload.sequence) : -1;
+    const chunk = typeof message?.payload?.chunk === "string" ? message.payload.chunk : "";
+    if (chunk.length > PAGE_ARCHIVE_CHUNK_CODE_UNITS + 1) {
+      sendResponse({ success: false, error: "ARCHIVE_CHUNK_TOO_LARGE" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    void archiveCaptureSessions
+      .append(sessionId, archiveSenderTabId, sequence, chunk)
+      .then((payload) => sendResponse({ success: true, payload } satisfies ArchiveProtocolResponse))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "ARCHIVE_CHUNK_FAILED",
+        } satisfies ArchiveProtocolResponse),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === PAGE_ARCHIVE_FINISH_MESSAGE) {
+    if (archiveSenderTabId === null) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_ARCHIVE_SENDER" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    const sessionId = typeof message?.payload?.sessionId === "string" ? message.payload.sessionId : "";
+    const chunkCount = Number.isSafeInteger(message?.payload?.chunkCount) ? Number(message.payload.chunkCount) : -1;
+    const capturedUrl = typeof message?.payload?.capturedUrl === "string" ? message.payload.capturedUrl.slice(0, 8192) : "";
+    void archiveCaptureSessions
+      .finish(sessionId, archiveSenderTabId, { chunkCount, capturedUrl })
+      .then((payload) => sendResponse({ success: true, payload } satisfies ArchiveProtocolResponse))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "ARCHIVE_FINISH_FAILED",
+        } satisfies ArchiveProtocolResponse),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === PAGE_ARCHIVE_ABORT_MESSAGE) {
+    if (archiveSenderTabId === null) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_ARCHIVE_SENDER" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    const sessionId = typeof message?.payload?.sessionId === "string" ? message.payload.sessionId : "";
+    void archiveCaptureSessions
+      .abort(sessionId, archiveSenderTabId)
+      .then(() => sendResponse({ success: true } satisfies ArchiveProtocolResponse))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "ARCHIVE_ABORT_FAILED",
+        } satisfies ArchiveProtocolResponse),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_SYNC_QUEUED") {
+    if (isTrustedExtensionSender(sender)) {
+      void triggerCloudSync().then(() => triggerArchiveOutboxDrain());
+    }
+    return;
+  }
+
   if (message?.target === "background" && message?.type === "HOVER_SAVE_TARGET") {
     const tabId = sender.tab?.id;
     const url = normalizeHttpUrl(typeof message?.payload?.url === "string" ? message.payload.url : null);
@@ -3941,14 +4433,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.target === "background" && message?.type === "UNDO_SAVE") {
     const primaryUrl = typeof message?.payload?.primaryUrl === "string" ? message.payload.primaryUrl : "";
-    if (primaryUrl) {
-      void sendForwardedToOffscreen({
-        service: "items",
-        type: "deleteByUrl",
-        payload: { url: primaryUrl },
-      }).catch(() => {});
-    }
-    return;
+    const itemId = typeof message?.payload?.itemId === "string" ? message.payload.itemId : "";
+    void (async () => {
+      if (itemId) await markArchiveItemCancelled(itemId);
+      if (primaryUrl) {
+        await sendForwardedToOffscreen({
+          service: "items",
+          type: "deleteByUrl",
+          payload: { url: primaryUrl },
+        });
+      }
+    })()
+      .then(() => sendResponse({ success: true }))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "Undo failed.",
+        }),
+      );
+    return true;
   }
 
   if (message?.target === "background" && message?.type === "OPEN_SEARCH") {

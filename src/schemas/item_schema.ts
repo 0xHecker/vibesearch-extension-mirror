@@ -13,6 +13,46 @@ export type MediaOcrMetadata = {
   engine?: string;
 };
 
+export type ContentFieldValue = string | number | boolean | string[] | null;
+export type ContentFields = Record<string, ContentFieldValue>;
+
+export type ContentBlock = {
+  id: string;
+  kind: "text" | "markdown" | "html" | "code" | "quote" | "richtext";
+  label?: string;
+  text?: string;
+  json?: unknown;
+  r2Key?: string;
+  language?: string;
+  searchable?: boolean;
+  createdAt?: number;
+};
+
+export type BlobRef = {
+  key: string;
+  kind: "html" | "pdf" | "json" | "text" | "archive" | "other";
+  contentType?: string;
+  byteSize?: number;
+  label?: string;
+  hash?: string;
+  capturedAt?: number;
+};
+
+export type AiExtraction = {
+  status: "pending" | "processing" | "done" | "error" | "skipped";
+  modelVersion?: string;
+  summary?: string;
+  autoTags?: string[];
+  suggestedFolderPath?: string[];
+  suggestedType?: string;
+  extractedFields?: ContentFields;
+  image?: Record<string, unknown>;
+  images?: Record<string, unknown>[];
+  video?: Record<string, unknown>;
+  error?: string;
+  updatedAt?: number;
+};
+
 export type ItemDocType = {
   id: string;
   userId: string | null;
@@ -39,6 +79,8 @@ export type ItemDocType = {
     | "linkedin"
     | "github"
     | "article";
+  type?: string;
+  fields?: ContentFields;
   folderId: string;
   spaceId: string;
   isFavorite: boolean;
@@ -67,8 +109,12 @@ export type ItemDocType = {
     capturedAt?: number;
     ocr?: MediaOcrMetadata;
   }[];
+  blocks?: ContentBlock[];
+  blobs?: BlobRef[];
   iconUrl?: string;
   displayImageUrl?: string;
+  summary?: string;
+  ai?: AiExtraction;
   parentId: string | null;
   chunkOrder?: number;
   vector_index?: number;
@@ -84,13 +130,13 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 0,
+  version: 1,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
   properties: {
     id: { type: "string", maxLength: 100 },
-    userId: { type: "string", default: null, maxLength: 1000 },
+    userId: { type: "string", default: "", maxLength: 1000 },
     title: { type: "string" },
     textContent: { type: "string" },
     ocrText: { type: "string" },
@@ -134,6 +180,11 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
         "article",
       ],
       maxLength: 20,
+    },
+    type: { type: "string", maxLength: 200 },
+    fields: {
+      type: "object",
+      additionalProperties: true,
     },
     folderId: { type: "string", ref: "folders", maxLength: 1000 },
     spaceId: { type: "string", default: "space_public_default", maxLength: 1000 },
@@ -200,6 +251,63 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
         },
       },
     },
+    blocks: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string", maxLength: 200 },
+          kind: {
+            type: "string",
+            enum: ["text", "markdown", "html", "code", "quote", "richtext"],
+          },
+          label: { type: "string" },
+          text: { type: "string" },
+          json: { type: ["object", "array", "string", "number", "boolean", "null"] },
+          r2Key: { type: "string" },
+          language: { type: "string", maxLength: 200 },
+          searchable: { type: "boolean" },
+          createdAt: {
+            type: "integer",
+            minimum: 0,
+            maximum: Number.MAX_SAFE_INTEGER - 1,
+            multipleOf: 1,
+          },
+        },
+        required: ["id", "kind"],
+      },
+    },
+    blobs: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          key: { type: "string" },
+          kind: {
+            type: "string",
+            enum: ["html", "pdf", "json", "text", "archive", "other"],
+          },
+          contentType: { type: "string", maxLength: 500 },
+          byteSize: {
+            type: "integer",
+            minimum: 0,
+            maximum: Number.MAX_SAFE_INTEGER - 1,
+            multipleOf: 1,
+          },
+          label: { type: "string" },
+          hash: { type: "string", maxLength: 256 },
+          capturedAt: {
+            type: "integer",
+            minimum: 0,
+            maximum: Number.MAX_SAFE_INTEGER - 1,
+            multipleOf: 1,
+          },
+        },
+        required: ["key", "kind"],
+      },
+    },
     // Content Chunking
     parentId: { type: ["string", "null"], ref: "items", default: null, maxLength: 100 },
     chunkOrder: { type: "number" },
@@ -225,6 +333,11 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     serverVersion: { type: "number", default: 0 },
     iconUrl: { type: "string" },
     displayImageUrl: { type: "string" },
+    summary: { type: "string" },
+    ai: {
+      type: "object",
+      additionalProperties: true,
+    },
     // Timestamps
     createdAt: {
       type: "integer",
@@ -279,4 +392,10 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "deletedAt",
   ],
   attachments: {},
+};
+
+// v1 declares the polymorphic content captured locally and uploaded to cloud.
+// Existing v0 rows remain valid and gain fields on their next local update.
+export const itemMigrationStrategies = {
+  1: (oldDoc: ItemDocType): ItemDocType => oldDoc,
 };

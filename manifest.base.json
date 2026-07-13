@@ -1,6 +1,6 @@
 {
   "name": "Vibesearch",
-  "description": ".",
+  "description": "Local-first search for tabs, bookmarks, screenshots, and saved pages, with on-device semantic AI and OCR.",
   "manifest_version": 3,
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvRbW0z9NFkbvL8l1nhVKIL4bvQfFMVPwUcKQAwXk8tJCyh4i+FbL/wQ+mUOTmB4rG6oLUDMi9v3sb+VuvF5KZvkYZas8OwYMkTlFgVDokFqBmddiUxZ7R0323aOnl6HZz+VI33hIvL9mxy9j2zQm23CT2O/NCWapKZzcf/GkFOraImV73Bk/H9HpVGpsdauj/K5FuOdjrFfnkIvuLgT2KEyJpWxxS4V8fCUp7gCIW+Id2m+UeIwASAtq2P/Ul1+DuO5rRfJM1Ah6qyvEKYul+5hUixsIYJlJS3HvSfBNjs7/Nz65zS6RFOYjbS5I3LUMGrzmVWrMl52pej8f9hqQNwIDAQAB",
   "options_ui": {
@@ -64,21 +64,8 @@
     }
   ],
   "devtools_page": "src/pages/devtools/index.html",
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "contentStyle.css",
-        "favicon_squared.png",
-        "favicon_squared-32.png",
-        "favicon_squared-128.png",
-        "src/pages/search/index.html",
-        "src/pages/offscreen/offscreen.html"
-      ],
-      "matches": ["<all_urls>"]
-    }
-  ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src 'self' data: https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://metadata-worker.watermelons.workers.dev https://meta.vibesearch.app https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://sheets.googleapis.com https://api.github.com",
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; frame-src https://vibesearch-web.watermelons.workers.dev; connect-src 'self' data: https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://metadata-worker.watermelons.workers.dev https://meta.vibesearch.app https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://vibesearch-api.watermelons.workers.dev https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://sheets.googleapis.com https://api.github.com",
     "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self' blob:; connect-src 'self' data: https://metadata-worker.watermelons.workers.dev https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://sheets.googleapis.com"
   },
   "sandbox": {

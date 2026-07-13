@@ -6,7 +6,8 @@ multi-stage, rate-aware, crash-resistant pipeline. This page covers the import s
 metadata pipeline that powers rich previews, and how media (images/screenshots) is stored.
 
 Implementation: `browser-bookmark-import.ts`, `github-stars-import.ts`, `github-stars-api.ts`,
-`metadata-pipeline.ts`, `media-storage.ts`, `utils/infer-source.ts`, `utils/media-embed.ts`.
+`metadata-pipeline.ts`, `media-storage.ts`, `archive-outbox.ts`, `utils/infer-source.ts`,
+`utils/media-embed.ts`.
 
 ## The shape of an import
 
@@ -44,10 +45,14 @@ Triggered from Settings → Data. The background worker reads the whole tree wit
   bookmarks"** folder. Nested bookmark folders become nested Vibesearch folders.
 - **Chunking.** Any folder is capped at **500 items** (`MAX_BOOKMARKS_PER_SPACE`); overflow rolls
   into additional folders so no single container grows unbounded.
-- **Idempotent re-import.** Each entity gets a **stable id** derived from a hash
+- **Idempotent re-import and background reconciliation.** Each entity gets a **stable id** derived from a hash
   (`browser-{space|folder|bookmark}-<hash>`), and `updateBookmark`/`updateFolder` return "no
-  change" when nothing differs — so re-importing updates in place instead of duplicating. A URL
-  change resets `isMetaFetched` so the item re-enriches. Folders over 300 items start collapsed.
+  change" when nothing differs — so re-importing updates in place instead of duplicating. Once a
+  person has explicitly imported browser bookmarks, the worker observes bookmark creates, edits,
+  moves, deletes, reorder events, and browser-import completion. A 1.5-second debounce plus a
+  one-shot alarm coalesces bursts and survives service-worker suspension; startup also reconciles
+  an already opted-in import. Only changed records enter the cloud outbox. A URL change resets
+  `isMetaFetched` so the item re-enriches. Folders over 300 items start collapsed.
 - **Source inference.** Each bookmark's `source` is guessed from its host via `inferSource`.
 
 ## GitHub stars
@@ -174,6 +179,14 @@ flowchart TD
 - **Embeds** (e.g. YouTube) are normalized to worker-proxied embed URLs (`media-embed.ts`) and
   rendered in sandboxed iframes.
 
+### Offline page previews
+
+A normal web-page save also queues an inert, single-file HTML preview. The extension captures
+the rendered DOM with SingleFile, streams it into an OPFS outbox, ensures the item reaches cloud
+sync first, and then uploads at most two archives per drain. A delayed server-capture intent is
+persisted before live capture so a service-worker crash cannot lose the preview request. See
+[offline-archives.md](offline-archives.md) for limits, fallback behavior, and security policy.
+
 ### Source inference — one source of truth
 
 `utils/infer-source.ts` maps a hostname to a `source` (the single source of truth for every save
@@ -193,6 +206,8 @@ flowchart LR
     C --> D["embedding queue<br/>(needs isMetaFetched)"]
     A --> E["media → OPFS"]
     E --> F["OPFS → R2 promotion"]
+    A --> I["page archive → OPFS outbox"]
+    I --> J["item-first sync → sanitized R2 HTML"]
     A --> G["images → OCR queue"]
     G --> H["ocrText → isDirty → re-embed"]
 ```

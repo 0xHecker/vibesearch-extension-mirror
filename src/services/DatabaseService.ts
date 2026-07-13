@@ -15,7 +15,7 @@ addRxPlugin(RxDBQueryBuilderPlugin);
 addRxPlugin(RxDBMigrationSchemaPlugin);
 
 // Import schemas
-import { itemSchema, ItemDocType } from "@src/schemas/item_schema";
+import { itemMigrationStrategies, itemSchema, ItemDocType } from "@src/schemas/item_schema";
 import { folderSchema, FolderDocType } from "@src/schemas/folder_schema";
 import { spaceSchema, SpaceDocType } from "@src/schemas/space_schema";
 import { spaceGroupSchema, SpaceGroupDocType } from "@src/schemas/space_group_schema";
@@ -80,6 +80,7 @@ const createDatabase = async () => {
   await db.addCollections({
     items: {
       schema: itemSchema,
+      migrationStrategies: itemMigrationStrategies,
     },
     folders: {
       schema: folderSchema,

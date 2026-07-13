@@ -5,6 +5,7 @@ import type { ItemDocType } from "@src/schemas/item_schema";
 import type { SpaceDocType } from "@src/schemas/space_schema";
 import type { SpaceGroupDocType } from "@src/schemas/space_group_schema";
 import { MAX_BOOKMARKS_PER_SPACE } from "@src/services/browser-bookmark-import";
+import { cloudSyncService, type CloudSyncDocBatch } from "@src/services/cloud-sync";
 
 export const GITHUB_STARS_SPACE_GROUP_ID = "space_group_github_stars";
 export const GITHUB_STARS_SPACE_GROUP_NAME = "GitHub Stars";
@@ -46,6 +47,12 @@ const chunk = <T,>(values: T[], size: number): T[][] => {
   for (let start = 0; start < values.length; start += size) result.push(values.slice(start, start + size));
   return result;
 };
+
+const yieldToEventLoop = () =>
+  new Promise<void>((resolve) => {
+    const timer = typeof window !== "undefined" ? window.setTimeout : setTimeout;
+    timer(resolve, 0);
+  });
 
 const stableHash = (value: string): string => {
   let first = 0x811c9dc5;
@@ -192,6 +199,39 @@ const notifyDbChange = (scope: "spaces" | "space_groups" | "folders" | "items") 
   } catch {}
 };
 
+const spaceMatches = (existing: SpaceDocType, candidate: SpaceDocType): boolean =>
+  existing.name === candidate.name &&
+  existing.slug === candidate.slug &&
+  existing.spaceGroupId === candidate.spaceGroupId &&
+  existing.isPrivate === candidate.isPrivate &&
+  existing.autoLockMs === candidate.autoLockMs &&
+  existing.sortOrder === candidate.sortOrder &&
+  existing.isArchived === false &&
+  existing.deletedAt === 0 &&
+  existing.purgeAt === 0;
+
+const folderMatches = (existing: FolderDocType, candidate: FolderDocType): boolean =>
+  existing.name === candidate.name &&
+  existing.spaceId === candidate.spaceId &&
+  existing.parentId === candidate.parentId &&
+  existing.sortOrder === candidate.sortOrder &&
+  existing.type === candidate.type;
+
+const updateFolder = (existing: FolderDocType | undefined, candidate: FolderDocType, now: number) => {
+  if (!existing) return candidate;
+  if (folderMatches(existing, candidate)) return null;
+  return {
+    ...existing,
+    name: candidate.name,
+    spaceId: candidate.spaceId,
+    parentId: candidate.parentId,
+    type: candidate.type,
+    sortOrder: candidate.sortOrder,
+    isDirty: false,
+    updatedAt: now,
+  } satisfies FolderDocType;
+};
+
 const updateItem = (existing: ItemDocType | undefined, candidate: ItemDocType, now: number) => {
   if (!existing) return candidate;
   const contentChanged =
@@ -204,9 +244,9 @@ const updateItem = (existing: ItemDocType | undefined, candidate: ItemDocType, n
     existing.authorUsername !== candidate.authorUsername ||
     existing.likes !== candidate.likes ||
     existing.iconUrl !== candidate.iconUrl ||
+    existing.source !== candidate.source ||
     existing.deletedAt !== 0;
-  const needsMetadata = existing.isMetaFetched;
-  if (!contentChanged && !needsMetadata) return null;
+  if (!contentChanged) return null;
   return {
     ...existing,
     title: candidate.title,
@@ -223,26 +263,44 @@ const updateItem = (existing: ItemDocType | undefined, candidate: ItemDocType, n
     vector_index: contentChanged ? -1 : existing.vector_index,
     vector_indexes: contentChanged ? [] : existing.vector_indexes,
     isMetaFetched: false,
-    isDirty: contentChanged ? false : existing.isDirty,
+    isDirty: false,
     deletedAt: 0,
     updatedAt: now,
   } satisfies ItemDocType;
 };
 
+type GitHubStarsImportDb = Awaited<ReturnType<typeof getDb>>;
+
+type GitHubStarsCloudSync = Pick<typeof cloudSyncService, "enqueueDocs">;
+
+export type GitHubStarsImportServiceOptions = {
+  getDb?: () => Promise<GitHubStarsImportDb>;
+  cloudSync?: GitHubStarsCloudSync;
+  markSearchDirty?: () => void;
+  now?: () => number;
+  yieldToEventLoop?: () => Promise<void>;
+  notifyDbChange?: (scope: "spaces" | "space_groups" | "folders" | "items") => void;
+};
+
 export class GitHubStarsImportService {
+  constructor(private readonly options: GitHubStarsImportServiceOptions = {}) {}
+
   async importStars(payload: { stars?: GitHubStar[] }): Promise<GitHubStarsImportResult> {
-    const db = await getDb();
-    const now = Date.now();
+    const db = await (this.options.getDb ?? getDb)();
+    const now = this.options.now?.() ?? Date.now();
+    const sync = this.options.cloudSync ?? cloudSyncService;
+    const yieldNow = this.options.yieldToEventLoop ?? yieldToEventLoop;
+    const publishDbChange = this.options.notifyDbChange ?? notifyDbChange;
     const plan = buildGitHubStarsImportPlan(Array.isArray(payload.stars) ? payload.stars : [], { now });
-    localSearchIndexService.markDirty();
 
     const previousGroup = await db.space_groups.findOne(GITHUB_STARS_SPACE_GROUP_ID).exec();
     const existingGroup = previousGroup?.toMutableJSON() as SpaceGroupDocType | undefined;
-    await db.space_groups.bulkUpsert([
-      existingGroup
-        ? { ...existingGroup, name: GITHUB_STARS_SPACE_GROUP_NAME, updatedAt: now }
-        : plan.spaceGroup,
-    ]);
+    const groupUpdate = !existingGroup
+      ? plan.spaceGroup
+      : existingGroup.name === GITHUB_STARS_SPACE_GROUP_NAME
+        ? null
+        : { ...existingGroup, name: GITHUB_STARS_SPACE_GROUP_NAME, updatedAt: now };
+    if (groupUpdate) await db.space_groups.bulkUpsert([groupUpdate]);
 
     const existingSpaceDocs = await db.spaces
       .find({ selector: { spaceGroupId: { $eq: GITHUB_STARS_SPACE_GROUP_ID } } })
@@ -251,17 +309,33 @@ export class GitHubStarsImportService {
       existingSpaceDocs.map((doc) => [doc.get("id") as string, doc.toMutableJSON() as SpaceDocType])
     );
     const plannedSpaceIds = new Set(plan.spaces.map((space) => space.id));
-    const spaceUpdates = plan.spaces.map((space) => {
-      const existing = existingSpaces.get(space.id);
-      return existing
-        ? { ...existing, ...space, isArchived: false, updatedAt: now }
-        : space;
-    });
+    const spaceUpdates = plan.spaces
+      .map((space) => {
+        const existing = existingSpaces.get(space.id);
+        if (!existing) return space;
+        if (spaceMatches(existing, space)) return null;
+        return {
+          ...existing,
+          name: space.name,
+          slug: space.slug,
+          spaceGroupId: space.spaceGroupId,
+          isPrivate: space.isPrivate,
+          autoLockMs: space.autoLockMs,
+          sortOrder: space.sortOrder,
+          isArchived: false,
+          deletedAt: 0,
+          purgeAt: 0,
+          updatedAt: now,
+        } satisfies SpaceDocType;
+      })
+      .filter((space): space is SpaceDocType => space !== null);
     const archivedSpaces = Array.from(existingSpaces.values())
       .filter((space) => !plannedSpaceIds.has(space.id) && !space.isArchived)
       .map((space) => ({ ...space, isArchived: true, updatedAt: now }));
-    if (spaceUpdates.length > 0 || archivedSpaces.length > 0) {
-      await db.spaces.bulkUpsert([...spaceUpdates, ...archivedSpaces]);
+    const changedSpaces = [...spaceUpdates, ...archivedSpaces];
+    for (const batch of chunk(changedSpaces, IMPORT_BATCH_SIZE)) {
+      await db.spaces.bulkUpsert(batch);
+      await yieldNow();
     }
 
     const relevantSpaceIds = Array.from(new Set([...existingSpaces.keys(), ...plannedSpaceIds]));
@@ -278,55 +352,80 @@ export class GitHubStarsImportService {
       folderDocs.map((doc) => [doc.get("id") as string, doc.toMutableJSON() as FolderDocType])
     );
 
-    const folderUpdates = plan.folders.map((folder) => {
-      const existing = existingFolders.get(folder.id);
-      if (!existing) return folder;
-      return {
-        ...existing,
-        name: folder.name,
-        spaceId: folder.spaceId,
-        parentId: null,
-        sortOrder: folder.sortOrder,
-        isDirty: false,
-        updatedAt: now,
-      } satisfies FolderDocType;
-    });
-    if (folderUpdates.length > 0) await db.folders.bulkUpsert(folderUpdates);
-    let updatedCount = 0;
+    const changedFolders: FolderDocType[] = [];
+    for (const folderBatch of chunk(plan.folders, IMPORT_BATCH_SIZE)) {
+      const updates = folderBatch
+        .map((folder) => updateFolder(existingFolders.get(folder.id), folder, now))
+        .filter((folder): folder is FolderDocType => folder !== null);
+      if (updates.length > 0) {
+        await db.folders.bulkUpsert(updates);
+        changedFolders.push(...updates);
+      }
+      await yieldNow();
+    }
+
+    const changedItems: ItemDocType[] = [];
+    const metadataUrls = new Set<string>();
     for (const batch of chunk(plan.items, IMPORT_BATCH_SIZE)) {
       const updates = batch
         .map((item) => updateItem(existingItems.get(item.id), item, now))
         .filter((item): item is ItemDocType => item !== null);
       if (updates.length > 0) {
         await db.items.bulkUpsert(updates);
-        updatedCount += updates.length;
+        changedItems.push(...updates);
+        for (const updated of updates) metadataUrls.add(updated.url);
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await yieldNow();
     }
 
     const plannedItemIds = new Set(plan.items.map((item) => item.id));
     const removedItems = Array.from(existingItems.values())
       .filter((item) => !plannedItemIds.has(item.id) && item.deletedAt === 0)
       .map((item) => ({ ...item, deletedAt: now, updatedAt: now, isDirty: false }));
-    if (removedItems.length > 0) await db.items.bulkUpsert(removedItems);
+    for (const batch of chunk(removedItems, IMPORT_BATCH_SIZE)) {
+      await db.items.bulkUpsert(batch);
+      await yieldNow();
+    }
 
     const plannedFolderIds = new Set(plan.folders.map((folder) => folder.id));
     const removedFolderIds = folderDocs
       .map((doc) => doc.get("id") as string)
       .filter((id) => !plannedFolderIds.has(id));
-    if (removedFolderIds.length > 0) await db.folders.bulkRemove(removedFolderIds);
+    for (const batch of chunk(removedFolderIds, IMPORT_BATCH_SIZE)) {
+      await db.folders.bulkRemove(batch);
+      await yieldNow();
+    }
 
-    notifyDbChange("space_groups");
-    notifyDbChange("spaces");
-    notifyDbChange("folders");
-    notifyDbChange("items");
+    const cloudChanges: CloudSyncDocBatch = {
+      spaceGroups: groupUpdate ? [groupUpdate] : [],
+      spaces: changedSpaces,
+      folders: changedFolders,
+      items: [...changedItems, ...removedItems],
+      deletes: removedFolderIds.map((id) => ({ collection: "folders", id, updatedAt: now, deletedAt: now })),
+    };
+    const changedCount =
+      cloudChanges.spaceGroups!.length +
+      cloudChanges.spaces!.length +
+      cloudChanges.folders!.length +
+      cloudChanges.items!.length +
+      cloudChanges.deletes!.length;
+    if (changedCount > 0) await sync.enqueueDocs(cloudChanges);
+
+    if (changedItems.length > 0 || removedItems.length > 0) {
+      (this.options.markSearchDirty ?? (() => localSearchIndexService.markDirty()))();
+    }
+
+    if (groupUpdate) publishDbChange("space_groups");
+    if (changedSpaces.length > 0) publishDbChange("spaces");
+    if (changedFolders.length > 0 || removedFolderIds.length > 0) publishDbChange("folders");
+    if (changedItems.length > 0 || removedItems.length > 0) publishDbChange("items");
     return {
       spaceGroupId: GITHUB_STARS_SPACE_GROUP_ID,
       spaceIds: plan.spaces.map((space) => space.id),
       importedCount: plan.items.length,
-      updatedCount,
+      updatedCount: changedItems.length,
       removedCount: removedItems.length,
-      metadataUrls: Array.from(new Set(plan.items.map((item) => item.url))),
+      metadataUrls: Array.from(metadataUrls),
     };
   }
 }

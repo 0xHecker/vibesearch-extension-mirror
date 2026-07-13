@@ -1,4 +1,9 @@
 import { extractContent } from "./platform-adapters";
+import {
+  PAGE_ARCHIVE_CAPTURE_MESSAGE,
+  type ArchiveProtocolResponse,
+  type PageArchiveCaptureRequest,
+} from "@src/services/archive-capture-protocol";
 
 type HoverSaveTarget = {
   url: string;
@@ -61,3 +66,20 @@ document.addEventListener(
   },
   true
 );
+
+let archiveCaptureModule: Promise<typeof import("./page-archive-capture")> | null = null;
+
+chrome.runtime.onMessage.addListener((message: PageArchiveCaptureRequest, _sender, sendResponse) => {
+  if (message?.type !== PAGE_ARCHIVE_CAPTURE_MESSAGE) return;
+  archiveCaptureModule ||= import("./page-archive-capture");
+  void archiveCaptureModule
+    .then(({ capturePageArchive }) => capturePageArchive(message.payload))
+    .then((payload) => sendResponse({ success: true, payload } satisfies ArchiveProtocolResponse))
+    .catch((error) =>
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "ARCHIVE_CAPTURE_FAILED",
+      } satisfies ArchiveProtocolResponse),
+    );
+  return true;
+});
