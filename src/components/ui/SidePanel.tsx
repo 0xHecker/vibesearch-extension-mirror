@@ -11,7 +11,7 @@ const SidePanel = React.forwardRef<HTMLDivElement, SidePanelProps>(
       <div
         ref={ref}
         className={cn(
-          "h-full w-[240px] bg-background-page-secondary shadow-lg transition-transform duration-300 ease-in-out",
+          "h-full w-[240px] bg-background-page-secondary shadow-lg transition-transform duration-300 ease-in-out overflow-hidden",
           className
         )}
         {...props}

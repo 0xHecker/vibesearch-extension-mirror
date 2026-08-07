@@ -37,7 +37,7 @@ export type SpaceDocType = {
 
 export const spaceSchema: RxJsonSchema<SpaceDocType> = {
   title: "space schema",
-  version: 0,
+  version: 2,
   description: "Describes a space used to scope folders and items",
   primaryKey: "id",
   type: "object",
@@ -104,4 +104,26 @@ export const spaceSchema: RxJsonSchema<SpaceDocType> = {
     "updatedAt",
   ],
   indexes: ["isPrivate", "sortOrder", "name", "isArchived", "slug", "spaceGroupId", "deletedAt", "purgeAt"],
+};
+
+const normalizeLegacySpace = (oldDoc: SpaceDocType): SpaceDocType => {
+  const row = oldDoc as SpaceDocType & Record<string, unknown>;
+  row.spaceGroupId = typeof row.spaceGroupId === "string" ? row.spaceGroupId : UNGROUPED_SPACE_GROUP_ID;
+  row.isPrivate = row.isPrivate === true;
+  row.autoLockMs =
+    Number.isSafeInteger(row.autoLockMs) && row.autoLockMs >= 30_000
+      ? Math.min(row.autoLockMs, 24 * 60 * 60 * 1000)
+      : DEFAULT_PRIVATE_AUTO_LOCK_MS;
+  row.sortOrder = Number.isSafeInteger(row.sortOrder) && row.sortOrder >= 0 ? row.sortOrder : 0;
+  row.isArchived = row.isArchived === true;
+  row.deletedAt = Number.isSafeInteger(row.deletedAt) && row.deletedAt >= 0 ? row.deletedAt : SPACE_NOT_BINNED;
+  row.purgeAt = Number.isSafeInteger(row.purgeAt) && row.purgeAt >= 0 ? row.purgeAt : 0;
+  row.createdAt = Number.isSafeInteger(row.createdAt) && row.createdAt >= 0 ? row.createdAt : 0;
+  row.updatedAt = Number.isSafeInteger(row.updatedAt) && row.updatedAt >= 0 ? row.updatedAt : row.createdAt;
+  return row;
+};
+
+export const spaceMigrationStrategies = {
+  1: normalizeLegacySpace,
+  2: normalizeLegacySpace,
 };

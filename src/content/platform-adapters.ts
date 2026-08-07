@@ -2,6 +2,8 @@
 // Injected on-demand into the page context to resolve canonical entities
 // (post/video/repo/article) from a clicked element, even mid-scroll.
 
+import { getPreferredYouTubeVideoId } from "@src/utils/media-embed";
+
 export type ExtractedContent = {
   canonicalUrl: string;
   title: string;
@@ -165,9 +167,11 @@ const twitter: Adapter = (target) => {
 };
 
 const youtube: Adapter = (target, clickedUrl) => {
-  const shortVideoId =
-    window.location.pathname.match(/\/shorts\/([^/?#]+)/)?.[1] ||
-    clickedUrl?.match(/\/shorts\/([^/?#]+)/)?.[1];
+  const clickedShortVideoId = clickedUrl?.match(/\/shorts\/([^/?#]+)/)?.[1] || null;
+  const currentShortVideoId = !clickedUrl
+    ? window.location.pathname.match(/\/shorts\/([^/?#]+)/)?.[1] || null
+    : null;
+  const shortVideoId = clickedShortVideoId || currentShortVideoId;
   if (shortVideoId) {
     const videoId = shortVideoId;
     const canonicalUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : window.location.href;
@@ -183,9 +187,7 @@ const youtube: Adapter = (target, clickedUrl) => {
   }
 
   // Watch page
-  const videoId =
-    new URLSearchParams(window.location.search).get("v") ||
-    clickedUrl?.match(/[?&]v=([^&#]+)/)?.[1];
+  const videoId = getPreferredYouTubeVideoId(clickedUrl, window.location.href);
   if (!videoId) return null;
 
   const canonicalUrl = `https://www.youtube.com/watch?v=${videoId}`;

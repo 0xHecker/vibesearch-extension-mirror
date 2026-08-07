@@ -4,32 +4,29 @@ import { resolve } from "path";
 
 import baseConfig from "./vite.config.base";
 import baseManifest from "./manifest.base.json";
-import chromeManifest from "./manifest.chrome.json";
+import firefoxManifest from "./manifest.firefox.json";
+import hostPermissions from "./manifest.host-permissions.json";
 import pkg from "./package.json";
+import { createFirefoxManifest } from "./extension-manifest-config";
 
 const isDev = process.env.NODE_ENV !== "production";
 
-const manifest: ManifestV3Export = {
-  ...baseManifest,
-  ...chromeManifest,
-  version: pkg.version,
-};
+const manifestConfig = createFirefoxManifest(
+  baseManifest,
+  firefoxManifest,
+  hostPermissions,
+  pkg.version
+);
 
 if (isDev) {
-  manifest.name = "Vibesearch (Dev)";
-  manifest.action = {
-    ...manifest.action,
-    default_icon: {
-      "32": "public/dev-icon-32.png",
-    },
-  };
-  manifest.icons = {
-    "128": "public/dev-icon-128.png",
-  };
+  manifestConfig.name = "Vibesearch (Dev)";
 }
+
+const manifest = manifestConfig as unknown as ManifestV3Export;
 
 const firefoxConfig = defineConfig({
   build: {
+    target: "firefox142",
     outDir: resolve(__dirname, "dist_firefox"),
     sourcemap: isDev,
     emptyOutDir: !isDev,
@@ -38,19 +35,64 @@ const firefoxConfig = defineConfig({
       input: {
         search: resolve(__dirname, "src/pages/search/index.html"),
         offscreen: resolve(__dirname, "src/pages/offscreen/offscreen.html"),
-        ocrSandbox: resolve(__dirname, "src/pages/ocr-sandbox/index.html"),
       },
     },
+  },
+  optimizeDeps: {
+    exclude: ["@paddleocr/paddleocr-js"],
+  },
+  resolve: {
+    // Firefox MV3 does not implement Chrome's manifest sandbox pages. Replace
+    // the unsafe-eval PaddleOCR implementation so the Gecko package remains
+    // loadable and AMO-reviewable; local semantic embeddings remain enabled.
+    alias: [
+      {
+        // The app never enables FlexSearch's optional nested worker. Its compact
+        // build omits the worker factory and the string-eval code it carries.
+        find: "flexsearch",
+        replacement: resolve(
+          __dirname,
+          "node_modules/flexsearch/dist/flexsearch.compact.module.min.js"
+        ),
+      },
+      {
+        // Transformers imports the WebGPU superset even when the model selects
+        // `device: \"wasm\"`. Firefox uses ORT's smaller WASM-only bundle whose
+        // embedded standard factory does not require string evaluation.
+        find: "onnxruntime-web/webgpu",
+        replacement: resolve(
+          __dirname,
+          "node_modules/onnxruntime-web/dist/ort.wasm.bundle.min.mjs"
+        ),
+      },
+      {
+        find: "@src/services/embedding-wasm-assets",
+        replacement: resolve(
+          __dirname,
+          "src/services/embedding-wasm-assets.firefox.ts"
+        ),
+      },
+      {
+        find: "@src/services/google-auth",
+        replacement: resolve(__dirname, "src/services/google-auth.firefox.ts"),
+      },
+      {
+        find: "@src/services/browser-bookmark-events",
+        replacement: resolve(
+          __dirname,
+          "src/services/browser-bookmark-events.firefox.ts"
+        ),
+      },
+      {
+        find: "@src/services/ocr.service",
+        replacement: resolve(__dirname, "src/services/ocr.service.firefox.ts"),
+      },
+    ],
   },
   plugins: [
     crx({
       manifest,
-      // NOTE: intentionally still "chrome". A true Firefox MV3 build needs a
-      // Firefox manifest (background.scripts instead of service_worker, plus
-      // browser_specific_settings.gecko.id); crxjs errors trying to convert the
-      // Chrome service_worker manifest. Until that exists this produces a
-      // Chrome-target build in its own dir (no longer clobbering dist_chrome).
-      browser: "chrome",
+      browser: "firefox",
     }),
   ],
 });

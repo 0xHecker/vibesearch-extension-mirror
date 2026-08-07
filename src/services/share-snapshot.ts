@@ -5,7 +5,15 @@ import type { ItemTagDocType } from "@src/schemas/item_tag_schema";
 import { UNGROUPED_SPACE_GROUP_ID, type SpaceDocType } from "@src/schemas/space_schema";
 import type { SpaceGroupDocType } from "@src/schemas/space_group_schema";
 import type { TagDocType } from "@src/schemas/tag_schema";
-import { PUBLIC_SPACE_ID } from "@src/common/spaces";
+import { LIVE_SPACE_SELECTOR, PUBLIC_SPACE_ID } from "@src/common/spaces";
+import {
+  withBinMutationLock,
+  withStableAffectedSpaceLocks,
+} from "@src/services/entity-mutation-lock";
+import {
+  withLiveSpaceDestination,
+} from "@src/services/live-destination";
+import { checkedRxBulkWrite } from "@src/services/rxdb-bulk-write";
 
 export type ShareSourceKind = "folder" | "folders" | "items";
 
@@ -134,6 +142,66 @@ export type MergeBackupSnapshotResult = {
   warnings: string[];
 };
 
+const addSpaceId = (spaceIds: Set<string>, value: unknown): void => {
+  if (typeof value !== "string") return;
+  const id = value.trim();
+  if (id) spaceIds.add(id);
+};
+
+const findDocsByIds = async (collection: any, ids: Iterable<string>): Promise<any[]> => {
+  const uniqueIds = Array.from(new Set(ids)).filter(Boolean);
+  const documents: any[] = [];
+  const batchSize = 200;
+  for (let offset = 0; offset < uniqueIds.length; offset += batchSize) {
+    const batch = uniqueIds.slice(offset, offset + batchSize);
+    const batchSet = new Set(batch);
+    const rows = await collection
+      .find({ selector: { id: { $in: batch } } })
+      .exec();
+    // Keep the post-filter because simple test adapters and older RxDB query
+    // planners may return a broader result for a large `$in` expression.
+    for (const row of rows) {
+      const id = row.get("id") as string | undefined;
+      if (id && batchSet.has(id)) documents.push(row);
+    }
+  }
+  return documents;
+};
+
+const incomingBackupSpaceIds = (snapshot: ShareSnapshotV1): Set<string> => {
+  const ids = new Set<string>([PUBLIC_SPACE_ID]);
+  for (const space of snapshot.spaces) addSpaceId(ids, space.id);
+  for (const folder of snapshot.folders) addSpaceId(ids, folder.spaceId);
+  for (const item of snapshot.items) addSpaceId(ids, item.spaceId);
+  return ids;
+};
+
+const currentBackupSpaceIds = async (
+  snapshot: ShareSnapshotV1,
+  db: Awaited<ReturnType<typeof getDb>>
+): Promise<Set<string>> => {
+  const ids = new Set<string>();
+  const folderIds = new Set<string>();
+  for (const folder of snapshot.folders) folderIds.add(folder.id);
+  for (const item of snapshot.items) {
+    if (item.folderId) folderIds.add(item.folderId);
+  }
+
+  const itemDocs = await findDocsByIds(
+    db.items,
+    snapshot.items.map((item) => item.id)
+  );
+  for (const itemDoc of itemDocs) {
+    addSpaceId(ids, itemDoc.get("spaceId"));
+    const folderId = itemDoc.get("folderId");
+    if (typeof folderId === "string" && folderId) folderIds.add(folderId);
+  }
+
+  const folderDocs = await findDocsByIds(db.folders, folderIds);
+  for (const folderDoc of folderDocs) addSpaceId(ids, folderDoc.get("spaceId"));
+  return ids;
+};
+
 const SOURCE_VALUES = new Set<ItemDocType["source"]>([
   "web",
   "twitter",
@@ -173,7 +241,7 @@ export async function buildShareSnapshotFromMixed(
   const db = await getDb();
   const [spaceGroupDocs, spaceDocs, folderDocs, itemDocs, tagDocs, itemTagDocs] = await Promise.all([
     db.space_groups.find().exec(),
-    db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec(),
+    db.spaces.find({ selector: { ...LIVE_SPACE_SELECTOR } }).exec(),
     db.folders.find().exec(),
     db.items.find({ selector: { deletedAt: { $eq: 0 } } }).exec(),
     db.tags.find().exec(),
@@ -184,19 +252,36 @@ export async function buildShareSnapshotFromMixed(
     raw: doc.toMutableJSON() as SpaceGroupDocType,
     sanitized: sanitizeSpaceGroup(doc.toMutableJSON() as SpaceGroupDocType),
   }));
-  const allSpaces = spaceDocs.map((doc) => ({
-    raw: doc.toMutableJSON() as SpaceDocType,
-    sanitized: sanitizeSpace(doc.toMutableJSON() as SpaceDocType),
-  }));
-  const allFolders = folderDocs.map((doc) => ({
-    raw: doc.toMutableJSON() as FolderDocType,
-    sanitized: sanitizeFolder(doc.toMutableJSON() as FolderDocType),
-  }));
+  const allSpaces = spaceDocs
+    .map((doc) => ({
+      raw: doc.toMutableJSON() as SpaceDocType,
+      sanitized: sanitizeSpace(doc.toMutableJSON() as SpaceDocType),
+    }))
+    .filter((space) => (space.raw.deletedAt || 0) === 0 && space.raw.isArchived !== true);
+  const liveSpaceIds = new Set(allSpaces.map((space) => space.raw.id));
+  const allFolders = folderDocs
+    .map((doc) => ({
+      raw: doc.toMutableJSON() as FolderDocType,
+      sanitized: sanitizeFolder(doc.toMutableJSON() as FolderDocType),
+    }))
+    .filter(
+      (folder) =>
+        (folder.raw.deletedAt || 0) === 0 && liveSpaceIds.has(folder.raw.spaceId)
+    );
+  const liveFolderSpaceById = new Map(
+    allFolders.map((folder) => [folder.raw.id, folder.raw.spaceId])
+  );
   const warnings: ShareSnapshotWarning[] = [];
-  const allItems = itemDocs.map((doc) => ({
-    raw: doc.toMutableJSON() as ItemDocType,
-    sanitized: sanitizeItem(doc.toMutableJSON() as ItemDocType, warnings),
-  }));
+  const allItems = itemDocs
+    .map((doc) => ({
+      raw: doc.toMutableJSON() as ItemDocType,
+      sanitized: sanitizeItem(doc.toMutableJSON() as ItemDocType, warnings),
+    }))
+    .filter((item) => {
+      const owningSpaceId =
+        liveFolderSpaceById.get(item.raw.folderId) || item.raw.spaceId || PUBLIC_SPACE_ID;
+      return liveSpaceIds.has(owningSpaceId);
+    });
 
   // Resolve spaces and space groups to a set of target space ids.
   const targetSpaceIds = new Set<string>();
@@ -209,14 +294,33 @@ export async function buildShareSnapshotFromMixed(
     }
   }
 
-  // Resolve target folder ids: directly selected + folders inside target spaces.
-  const targetFolderIds = new Set<string>();
-  for (const folderId of input.selection.folderIds) targetFolderIds.add(folderId);
+  // Resolve folders whose contents are explicitly selected.
+  const contentFolderIds = new Set<string>();
+  for (const folderId of input.selection.folderIds) contentFolderIds.add(folderId);
   for (const folder of allFolders) {
-    if (targetSpaceIds.has(folder.raw.spaceId)) targetFolderIds.add(folder.raw.id);
+    if (targetSpaceIds.has(folder.raw.spaceId)) contentFolderIds.add(folder.raw.id);
+  }
+  let expandedFolderSet = true;
+  while (expandedFolderSet) {
+    expandedFolderSet = false;
+    for (const folder of allFolders) {
+      if (
+        folder.raw.parentId &&
+        contentFolderIds.has(folder.raw.parentId) &&
+        !contentFolderIds.has(folder.raw.id)
+      ) {
+        contentFolderIds.add(folder.raw.id);
+        expandedFolderSet = true;
+      }
+    }
   }
 
-  // Resolve target item ids: directly selected + items in target folders.
+  // Resolve all folder ids included in the snapshot: content folders plus
+  // lightweight containers for directly selected items.
+  const targetFolderIds = new Set<string>();
+  for (const folderId of contentFolderIds) targetFolderIds.add(folderId);
+
+  // Resolve directly selected item ids.
   const targetItemIds = new Set<string>();
   for (const itemId of input.selection.itemIds) targetItemIds.add(itemId);
 
@@ -237,14 +341,14 @@ export async function buildShareSnapshotFromMixed(
     return true;
   });
 
-  // Items: directly selected + items whose folder is included.
+  // Items: directly selected + items whose folder contents are included.
   const includedItems = allItems.filter((item) => {
     if (targetItemIds.has(item.raw.id)) {
       if (item.raw.folderId && targetFolderIds.has(item.raw.folderId)) return true;
       // Item selected but its folder wasn't resolved — keep it anyway with undefined folderId.
       return true;
     }
-    return item.raw.folderId ? targetFolderIds.has(item.raw.folderId) : false;
+    return item.raw.folderId ? contentFolderIds.has(item.raw.folderId) : false;
   });
 
   // Spaces: any space that owns an included folder.
@@ -316,7 +420,7 @@ export async function buildLocalExportSnapshot(
   const db = await getDb();
   const [spaceGroupDocs, spaceDocs, folderDocs, itemDocs, tagDocs, itemTagDocs] = await Promise.all([
     db.space_groups.find().exec(),
-    db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec(),
+    db.spaces.find({ selector: { ...LIVE_SPACE_SELECTOR } }).exec(),
     db.folders.find().exec(),
     db.items.find({ selector: { deletedAt: { $eq: 0 } } }).exec(),
     db.tags.find().exec(),
@@ -326,17 +430,25 @@ export async function buildLocalExportSnapshot(
   const spaceGroups = spaceGroupDocs.map((doc) =>
     sanitizeSpaceGroup(doc.toMutableJSON() as SpaceGroupDocType)
   );
-  const spaces = spaceDocs.map((doc) => sanitizeSpace(doc.toMutableJSON() as SpaceDocType));
+  const spaces = spaceDocs
+    .map((doc) => doc.toMutableJSON() as SpaceDocType)
+    .filter((space) => (space.deletedAt || 0) === 0 && space.isArchived !== true)
+    .map((space) => sanitizeSpace(space));
   const spaceIds = new Set(spaces.map((space) => space.id));
   const folders = folderDocs
-    .map((doc) => sanitizeFolder(doc.toMutableJSON() as FolderDocType))
+    .map((doc) => doc.toMutableJSON() as FolderDocType)
+    .filter((folder) => (folder.deletedAt || 0) === 0)
+    .map((folder) => sanitizeFolder(folder))
     .filter((folder) => !folder.spaceId || spaceIds.has(folder.spaceId));
   const folderIds = new Set(folders.map((folder) => folder.id));
 
   const warnings: ShareSnapshotWarning[] = [];
   const items = itemDocs
-    .map((doc) => sanitizeItem(doc.toMutableJSON() as ItemDocType, warnings))
-    .filter((item) => !item.folderId || folderIds.has(item.folderId));
+    .map((doc) => doc.toMutableJSON() as ItemDocType)
+    .filter((item) =>
+      item.folderId ? folderIds.has(item.folderId) : spaceIds.has(item.spaceId || PUBLIC_SPACE_ID)
+    )
+    .map((item) => sanitizeItem(item, warnings));
   const itemIds = new Set(items.map((item) => item.id));
 
   const tags = tagDocs.map((doc) => sanitizeTag(doc.toMutableJSON() as TagDocType));
@@ -375,54 +487,64 @@ export async function importSharedSnapshot(
   const db = await getDb();
   const now = Date.now();
   const targetSpaceId = await resolveTargetSpaceId(db, payload.targetSpaceId);
-  const rootFolder: FolderDocType = {
-    id: crypto.randomUUID(),
-    name: normalizeTitle(payload.rootFolderName, snapshot.title || "Shared import"),
-    userId: "",
-    spaceId: targetSpaceId,
-    parentId: null,
-    type: "folder",
-    sortOrder: now,
-    isLocked: false,
-    isPinned: false,
-    isCollapsed: false,
-    isDirty: true,
-    serverVersion: 0,
-    createdAt: now,
-    updatedAt: now,
-  };
-
   const folderIdMap = new Map<string, string>();
-  const importedFolders: FolderDocType[] = [rootFolder];
+  const importedFolders: FolderDocType[] = [];
   const sourceFolders = [...snapshot.folders].sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
   for (const folder of sourceFolders) {
     folderIdMap.set(folder.id, crypto.randomUUID());
   }
+  let rootFolderId = "";
   for (const folder of sourceFolders) {
     const newId = folderIdMap.get(folder.id) || crypto.randomUUID();
+    const parentId = folder.parentId ? folderIdMap.get(folder.parentId) || null : null;
+    if (!rootFolderId && parentId === null) rootFolderId = newId;
     importedFolders.push({
       id: newId,
       name: normalizeTitle(folder.name, "Imported folder"),
       userId: "",
       spaceId: targetSpaceId,
-      parentId: folder.parentId ? folderIdMap.get(folder.parentId) || rootFolder.id : rootFolder.id,
+      parentId,
       type: folder.type === "tab_group" ? "tab_group" : "folder",
       sortOrder: Number.isFinite(folder.sortOrder) ? Math.max(0, Math.floor(folder.sortOrder as number)) : now,
       isLocked: false,
       isPinned: false,
       isCollapsed: false,
+      deletedAt: 0,
+      purgeAt: 0,
       isDirty: true,
       serverVersion: 0,
       createdAt: now,
       updatedAt: now,
     });
   }
+  if (!rootFolderId) {
+    const fallbackRoot: FolderDocType = {
+      id: crypto.randomUUID(),
+      name: normalizeTitle(payload.rootFolderName, snapshot.title || "Shared import"),
+      userId: "",
+      spaceId: targetSpaceId,
+      parentId: null,
+      type: "tab_group",
+      sortOrder: now,
+      isLocked: false,
+      isPinned: false,
+      isCollapsed: false,
+      deletedAt: 0,
+      purgeAt: 0,
+      isDirty: true,
+      serverVersion: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    importedFolders.push(fallbackRoot);
+    rootFolderId = fallbackRoot.id;
+  }
 
   const itemIdMap = new Map<string, string>();
   const importedItems = snapshot.items.map((item, index) => {
     const newId = crypto.randomUUID();
     itemIdMap.set(item.id, newId);
-    const folderId = item.folderId ? folderIdMap.get(item.folderId) || rootFolder.id : rootFolder.id;
+    const folderId = item.folderId ? folderIdMap.get(item.folderId) || rootFolderId : rootFolderId;
     return toImportedItem(item, newId, folderId, targetSpaceId, now + index);
   });
 
@@ -457,21 +579,45 @@ export async function importSharedSnapshot(
     })
     .filter((join): join is ItemTagDocType => join !== null);
 
-  await db.folders.bulkInsert(importedFolders);
-  if (importedItems.length > 0) await db.items.bulkInsert(importedItems);
-  if (importedTags.length > 0) await db.tags.bulkInsert(importedTags);
-  if (importedItemTags.length > 0) await db.item_tags.bulkUpsert(importedItemTags as any);
+  return withBinMutationLock(db, () =>
+    withLiveSpaceDestination(db, targetSpaceId, async () => {
+      // The target is resolved once for UX fallback, then re-read under the
+      // same lifecycle/space lock used by Bin operations. A space that was
+      // binned or archived while the snapshot was prepared must not receive
+      // new live folders or items.
+      await checkedRxBulkWrite(
+        "shared-import.folders",
+        importedFolders,
+        (rows) => db.folders.bulkInsert(rows)
+      );
+      await checkedRxBulkWrite(
+        "shared-import.items",
+        importedItems,
+        (rows) => db.items.bulkInsert(rows)
+      );
+      await checkedRxBulkWrite(
+        "shared-import.tags",
+        importedTags,
+        (rows) => db.tags.bulkInsert(rows)
+      );
+      await checkedRxBulkWrite(
+        "shared-import.item-tags",
+        importedItemTags,
+        (rows) => db.item_tags.bulkUpsert(rows)
+      );
 
-  sendDbChange("folders");
-  sendDbChange("items");
-  if (importedTags.length > 0 || importedItemTags.length > 0) sendDbChange("tags");
+      sendDbChange("folders");
+      sendDbChange("items");
+      if (importedTags.length > 0 || importedItemTags.length > 0) sendDbChange("tags");
 
-  return {
-    rootFolderId: rootFolder.id,
-    folderCount: importedFolders.length,
-    itemCount: importedItems.length,
-    tagCount: importedTags.length,
-  };
+      return {
+        rootFolderId,
+        folderCount: importedFolders.length,
+        itemCount: importedItems.length,
+        tagCount: importedTags.length,
+      };
+    })
+  );
 }
 
 /**
@@ -484,6 +630,23 @@ export async function mergeBackupSnapshot(
 ): Promise<MergeBackupSnapshotResult> {
   const snapshot = validateSnapshot(snapshotValue);
   const db = await getDb();
+  const lifecycleSpaceIds = incomingBackupSpaceIds(snapshot);
+
+  return withBinMutationLock(db, () =>
+    withStableAffectedSpaceLocks(
+      db,
+      lifecycleSpaceIds,
+      () => currentBackupSpaceIds(snapshot, db),
+      () =>
+      mergeBackupSnapshotLocked(snapshot, db)
+    )
+  );
+}
+
+async function mergeBackupSnapshotLocked(
+  snapshot: ShareSnapshotV1,
+  db: Awaited<ReturnType<typeof getDb>>
+): Promise<MergeBackupSnapshotResult> {
   const now = Date.now();
   const warnings: string[] = (snapshot.warnings || [])
     .map((warning) => warning.detail)
@@ -524,6 +687,8 @@ export async function mergeBackupSnapshot(
         spaceGroupId: UNGROUPED_SPACE_GROUP_ID,
         sortOrder: normalizeNumber(source.sortOrder) ?? existing.sortOrder,
         isArchived: false,
+        deletedAt: 0,
+        purgeAt: 0,
         updatedAt: Math.max(existing.updatedAt, normalizeNumber(snapshot.createdAt) || now),
       });
       continue;
@@ -549,58 +714,191 @@ export async function mergeBackupSnapshot(
       updatedAt: now,
     });
   }
-  if (spaces.length > 0) await db.spaces.bulkUpsert(spaces);
-  const validSpaceIds = new Set([...existingSpaces.keys(), ...spaces.map((space) => space.id), PUBLIC_SPACE_ID]);
+  await checkedRxBulkWrite(
+    "backup-restore.spaces",
+    spaces,
+    (rows) => db.spaces.bulkUpsert(rows)
+  );
+  const prospectiveSpaces = new Map(existingSpaces);
+  for (const space of spaces) prospectiveSpaces.set(space.id, space);
+  const liveSpaceIds = new Set(
+    Array.from(prospectiveSpaces.values())
+      .filter((space) => (space.deletedAt || 0) === 0 && space.isArchived !== true)
+      .map((space) => space.id)
+  );
+  const fallbackSpaceId = liveSpaceIds.has(PUBLIC_SPACE_ID) ? PUBLIC_SPACE_ID : null;
 
-  const sourceFolderIds = new Set(snapshot.folders.map((folder) => folder.id));
-  const folders: FolderDocType[] = snapshot.folders.map((source) => {
-    const existing = existingFolders.get(source.id);
-    const spaceId = source.spaceId && validSpaceIds.has(source.spaceId) ? source.spaceId : PUBLIC_SPACE_ID;
-    if (existing) {
-      return {
-        ...existing,
-        name: normalizeTitle(source.name, existing.name),
-        spaceId,
-        parentId: source.parentId && sourceFolderIds.has(source.parentId) ? source.parentId : null,
-        type: source.type === "tab_group" ? "tab_group" : "folder",
-        sortOrder: normalizeNumber(source.sortOrder) ?? existing.sortOrder,
-        isDirty: true,
-        updatedAt: Math.max(existing.updatedAt, normalizeNumber(snapshot.createdAt) || now),
-      };
-    }
-    return {
-      id: source.id,
-      name: normalizeTitle(source.name, "Imported folder"),
-      userId: "",
-      spaceId,
-      parentId: source.parentId && sourceFolderIds.has(source.parentId) ? source.parentId : null,
-      type: source.type === "tab_group" ? "tab_group" : "folder",
-      sortOrder: normalizeNumber(source.sortOrder) ?? now,
-      isLocked: false,
-      isPinned: false,
-      isCollapsed: false,
-      isDirty: true,
-      serverVersion: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
-  });
-  if (folders.length > 0) await db.folders.bulkUpsert(folders);
-  const validFolderIds = new Set([...existingFolders.keys(), ...folders.map((folder) => folder.id)]);
-  const folderSpaceIds = new Map(folders.map((folder) => [folder.id, folder.spaceId]));
-
-  const items: ItemDocType[] = [];
-  for (const source of snapshot.items) {
-    const existing = existingItems.get(source.id);
-    const folderId = source.folderId && validFolderIds.has(source.folderId) ? source.folderId : existing?.folderId;
-    if (!folderId) {
-      warnings.push(`Skipped item "${source.title}" because its folder is absent from the backup.`);
+  const requestedParentByFolderId = new Map<string, string | null>();
+  const folders: FolderDocType[] = [];
+  const restoredFolderIds = new Set<string>();
+  for (const source of snapshot.folders) {
+    if (restoredFolderIds.has(source.id)) {
+      warnings.push(`Skipped duplicate folder id "${source.id}" in the backup.`);
       continue;
     }
-    const spaceId = folderSpaceIds.get(folderId) || existing?.spaceId || PUBLIC_SPACE_ID;
+    const existing = existingFolders.get(source.id);
+    const requestedSpaceId = source.spaceId || existing?.spaceId || PUBLIC_SPACE_ID;
+    const spaceId = liveSpaceIds.has(requestedSpaceId)
+      ? requestedSpaceId
+      : fallbackSpaceId;
+    if (!spaceId) {
+      warnings.push(
+        `Skipped folder "${source.name}" because no live destination space is available.`
+      );
+      continue;
+    }
+    if (spaceId !== requestedSpaceId) {
+      warnings.push(
+        `Restored folder "${source.name}" to the default space because its destination is unavailable.`
+      );
+    }
+
+    restoredFolderIds.add(source.id);
+    requestedParentByFolderId.set(source.id, source.parentId || null);
+    folders.push(
+      existing
+        ? {
+            ...existing,
+            name: normalizeTitle(source.name, existing.name),
+            spaceId,
+            parentId: null,
+            type: source.type === "tab_group" ? "tab_group" : "folder",
+            sortOrder: normalizeNumber(source.sortOrder) ?? existing.sortOrder,
+            deletedAt: 0,
+            purgeAt: 0,
+            isDirty: true,
+            updatedAt: Math.max(existing.updatedAt, normalizeNumber(snapshot.createdAt) || now),
+          }
+        : {
+            id: source.id,
+            name: normalizeTitle(source.name, "Imported folder"),
+            userId: "",
+            spaceId,
+            parentId: null,
+            type: source.type === "tab_group" ? "tab_group" : "folder",
+            sortOrder: normalizeNumber(source.sortOrder) ?? now,
+            isLocked: false,
+            isPinned: false,
+            isCollapsed: false,
+            deletedAt: 0,
+            purgeAt: 0,
+            isDirty: true,
+            serverVersion: 0,
+            createdAt: now,
+            updatedAt: now,
+          }
+    );
+  }
+
+  const restoredFolderById = new Map(folders.map((folder) => [folder.id, folder]));
+  const parentByFolderId = new Map<string, string | null>();
+  for (const folder of folders) {
+    const parentId = requestedParentByFolderId.get(folder.id) || null;
+    const parent = parentId ? restoredFolderById.get(parentId) : undefined;
+    if (parent && parent.id !== folder.id && parent.spaceId === folder.spaceId) {
+      parentByFolderId.set(folder.id, parent.id);
+    } else {
+      if (parentId) {
+        warnings.push(
+          `Restored folder "${folder.name}" at the root because its parent is unavailable or belongs to another space.`
+        );
+      }
+      parentByFolderId.set(folder.id, null);
+    }
+  }
+  for (const folder of folders) {
+    const seen = new Set<string>([folder.id]);
+    let cursor = parentByFolderId.get(folder.id) || null;
+    let cyclic = false;
+    while (cursor) {
+      if (seen.has(cursor)) {
+        cyclic = true;
+        break;
+      }
+      seen.add(cursor);
+      cursor = parentByFolderId.get(cursor) || null;
+    }
+    if (cyclic) {
+      parentByFolderId.set(folder.id, null);
+      warnings.push(`Restored folder "${folder.name}" at the root to break a parent cycle.`);
+    }
+    folder.parentId = parentByFolderId.get(folder.id) || null;
+  }
+
+  await checkedRxBulkWrite(
+    "backup-restore.folders",
+    folders,
+    (rows) => db.folders.bulkUpsert(rows)
+  );
+
+  const prospectiveFolders = new Map(existingFolders);
+  for (const folder of folders) prospectiveFolders.set(folder.id, folder);
+  const liveFolderCache = new Map<string, boolean>();
+  const isLiveFolderDestination = (folderId: string): boolean => {
+    if (liveFolderCache.has(folderId)) return liveFolderCache.get(folderId) === true;
+    const path: string[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = folderId;
+    let live = true;
+    let expectedSpaceId = "";
+    while (cursor) {
+      const cached = liveFolderCache.get(cursor);
+      if (cached !== undefined) {
+        live = cached;
+        break;
+      }
+      if (seen.has(cursor)) {
+        live = false;
+        break;
+      }
+      seen.add(cursor);
+      const folder = prospectiveFolders.get(cursor);
+      if (
+        !folder ||
+        (folder.deletedAt || 0) !== 0 ||
+        !liveSpaceIds.has(folder.spaceId) ||
+        (expectedSpaceId && folder.spaceId !== expectedSpaceId)
+      ) {
+        live = false;
+        break;
+      }
+      expectedSpaceId = folder.spaceId;
+      path.push(cursor);
+      cursor = folder.parentId || null;
+    }
+    for (const id of path) liveFolderCache.set(id, live);
+    if (path.length === 0) liveFolderCache.set(folderId, live);
+    return live;
+  };
+
+  const items: ItemDocType[] = [];
+  const restoredOrRetainedItemIds = new Set<string>();
+  for (const source of snapshot.items) {
+    const existing = existingItems.get(source.id);
+    const requestedFolderId = source.folderId || existing?.folderId || "";
+    const folderId =
+      requestedFolderId && isLiveFolderDestination(requestedFolderId)
+        ? requestedFolderId
+        : "";
+    if (!folderId) {
+      warnings.push(
+        `Skipped item "${source.title}" because its folder or destination space is not live.`
+      );
+      continue;
+    }
+    const destinationFolder = prospectiveFolders.get(folderId) as FolderDocType;
+    const spaceId = destinationFolder.spaceId;
     const incoming = toImportedItem(source, source.id, folderId, spaceId, now);
     const sourceUpdatedAt = normalizeNumber(source.updatedAt) || now;
-    if (existing && existing.updatedAt > sourceUpdatedAt) continue;
+    if (
+      existing &&
+      existing.updatedAt > sourceUpdatedAt &&
+      (existing.deletedAt || 0) === 0 &&
+      isLiveFolderDestination(existing.folderId)
+    ) {
+      restoredOrRetainedItemIds.add(existing.id);
+      continue;
+    }
     items.push({
       ...incoming,
       userId: existing?.userId || incoming.userId,
@@ -614,8 +912,13 @@ export async function mergeBackupSnapshot(
       isEmbedded: false,
       isDirty: false,
     });
+    restoredOrRetainedItemIds.add(source.id);
   }
-  if (items.length > 0) await db.items.bulkUpsert(items);
+  await checkedRxBulkWrite(
+    "backup-restore.items",
+    items,
+    (rows) => db.items.bulkUpsert(rows)
+  );
 
   const tagIdMap = new Map<string, string>();
   const tags: TagDocType[] = [];
@@ -635,13 +938,16 @@ export async function mergeBackupSnapshot(
       updatedAt: now,
     });
   }
-  if (tags.length > 0) await db.tags.bulkUpsert(tags);
+  await checkedRxBulkWrite(
+    "backup-restore.tags",
+    tags,
+    (rows) => db.tags.bulkUpsert(rows)
+  );
 
-  const itemIds = new Set([...existingItems.keys(), ...items.map((item) => item.id)]);
   const itemTags = snapshot.itemTags
     .map((source) => {
       const tagId = tagIdMap.get(source.tagId);
-      if (!itemIds.has(source.itemId) || !tagId) return null;
+      if (!restoredOrRetainedItemIds.has(source.itemId) || !tagId) return null;
       return {
         id: `${source.itemId}|${tagId}`,
         itemId: source.itemId,
@@ -650,7 +956,11 @@ export async function mergeBackupSnapshot(
       } as ItemTagDocType;
     })
     .filter((row): row is ItemTagDocType => row !== null);
-  if (itemTags.length > 0) await db.item_tags.bulkUpsert(itemTags);
+  await checkedRxBulkWrite(
+    "backup-restore.item-tags",
+    itemTags,
+    (rows) => db.item_tags.bulkUpsert(rows)
+  );
 
   sendDbChange("spaces");
   sendDbChange("folders");

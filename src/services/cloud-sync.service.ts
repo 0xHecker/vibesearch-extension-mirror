@@ -5,16 +5,34 @@
  * truth; this module *forwards* captured/imported content to the web-app backend
  * (`vibesearch-api`). It never pulls. See docs/CONNECTORS.md.
  *
- * Auth reuses the Firebase ID token stored by the sign-in flow
- * (`archive.service.ts` → `AUTH_TOKEN_STORAGE_KEY`). Idempotency is client-side:
+ * Auth and API configuration reuse the primary cloud-sync service. Idempotency is client-side:
  * each item carries a stable `externalId` (e.g. `x:<tweetId>`); we remember which
  * ids we've pushed so a re-sync doesn't duplicate.
  */
+import { getCloudAuthToken } from "./cloud-auth";
 import {
-  resolveArchiveApiBase,
-  ArchiveAuthError,
-} from "./archive.service";
-import { getValidIdToken } from "./cloud-auth.service";
+  CLOUD_SYNC_API_BASE_KEY,
+  DEFAULT_VIBESEARCH_API_BASE,
+} from "./cloud-config";
+
+export class ConnectorCloudAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConnectorCloudAuthError";
+  }
+}
+
+const resolveConnectorApiBase = async (): Promise<string> => {
+  try {
+    const row = await chrome.storage.local.get(CLOUD_SYNC_API_BASE_KEY);
+    const configured = typeof row?.[CLOUD_SYNC_API_BASE_KEY] === "string"
+      ? row[CLOUD_SYNC_API_BASE_KEY].trim().replace(/\/+$/, "")
+      : "";
+    return configured || DEFAULT_VIBESEARCH_API_BASE;
+  } catch {
+    return DEFAULT_VIBESEARCH_API_BASE;
+  }
+};
 
 export interface CapturedMedia {
   type: string; // photo | video | gif | image | audio
@@ -93,16 +111,16 @@ function toItemBody(item: CapturedItem): Record<string, unknown> {
 
 /**
  * Push captured items to the cloud (create). Unidirectional. Skips items whose
- * `externalId` was already pushed. Throws `ArchiveAuthError` if not signed in
+ * `externalId` was already pushed. Throws `ConnectorCloudAuthError` if not signed in
  * (so callers can prompt sign-in); per-item HTTP failures are counted, not thrown.
  */
 export async function pushCapturedItems(
   items: CapturedItem[],
   opts?: { onProgress?: (done: number, total: number) => void; shouldCancel?: () => boolean },
 ): Promise<CloudPushResult> {
-  const token = await getValidIdToken();
-  if (!token) throw new ArchiveAuthError("Sign in to Vibesearch to sync to the cloud.");
-  const base = resolveArchiveApiBase();
+  const token = await getCloudAuthToken();
+  if (!token) throw new ConnectorCloudAuthError("Sign in to Vibesearch to sync to the cloud.");
+  const base = await resolveConnectorApiBase();
   const pushedIds = await loadPushedIds();
   console.log(`[Vibesearch · Cloud] pushing ${items.length} item(s) to ${base}…`);
 
@@ -130,7 +148,7 @@ export async function pushCapturedItems(
       });
       if (res.status === 401 || res.status === 403) {
         await savePushedIds(pushedIds);
-        throw new ArchiveAuthError("Your Vibesearch session expired — sign in again to sync.");
+        throw new ConnectorCloudAuthError("Your Vibesearch session expired — sign in again to sync.");
       }
       if (!res.ok) {
         console.warn(`[Vibesearch · Cloud] ✗ ${res.status} for`, item.url);
@@ -142,7 +160,7 @@ export async function pushCapturedItems(
         if (item.externalId) pushedIds.add(item.externalId);
       }
     } catch (err) {
-      if (err instanceof ArchiveAuthError) throw err;
+      if (err instanceof ConnectorCloudAuthError) throw err;
       failed += 1;
     }
     opts?.onProgress?.(done, items.length);
@@ -151,37 +169,4 @@ export async function pushCapturedItems(
   await savePushedIds(pushedIds);
   console.log(`[Vibesearch · Cloud] pushed ${pushed} new, ${skipped} already saved, ${failed} failed.`);
   return { pushed, skipped, failed };
-}
-
-/** Whether a cloud session token is present (drives the connectors UI state). */
-export async function isCloudConnected(): Promise<boolean> {
-  return (await getValidIdToken()) != null;
-}
-
-/**
- * Push a single captured item and return the created **cloud item id** (so a
- * snapshot can be attached to it via the archive endpoint). Returns null if not
- * signed in or the create failed. Records the `externalId` as pushed (dedupe).
- */
-export async function pushSingleItem(item: CapturedItem): Promise<{ id: string } | null> {
-  const token = await getValidIdToken();
-  if (!token) return null;
-  const base = resolveArchiveApiBase();
-  try {
-    const res = await fetch(`${base}/v1/items`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify(toItemBody(item)),
-    });
-    if (!res.ok) return null;
-    const data = (await res.json().catch(() => null)) as { id?: string } | null;
-    if (item.externalId) {
-      const ids = await loadPushedIds();
-      ids.add(item.externalId);
-      await savePushedIds(ids);
-    }
-    return data?.id ? { id: data.id } : null;
-  } catch {
-    return null;
-  }
 }

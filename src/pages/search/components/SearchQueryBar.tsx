@@ -1,4 +1,4 @@
-import { analyzeQuery } from "@src/search-core/query-language";
+import { analyzeQuery, removePillRangesFromQuery } from "@src/search-core/query-language";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Input } from "@src/components/ui/input";
 import { Popover, PopoverAnchor, PopoverContent } from "@src/components/ui/popover";
@@ -212,13 +212,19 @@ const analyzeOnce = (input: string, catalogs: QueryAssistCatalogs): QueryAnalysi
 // Split a query string into committed filter tokens (pills) + free text.
 const splitQuery = (query: string, catalogs: QueryAssistCatalogs) => {
   const analysis = analyzeOnce(query, catalogs);
-  return { tokens: analysis.pills.map((pill) => pill.raw), text: analysis.freeText };
+  return {
+    tokens: analysis.pills.map((pill) => pill.raw),
+    text: removePillRangesFromQuery(query, analysis.pills),
+  };
 };
 
 // Pull any complete filter tokens out of the input text so they can become pills.
 const extractFilters = (text: string, catalogs: QueryAssistCatalogs) => {
   const analysis = analyzeOnce(text, catalogs);
-  return { filters: analysis.pills.map((pill) => pill.raw), rest: analysis.freeText };
+  return {
+    filters: analysis.pills.map((pill) => pill.raw),
+    rest: removePillRangesFromQuery(text, analysis.pills),
+  };
 };
 
 export const SearchQueryBar = ({

@@ -7,6 +7,19 @@ import {
 import { setupOffscreenDocument } from "@src/services/offscreen-helper";
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { OPEN_ON_NEW_TAB_STORAGE_KEY } from "@src/common/new-tab-pref";
+import {
+  importSettingsPatchFromPayload,
+  normalizeImportSettings,
+  type ImportSettings,
+} from "@src/common/import-settings";
+import {
+  reconcileLiveImportLruFolders,
+  resolveLiveImportFolderTarget,
+  selectQuickSaveFolderTarget,
+  type ImportLruFolderEntry,
+  type LiveImportFolderTarget,
+  type LiveImportSpaceSnapshot,
+} from "@src/common/import-lru";
 import type { ImportTargetSpace } from "@src/services/db-manager";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { ItemDocType } from "@src/schemas/item_schema";
@@ -19,7 +32,9 @@ import {
   saveMediaToOpfs,
   uploadOpfsFileToR2,
   uploadRemoteMediaToR2,
-  deleteMediaFromOpfs,
+  mapWithConcurrencyStable,
+  BoundedOpfsCleanupBatch,
+  type OpfsFileIdentity,
 } from "@src/services/media-storage";
 import { OCR_MODEL_VERSION } from "@src/services/ocr-model-config";
 import {
@@ -34,12 +49,36 @@ import type {
   BrowserBookmarkImportResult,
   BrowserBookmarkNode,
 } from "@src/services/browser-bookmark-import";
+import {
+  BROWSER_BOOKMARK_RESYNC_ALARM_NAME,
+  BrowserBookmarkResyncScheduler,
+} from "@src/services/browser-bookmark-resync";
+import { registerBrowserBookmarkEvents } from "@src/services/browser-bookmark-events";
+import {
+  CLOUD_SYNC_CONTINUATION_DELAY_MS,
+  shouldScheduleCloudSyncContinuation,
+} from "@src/services/cloud-sync-continuation";
+import {
+  ARCHIVE_OUTBOX_ALARM_NAME,
+  ARCHIVE_OUTBOX_DRAIN_LIMIT,
+  ArchiveOutbox,
+  createChromeArchiveOutboxStorage,
+  createOpfsArchiveOutboxFiles,
+} from "@src/services/archive-outbox";
+import { ArchiveCaptureSessionManager } from "@src/services/archive-capture-session";
+import {
+  PAGE_ARCHIVE_ABORT_MESSAGE,
+  PAGE_ARCHIVE_CAPTURE_MESSAGE,
+  PAGE_ARCHIVE_CAPTURE_TIMEOUT_MS,
+  PAGE_ARCHIVE_CHUNK_CODE_UNITS,
+  PAGE_ARCHIVE_CHUNK_MESSAGE,
+  PAGE_ARCHIVE_FINISH_MESSAGE,
+  type ArchiveProtocolResponse,
+} from "@src/services/archive-capture-protocol";
+import { CLOUD_SYNC_TOKEN_KEY } from "@src/services/cloud-sync";
+import type { CloudAuthStatus } from "@src/services/cloud-auth";
 import type { GitHubStar, GitHubStarsImportResult } from "@src/services/github-stars-import";
 import { collectGitHubStarsPages } from "@src/services/github-stars-api";
-import { captureSingleFileSnapshot } from "@src/content/capture-snapshot";
-import type { CaptureSnapshotOptions, CaptureSnapshotResult } from "@src/content/capture-snapshot";
-import { uploadArchiveSnapshot, ArchiveAuthError } from "@src/services/archive.service";
-import { pushSingleItem, type CapturedItem } from "@src/services/cloud-sync.service";
 import {
   connect as connectConnector,
   disconnect as disconnectConnector,
@@ -51,19 +90,53 @@ import {
   setupConnectorScheduler,
   onConnectorAlarm,
   CONNECTOR_SYNC_ALARM,
+  CONNECTOR_CONTINUATION_ALARM,
+  type ConnectorSyncOutcome,
 } from "@src/services/connectors/registry";
-import {
-  signInWithGoogle,
-  signInWithTestCredentials,
-  signOutCloud,
-  getCloudAccount,
-} from "@src/services/cloud-auth.service";
 import type { ConnectorPlatform } from "@src/services/connectors/types";
 
 const SYNC_ALARM_NAME = "vector-sync-alarm";
+const CLOUD_SYNC_ALARM_NAME = "cloud-sync-alarm";
+const CLOUD_SYNC_CONTINUATION_ALARM_NAME = "cloud-sync-continuation";
+const ARCHIVE_OUTBOX_RETRY_ALARM_NAME = "archive-outbox-retry";
 const EMBEDDING_ALARM_NAME = "embedding-alarm";
 const METADATA_RETRY_ALARM_NAME = "metadata-retry-alarm";
-const FORCE_DEV_OFFSCREEN_RESET = (import.meta as any)?.env?.VITE_FORCE_DEV_OFFSCREEN_RESET === "1";
+const CONNECTOR_MESSAGE_TYPES = new Set([
+  "RUN_CONNECTOR_SYNC",
+  "CANCEL_CONNECTOR_SYNC",
+  "CONNECTOR_LIST",
+  "CONNECTOR_CONNECT",
+  "CONNECTOR_DISCONNECT",
+  "CONNECTOR_SET_AUTOSYNC",
+]);
+const CONNECTOR_LABELS: Record<ConnectorPlatform, string> = {
+  x: "X (Twitter)",
+  reddit: "Reddit",
+  instagram: "Instagram",
+};
+const isConnectorPlatform = (value: string): value is ConnectorPlatform =>
+  value === "x" || value === "reddit" || value === "instagram";
+const describeConnectorOutcome = (
+  who: string,
+  outcome: ConnectorSyncOutcome,
+): string => {
+  if (outcome.error) return outcome.error;
+  if (outcome.cancelled) {
+    return `${who}: cancelled — ${outcome.pushed} synced before stopping.`;
+  }
+  if (outcome.fetched === 0) {
+    return outcome.hasMore
+      ? `${who}: backlog checkpoint saved; continuing shortly.`
+      : `${who}: already up to date — nothing new to sync.`;
+  }
+  const parts = [`${outcome.pushed} new item${outcome.pushed === 1 ? "" : "s"} synced`];
+  if (outcome.skipped) parts.push(`${outcome.skipped} already saved`);
+  if (outcome.failed) parts.push(`${outcome.failed} failed`);
+  if (outcome.hasMore) parts.push("more queued for the next bounded run");
+  return `${who}: ${parts.join(", ")}.`;
+};
+const FORCE_DEV_OFFSCREEN_RESET =
+  import.meta.env.VITE_FORCE_DEV_OFFSCREEN_RESET === "1";
 const SEARCH_PAGE_PATH = "/src/pages/search/index.html";
 const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
   "items:getByIds",
@@ -84,6 +157,7 @@ const INTERNAL_ONLY_OFFSCREEN_METHODS = new Set<string>(["items:saveFetchedMetad
 const IMPORT_SETTINGS_KEY = "vs_import_settings_v1";
 const IMPORT_DRAFTS_KEY = "vs_import_drafts_v1";
 const IMPORT_LRU_FOLDERS_KEY = "vs_import_lru_folders_v1";
+const BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY = "vibesearch:browserBookmarkAutoSyncEnabled:v1";
 const IMPORT_LRU_MAX = 5;
 const IMPORT_MAX_DRAFTS = 24;
 const IMPORT_FAILED_ATTEMPTS_MAX = 20;
@@ -127,11 +201,12 @@ const SHARE_URL_HOSTS = new Set([
 
 const LOCAL_IMPORT_HOST = "local.vibesearch.invalid";
 const PROCESS_STATUS_HISTORY_MAX = 120;
+const PROCESS_STATUS_SUCCESS_TTL_MS = 15 * 60 * 1000;
+const PROCESS_STATUS_PROCESSING_TTL_MS = 45 * 60 * 1000;
 
 type OffscreenResponse<T> = { success?: boolean; payload?: T; error?: string };
 type ImportMode = "save" | "shot" | "extract";
 type ImportTarget = { mode: ImportMode; spaceId?: string; folderId?: string; itemId?: string; screenshotMode?: "visible" | "region"; extractIntent?: boolean };
-type ImportSettings = { reviewBeforeSave: boolean };
 type ImportRetryAction = "RETRY_IMPORT";
 type ImportClickContext = {
   pageUrl: string | null;
@@ -189,6 +264,8 @@ type PreparedImportContent = {
   tags: string[];
   shouldFetchMetadata: boolean;
   isMetaFetched: boolean;
+  archiveUrl?: string;
+  liveArchiveUrl?: string;
 };
 
 type ScreenshotRegionSelection = {
@@ -249,6 +326,8 @@ type ImportDraft = {
   ocrSourceHash?: string;
   shouldFetchMetadata?: boolean;
   isMetaFetched?: boolean;
+  archiveUrl?: string;
+  liveArchiveUrl?: string;
   context: ImportClickContext;
   target: { spaceId: string; folderId?: string; parentId?: string | null; newFolderName?: string };
 };
@@ -411,6 +490,8 @@ const resolveMediaType = (
   return null;
 };
 
+const recentProcessStatuses = new Map<string, ProcessStatusRecord>();
+
 const sendProcessStatus = (
   id: string,
   label: string,
@@ -427,6 +508,7 @@ const sendProcessStatus = (
     updatedAt: Date.now(),
   };
   recentProcessStatuses.set(id, payload);
+  pruneRecentProcessStatuses();
   if (recentProcessStatuses.size > PROCESS_STATUS_HISTORY_MAX) {
     const trim = [...recentProcessStatuses.values()]
       .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -441,10 +523,23 @@ const sendProcessStatus = (
     });
   } catch {}
 };
-const listRecentProcessStatuses = (max = 24): ProcessStatusRecord[] =>
-  [...recentProcessStatuses.values()]
+const isProcessStatusFresh = (row: ProcessStatusRecord, now = Date.now()): boolean => {
+  if (row.state === "success") return now - row.updatedAt <= PROCESS_STATUS_SUCCESS_TTL_MS;
+  if (row.state === "processing") return now - row.updatedAt <= PROCESS_STATUS_PROCESSING_TTL_MS;
+  return true;
+};
+const pruneRecentProcessStatuses = () => {
+  const now = Date.now();
+  for (const [id, row] of recentProcessStatuses.entries()) {
+    if (!isProcessStatusFresh(row, now)) recentProcessStatuses.delete(id);
+  }
+};
+const listRecentProcessStatuses = (max = 24): ProcessStatusRecord[] => {
+  pruneRecentProcessStatuses();
+  return [...recentProcessStatuses.values()]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, Math.max(1, Math.min(200, max)));
+};
 
 // Publish a live "Metadata" row so a bulk import shows exactly how much
 // enrichment is left. The pipeline already paces and retries requests; this
@@ -487,10 +582,11 @@ const setStorageValue = async <T>(key: string, value: T): Promise<void> => {
 };
 const getImportSettings = async (): Promise<ImportSettings> => {
   const raw = await getStorageValue<Partial<ImportSettings>>(IMPORT_SETTINGS_KEY, {});
-  return { reviewBeforeSave: raw.reviewBeforeSave === true };
+  return normalizeImportSettings(raw);
 };
-const setImportSettings = async (reviewBeforeSave: boolean): Promise<ImportSettings> => {
-  const next = { reviewBeforeSave: reviewBeforeSave === true };
+const setImportSettings = async (patch: Partial<ImportSettings>): Promise<ImportSettings> => {
+  const raw = await getStorageValue<Partial<ImportSettings>>(IMPORT_SETTINGS_KEY, {});
+  const next = normalizeImportSettings({ ...raw, ...patch });
   await setStorageValue(IMPORT_SETTINGS_KEY, next);
   return next;
 };
@@ -509,13 +605,7 @@ const saveDrafts = async (drafts: ImportDraft[]) => {
   );
 };
 
-type LruFolderEntry = {
-  folderId: string;
-  spaceId: string;
-  folderName: string;
-  spaceName: string;
-  usedAt: number;
-};
+type LruFolderEntry = ImportLruFolderEntry;
 
 const getLruFolders = async (): Promise<LruFolderEntry[]> => {
   const raw = await getStorageValue<unknown[]>(IMPORT_LRU_FOLDERS_KEY, []);
@@ -535,29 +625,62 @@ const recordLruFolder = async (entry: LruFolderEntry): Promise<void> => {
   await setStorageValue(IMPORT_LRU_FOLDERS_KEY, filtered.slice(0, IMPORT_LRU_MAX));
 };
 
+const loadLiveImportSpaces = async (): Promise<LiveImportSpaceSnapshot[]> => {
+  const spaces = await sendForwardedToOffscreen<Array<{ id: string; name?: string }>>({
+    service: "spaces",
+    type: "listSpaces",
+    payload: {},
+  });
+  return Array.isArray(spaces) ? spaces.filter((space) => !!space?.id) : [];
+};
+
+const loadImportFolder = (folderId: string): Promise<FolderDocType | null> =>
+  sendForwardedToOffscreen<FolderDocType | null>({
+    service: "folders",
+    type: "getById",
+    payload: { id: folderId, skipLockCheck: true },
+  });
+
+const resolveFreshLiveImportFolder = async (
+  folderId: string
+): Promise<LiveImportFolderTarget | null> => {
+  try {
+    const [folder, liveSpaces] = await Promise.all([
+      loadImportFolder(folderId),
+      loadLiveImportSpaces(),
+    ]);
+    return resolveLiveImportFolderTarget(folder, liveSpaces);
+  } catch {
+    return null;
+  }
+};
+
+const sameLruEntry = (left: LruFolderEntry, right: LruFolderEntry): boolean =>
+  left.folderId === right.folderId &&
+  left.spaceId === right.spaceId &&
+  left.folderName === right.folderName &&
+  left.spaceName === right.spaceName &&
+  left.usedAt === right.usedAt;
+
 const pruneLruFolders = async (): Promise<LruFolderEntry[]> => {
   const lru = await getLruFolders();
   if (lru.length === 0) return [];
-  const verified = await Promise.all(
-    lru.map(async (entry) => {
-      try {
-        const folder = await sendForwardedToOffscreen<FolderDocType | null>({
-          service: "folders",
-          type: "getById",
-          payload: { id: entry.folderId, skipLockCheck: true },
-        });
-        if (!folder?.id) return null;
-        if (folder.name !== entry.folderName) {
-          return { ...entry, folderName: folder.name };
-        }
-        return entry;
-      } catch {
-        return null;
-      }
-    })
+  let liveSpaces: LiveImportSpaceSnapshot[];
+  try {
+    liveSpaces = await loadLiveImportSpaces();
+  } catch {
+    // A transient offscreen failure must not permanently erase recent targets.
+    // Returning no target makes quick-save use its safe new-folder fallback.
+    return [];
+  }
+  const folders = await Promise.all(
+    lru.map((entry) => loadImportFolder(entry.folderId).catch(() => null))
   );
-  const alive = verified.filter((entry): entry is LruFolderEntry => entry !== null);
-  if (alive.length !== lru.length) {
+  const alive = reconcileLiveImportLruFolders(lru, folders, liveSpaces).slice(0, IMPORT_LRU_MAX);
+  if (
+    alive.length !== lru.length ||
+    alive.some((entry, index) => !sameLruEntry(entry, lru[index]))
+  ) {
     await setStorageValue(IMPORT_LRU_FOLDERS_KEY, alive);
   }
   return alive;
@@ -609,7 +732,6 @@ const toTabSnapshot = (tab?: chrome.tabs.Tab): TabSnapshot | undefined => {
 };
 
 const failedImportAttempts = new Map<string, FailedImportAttempt>();
-const recentProcessStatuses = new Map<string, ProcessStatusRecord>();
 const rememberFailedImportAttempt = (statusId: string, attempt: FailedImportAttempt) => {
   failedImportAttempts.set(statusId, attempt);
   const entries = [...failedImportAttempts.entries()].sort(
@@ -650,8 +772,189 @@ const sendForwardedToOffscreen = async <T = unknown>(request: {
   return response.payload as T;
 };
 
+const refreshConnectorCloudAuth = async (): Promise<CloudAuthStatus | null> => {
+  try {
+    return await sendForwardedToOffscreen<CloudAuthStatus>({
+      service: "cloudAuth",
+      type: "status",
+      payload: { refresh: true },
+    });
+  } catch {
+    return null;
+  }
+};
+
+type CloudSyncPushItemResponse = {
+  ready?: boolean;
+  reason?: string;
+};
+
+const archiveOutboxFiles = createOpfsArchiveOutboxFiles();
+const archiveOutbox = new ArchiveOutbox({
+  storage: createChromeArchiveOutboxStorage(),
+  files: archiveOutboxFiles,
+  ensureItem: async (itemId) => {
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      return { ready: false, reason: "OFFLINE", retryAfterMs: 60_000 };
+    }
+    const result = await sendForwardedToOffscreen<CloudSyncPushItemResponse>({
+      service: "cloudSync",
+      type: "pushItem",
+      payload: { itemId },
+    });
+    return result?.ready
+      ? { ready: true }
+      : {
+          ready: false,
+          reason: result?.reason || "ITEM_NOT_SYNCED",
+          retryAfterMs: result?.reason === "missing-local-item" ? 5 * 60_000 : 30_000,
+        };
+  },
+});
+const archiveCaptureSessions = new ArchiveCaptureSessionManager({
+  outbox: archiveOutbox,
+});
+const cancelledArchiveItems = new Map<string, number>();
+
+const markArchiveItemCancelled = async (itemId: string): Promise<void> => {
+  if (!itemId) return;
+  cancelledArchiveItems.set(itemId, Date.now());
+  for (const [id, cancelledAt] of cancelledArchiveItems) {
+    if (Date.now() - cancelledAt > 60 * 60 * 1000) cancelledArchiveItems.delete(id);
+  }
+  await archiveCaptureSessions.cancelItem(itemId);
+  await archiveOutbox.discardItem(itemId);
+};
+
+const scheduleArchiveOutboxRetry = async (): Promise<void> => {
+  const jobs = await archiveOutbox.list();
+  if (jobs.length === 0) {
+    await chrome.alarms.clear(ARCHIVE_OUTBOX_RETRY_ALARM_NAME);
+    return;
+  }
+  const nextAttemptAt = Math.min(...jobs.map((job) => job.nextAttemptAt));
+  await chrome.alarms.create(ARCHIVE_OUTBOX_RETRY_ALARM_NAME, {
+    when: Math.max(Date.now() + 30_000, nextAttemptAt),
+  });
+};
+
+const triggerArchiveOutboxDrain = async (): Promise<void> => {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+  try {
+    const result = await archiveOutbox.drain(ARCHIVE_OUTBOX_DRAIN_LIMIT);
+    if (result.remaining > 0 && result.reason !== "missing-token") await scheduleArchiveOutboxRetry();
+  } catch (error) {
+    console.warn("[archive] outbox drain skipped", error);
+    await scheduleArchiveOutboxRetry().catch(() => {});
+  }
+};
+
+const queueServerArchive = async (itemId: string, archiveUrl: string): Promise<void> => {
+  if (cancelledArchiveItems.has(itemId)) return;
+  await archiveOutbox.enqueueServerCapture(itemId, archiveUrl);
+  sendProcessStatus(`archive-${itemId}`, "Offline preview", "processing", "Queued for capture.");
+  void triggerArchiveOutboxDrain();
+};
+
+const capturePageArchiveForItem = async (input: {
+  itemId: string;
+  archiveUrl: string;
+  liveArchiveUrl?: string;
+  tab?: chrome.tabs.Tab;
+}): Promise<void> => {
+  cancelledArchiveItems.delete(input.itemId);
+  const tabId = input.tab?.id;
+  const liveUrl = normalizeHttpUrl(input.liveArchiveUrl || null);
+  if (typeof tabId !== "number" || !liveUrl) {
+    await queueServerArchive(input.itemId, input.archiveUrl);
+    return;
+  }
+
+  const statusId = `archive-${input.itemId}`;
+  sendProcessStatus(statusId, "Offline preview", "processing", "Capturing this page in the background...");
+  let sessionId = "";
+  try {
+    const currentTab = await chrome.tabs.get(tabId);
+    const currentUrl = normalizeHttpUrl(currentTab.url || null);
+    if (!currentUrl || currentUrl !== liveUrl) throw new Error("ARCHIVE_PAGE_NAVIGATED");
+
+    const deadlineAt = Date.now() + PAGE_ARCHIVE_CAPTURE_TIMEOUT_MS;
+    // The service worker can be terminated unexpectedly even while Chrome would
+    // normally keep this message alive. A delayed server job is the durable
+    // fallback; a completed local capture replaces it with the OPFS upload.
+    await archiveOutbox.enqueueServerCapture(input.itemId, input.archiveUrl, {
+      notBefore: deadlineAt + 2_000,
+    });
+    await scheduleArchiveOutboxRetry();
+    const opened = await archiveCaptureSessions.open({
+      itemId: input.itemId,
+      tabId,
+      sourceUrl: liveUrl,
+      deadlineAt,
+    });
+    sessionId = opened.sessionId;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error("ARCHIVE_CAPTURE_DEADLINE")), PAGE_ARCHIVE_CAPTURE_TIMEOUT_MS + 2_000);
+    });
+    let response: ArchiveProtocolResponse;
+    try {
+      response = (await Promise.race([
+        chrome.tabs.sendMessage(tabId, {
+          type: PAGE_ARCHIVE_CAPTURE_MESSAGE,
+          payload: {
+            sessionId,
+            expectedUrl: liveUrl,
+            deadlineAt,
+            maxHtmlBytes: opened.maxHtmlBytes,
+          },
+        }),
+        timeoutPromise,
+      ])) as ArchiveProtocolResponse;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+    if (!response?.success) throw new Error(response?.error || "ARCHIVE_CAPTURE_FAILED");
+    if (archiveCaptureSessions.isOpen(sessionId)) throw new Error("ARCHIVE_CAPTURE_INCOMPLETE");
+    if (cancelledArchiveItems.has(input.itemId)) {
+      await archiveOutbox.discardItem(input.itemId);
+      return;
+    }
+    sendProcessStatus(statusId, "Offline preview", "processing", "Captured locally; waiting to sync.");
+    void triggerArchiveOutboxDrain();
+  } catch (error) {
+    if (sessionId) await archiveCaptureSessions.abort(sessionId, tabId).catch(() => {});
+    if (cancelledArchiveItems.has(input.itemId)) return;
+    console.warn("[archive] live page capture fell back to server capture", error);
+    await queueServerArchive(input.itemId, input.archiveUrl);
+  }
+};
+
+const retryPendingLocalMetadataUrls = async (): Promise<number> => {
+  const result = await sendForwardedToOffscreen<{ urls?: string[] }>({
+    service: "items",
+    type: "getPendingMetadataUrls",
+    payload: { limit: 500 },
+  });
+  const urls = Array.isArray(result?.urls)
+    ? result.urls.filter((url) => typeof url === "string" && isMetadataFetchableUrl(url))
+    : [];
+  if (urls.length === 0) return 0;
+
+  sendProcessStatus(
+    "metadata-queue",
+    "Metadata",
+    "processing",
+    `Retrying metadata for ${urls.length.toLocaleString()} pending links...`
+  );
+  scheduleForProcessing(urls, false);
+  return urls.length;
+};
+
 let browserBookmarkImportInFlight: Promise<BrowserBookmarkImportResult> | null = null;
 let githubStarsImportInFlight: Promise<GitHubStarsImportResult> | null = null;
+let browserBookmarkAutoSyncEnabled: boolean | null = null;
+let browserBookmarkAutoSyncEnabledLoad: Promise<boolean> | null = null;
 
 const fetchGitHubStars = async (accessToken: string): Promise<GitHubStar[]> => {
   const token = accessToken.trim();
@@ -677,17 +980,79 @@ const fetchGitHubStars = async (accessToken: string): Promise<GitHubStar[]> => {
   });
 };
 
-const importBrowserBookmarks = async (): Promise<BrowserBookmarkImportResult> => {
-  if (browserBookmarkImportInFlight) return browserBookmarkImportInFlight;
+const markBrowserBookmarkAutoSyncEnabled = async (): Promise<void> => {
+  try {
+    await setStorageValue(BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY, true);
+    browserBookmarkAutoSyncEnabled = true;
+  } catch (error) {
+    console.warn("[browserBookmarks] could not persist automatic sync preference", error);
+  }
+};
+
+const isBrowserBookmarkAutoSyncEnabled = async (): Promise<boolean> => {
+  if (browserBookmarkAutoSyncEnabled !== null) return browserBookmarkAutoSyncEnabled;
+  if (browserBookmarkAutoSyncEnabledLoad) return browserBookmarkAutoSyncEnabledLoad;
+
+  const load = (async () => {
+    try {
+      const stored = await chrome.storage.local.get(BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY);
+      const explicitValue = stored[BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY];
+      if (explicitValue === true || explicitValue === false) return explicitValue;
+
+      // Upgrade existing imports once. A fresh profile stays opt-in until the
+      // person explicitly imports browser bookmarks from the app.
+      const imported = await sendForwardedToOffscreen<boolean>({
+        service: "browserBookmarks",
+        type: "hasImported",
+      });
+      await setStorageValue(BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY, imported);
+      return imported;
+    } catch (error) {
+      console.warn("[browserBookmarks] automatic sync availability check failed", error);
+      return false;
+    }
+  })();
+  browserBookmarkAutoSyncEnabledLoad = load;
+  try {
+    const enabled = await load;
+    browserBookmarkAutoSyncEnabled = enabled;
+    return enabled;
+  } finally {
+    if (browserBookmarkAutoSyncEnabledLoad === load) browserBookmarkAutoSyncEnabledLoad = null;
+  }
+};
+
+type BrowserBookmarkImportOptions = {
+  silent?: boolean;
+  afterInFlight?: boolean;
+};
+
+const importBrowserBookmarks = async (
+  options: BrowserBookmarkImportOptions = {}
+): Promise<BrowserBookmarkImportResult> => {
+  if (browserBookmarkImportInFlight) {
+    if (!options.afterInFlight) return browserBookmarkImportInFlight;
+    try {
+      await browserBookmarkImportInFlight;
+    } catch {
+      // Read a fresh tree below so a failed overlapping import cannot discard
+      // a browser mutation that arrived while it was running.
+    }
+    return importBrowserBookmarks({ ...options, afterInFlight: false });
+  }
 
   const run = (async () => {
     if (!chrome.bookmarks?.getTree) {
       throw new Error("Browser bookmark access is not available in this browser.");
     }
 
-    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Reading your bookmark folders...");
+    if (!options.silent) {
+      sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Reading your bookmark folders...");
+    }
     const tree = (await chrome.bookmarks.getTree()) as BrowserBookmarkNode[];
-    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Preserving folders and importing bookmarks...");
+    if (!options.silent) {
+      sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Preserving folders and importing bookmarks...");
+    }
     const result = await sendForwardedToOffscreen<BrowserBookmarkImportResult>({
       service: "browserBookmarks",
       type: "importTree",
@@ -695,21 +1060,33 @@ const importBrowserBookmarks = async (): Promise<BrowserBookmarkImportResult> =>
     });
     const metadataUrls = result.metadataUrls;
     if (metadataUrls.length > 0) {
+      if (!options.silent) {
+        sendProcessStatus(
+          "browser-bookmarks",
+          "Browser bookmarks",
+          "processing",
+          `Queueing metadata for ${metadataUrls.length.toLocaleString()} bookmarks...`
+        );
+      }
+      scheduleForProcessing(metadataUrls, false);
+    }
+    await markBrowserBookmarkAutoSyncEnabled();
+    scheduleContextMenuRefresh("high");
+    if (
+      result.updatedFolderCount === 0 &&
+      result.updatedBookmarkCount === 0 &&
+      result.removedBookmarkCount === 0
+    ) {
+      void triggerCloudSync();
+    }
+    if (!options.silent) {
       sendProcessStatus(
         "browser-bookmarks",
         "Browser bookmarks",
-        "processing",
-        `Queueing metadata for ${metadataUrls.length.toLocaleString()} bookmarks...`
+        "success",
+        `Imported ${result.bookmarkCount.toLocaleString()} bookmarks across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${metadataUrls.length.toLocaleString()}.`
       );
-      scheduleForProcessing(metadataUrls, false);
     }
-    scheduleContextMenuRefresh("high");
-    sendProcessStatus(
-      "browser-bookmarks",
-      "Browser bookmarks",
-      "success",
-      `Synced ${result.bookmarkCount.toLocaleString()} bookmarks across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${metadataUrls.length.toLocaleString()}.`
-    );
     return result;
   })();
 
@@ -718,11 +1095,31 @@ const importBrowserBookmarks = async (): Promise<BrowserBookmarkImportResult> =>
     return await run;
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Browser bookmark import failed.";
-    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "error", detail);
+    if (!options.silent) sendProcessStatus("browser-bookmarks", "Browser bookmarks", "error", detail);
     throw error;
   } finally {
     browserBookmarkImportInFlight = null;
   }
+};
+
+const browserBookmarkResyncScheduler = new BrowserBookmarkResyncScheduler({
+  isEnabled: isBrowserBookmarkAutoSyncEnabled,
+  runSync: async () => {
+    await importBrowserBookmarks({ silent: true, afterInFlight: true });
+  },
+  createFallbackAlarm: async (when) => {
+    await chrome.alarms.create(BROWSER_BOOKMARK_RESYNC_ALARM_NAME, { when });
+  },
+  clearFallbackAlarm: async () => {
+    await chrome.alarms.clear(BROWSER_BOOKMARK_RESYNC_ALARM_NAME);
+  },
+  onError: (error) => {
+    console.warn("[browserBookmarks] automatic resync failed", error);
+  },
+});
+
+const requestBrowserBookmarkResync = (): void => {
+  void browserBookmarkResyncScheduler.request();
 };
 
 const importGitHubStars = async (accessToken: string): Promise<GitHubStarsImportResult> => {
@@ -731,7 +1128,7 @@ const importGitHubStars = async (accessToken: string): Promise<GitHubStarsImport
   const run = (async () => {
     sendProcessStatus("github-stars", "GitHub stars", "processing", "Reading starred repositories...");
     const stars = await fetchGitHubStars(accessToken);
-    sendProcessStatus("github-stars", "GitHub stars", "processing", "Syncing starred repositories...");
+    sendProcessStatus("github-stars", "GitHub stars", "processing", "Importing starred repositories...");
     const result = await sendForwardedToOffscreen<GitHubStarsImportResult>({
       service: "githubStars",
       type: "importStars",
@@ -751,7 +1148,7 @@ const importGitHubStars = async (accessToken: string): Promise<GitHubStarsImport
       "github-stars",
       "GitHub stars",
       "success",
-      `Synced ${result.importedCount.toLocaleString()} starred repositories across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${result.metadataUrls.length.toLocaleString()}.`
+      `Imported ${result.importedCount.toLocaleString()} starred repositories across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${result.metadataUrls.length.toLocaleString()}.`
     );
     return result;
   })();
@@ -810,10 +1207,17 @@ const rememberHoverSaveTarget = (tabId: number, url: string, title?: string): vo
 
 const collectContext = (info: chrome.contextMenus.OnClickData, tab?: chrome.tabs.Tab): ImportClickContext => {
   const hoverTarget = getHoverSaveTarget(tab?.id);
+  const pageUrl = normalizeHttpUrl(info.pageUrl || null);
+  const nativeLinkUrl = normalizeHttpUrl(info.linkUrl || null);
+  const hoverLinkUrl = hoverTarget?.url || null;
+  const linkUrl =
+    hoverLinkUrl && nativeLinkUrl && pageUrl && nativeLinkUrl === pageUrl && hoverLinkUrl !== pageUrl
+      ? hoverLinkUrl
+      : nativeLinkUrl || hoverLinkUrl;
   return {
-    pageUrl: normalizeHttpUrl(info.pageUrl || null),
+    pageUrl,
     frameUrl: normalizeHttpUrl(info.frameUrl || null),
-    linkUrl: normalizeHttpUrl(info.linkUrl || null) || hoverTarget?.url || null,
+    linkUrl,
     mediaUrl: normalizeHttpUrl(info.srcUrl || null),
     mediaType: info.mediaType || null,
     selectionText: normalizeSelectionText(info.selectionText || ""),
@@ -1046,16 +1450,21 @@ const extractContentFromPage = async (
           return "";
         };
         const youtubeVideoId = (): string | null => {
+          const href = clickedUrl || "";
+          const clickedWatchMatch = /[?&]v=([^&#]+)/.exec(href);
+          if (clickedWatchMatch?.[1]) return clickedWatchMatch[1];
+          const clickedShortMatch = /\/shorts\/([^/?#]+)/.exec(href);
+          if (clickedShortMatch?.[1]) return clickedShortMatch[1];
+
           const path = window.location.pathname;
           if (path.startsWith("/shorts/")) {
             return path.split("/shorts/")[1]?.split(/[?#/]/)[0] || null;
           }
           const fromSearch = new URLSearchParams(window.location.search).get("v");
           if (fromSearch) return fromSearch;
-          const href = clickedUrl || window.location.href;
-          const watchMatch = /[?&]v=([^&#]+)/.exec(href);
+          const watchMatch = /[?&]v=([^&#]+)/.exec(window.location.href);
           if (watchMatch?.[1]) return watchMatch[1];
-          const shortMatch = /\/shorts\/([^/?#]+)/.exec(href);
+          const shortMatch = /\/shorts\/([^/?#]+)/.exec(window.location.href);
           return shortMatch?.[1] || null;
         };
         const visibleScore = (el: Element): number => {
@@ -1090,7 +1499,8 @@ const extractContentFromPage = async (
 
           const videoId = youtubeVideoId();
           if (!videoId) return null;
-          const isShort = window.location.pathname.startsWith("/shorts/");
+          const clickedIsShort = /\/shorts\/[^/?#]+/.test(clickedUrl || "");
+          const isShort = clickedIsShort || (!clickedUrl && window.location.pathname.startsWith("/shorts/"));
           const canonicalUrl = isShort
             ? `https://www.youtube.com/shorts/${videoId}`
             : `https://www.youtube.com/watch?v=${videoId}`;
@@ -1885,6 +2295,22 @@ const resolveSaveContentKind = (context: ImportClickContext): SaveContentKind =>
 const resolveSavePrimaryUrl = (context: ImportClickContext) =>
   context.pageUrl || context.frameUrl || context.tabUrl || context.linkUrl || context.mediaUrl || null;
 
+const resolveLiveArchiveUrl = (
+  context: ImportClickContext,
+  tab: chrome.tabs.Tab | undefined,
+): string | undefined => {
+  if (
+    typeof tab?.id !== "number" ||
+    context.linkUrl ||
+    context.mediaUrl ||
+    context.selectionText ||
+    (context.frameUrl && context.frameUrl !== context.tabUrl)
+  ) {
+    return undefined;
+  }
+  return normalizeHttpUrl(tab.url || context.tabUrl || context.pageUrl) || undefined;
+};
+
 const resolveSavePrimaryUrlOrFallback = (
   context: ImportClickContext,
   mode: ImportMode
@@ -2454,6 +2880,7 @@ const prepareImportContent = async (
   const shouldFetchMetadata = isMetadataFetchablePageUrl(primaryUrl);
 
   return {
+    itemId: crypto.randomUUID(),
     primaryUrl,
     title,
     textContent,
@@ -2464,6 +2891,8 @@ const prepareImportContent = async (
     tags: suggestedTags(context, source),
     shouldFetchMetadata,
     isMetaFetched: !shouldFetchMetadata,
+    archiveUrl: primaryUrl,
+    liveArchiveUrl: resolveLiveArchiveUrl(context, tab),
   };
 };
 
@@ -2567,17 +2996,31 @@ const resolveQuickSaveTarget = async (
   context: ImportClickContext,
   mode: ImportMode
 ): Promise<{ folderId: string; spaceId: string }> => {
-  if (target.folderId) {
-    return { folderId: target.folderId, spaceId: target.spaceId || PUBLIC_SPACE_ID };
+  const requestedFolder = target.folderId
+    ? await resolveFreshLiveImportFolder(target.folderId)
+    : null;
+  const lru = requestedFolder ? [] : await pruneLruFolders();
+  const selectedFolder = selectQuickSaveFolderTarget(requestedFolder, lru);
+  if (selectedFolder) {
+    return { folderId: selectedFolder.folderId, spaceId: selectedFolder.spaceId };
   }
-  const lru = await resolveQuickSaveFolder();
-  if (lru) return { folderId: lru.folderId, spaceId: lru.spaceId };
+
+  const requestedSpaceId = target.spaceId || PUBLIC_SPACE_ID;
+  let fallbackSpaceId = PUBLIC_SPACE_ID;
+  try {
+    const liveSpaces = await loadLiveImportSpaces();
+    if (liveSpaces.some((space) => space.id === requestedSpaceId)) {
+      fallbackSpaceId = requestedSpaceId;
+    }
+  } catch {
+    // Public is created during database initialization and is the safest retry.
+  }
   const folderId = await resolveTargetFolder(
-    { spaceId: target.spaceId || PUBLIC_SPACE_ID, folderId: undefined, newFolderName: autoFolderName(context, mode) },
+    { spaceId: fallbackSpaceId, folderId: undefined, newFolderName: autoFolderName(context, mode) },
     context,
     mode
   );
-  return { folderId, spaceId: target.spaceId || PUBLIC_SPACE_ID };
+  return { folderId, spaceId: fallbackSpaceId };
 };
 
 let menuRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2831,6 +3274,8 @@ const createDraftFromAction = async (
     ocrSourceHash: prepared.ocrSourceHash,
     shouldFetchMetadata: prepared.shouldFetchMetadata,
     isMetaFetched: prepared.isMetaFetched,
+    archiveUrl: prepared.archiveUrl,
+    liveArchiveUrl: prepared.liveArchiveUrl,
     context,
     target: {
       spaceId: target.spaceId || PUBLIC_SPACE_ID,
@@ -2841,6 +3286,17 @@ const createDraftFromAction = async (
   };
   const drafts = await loadDrafts();
   await saveDrafts([draft, ...drafts.filter((entry) => entry.id !== draft.id)]);
+  if (draft.itemId && draft.archiveUrl) {
+    void capturePageArchiveForItem({
+      itemId: draft.itemId,
+      archiveUrl: draft.archiveUrl,
+      liveArchiveUrl: draft.liveArchiveUrl,
+      tab,
+    }).catch((error) => {
+      console.warn("[archive] draft capture could not be queued", error);
+      sendProcessStatus(`archive-${draft.itemId}`, "Offline preview", "error", "Could not queue this preview.");
+    });
+  }
   return draft;
 };
 
@@ -2908,6 +3364,18 @@ const runImportAction = async (
     }),
   });
 
+  if (prepared.archiveUrl) {
+    void capturePageArchiveForItem({
+      itemId: inserted.id,
+      archiveUrl: prepared.archiveUrl,
+      liveArchiveUrl: prepared.liveArchiveUrl,
+      tab,
+    }).catch((error) => {
+      console.warn("[archive] page capture could not be queued", error);
+      sendProcessStatus(`archive-${inserted.id}`, "Offline preview", "error", "Could not queue this preview.");
+    });
+  }
+
   // Saved images (right-click → save image, image links, etc.) are OCR'd like
   // screenshots so their text becomes searchable; OCR then re-embeds them. The
   // explicit per-item trigger is reliable even in a large library.
@@ -2924,14 +3392,8 @@ const runImportAction = async (
   sendProcessStatus(job.id, job.label, "success", "Imported.");
   scheduleContextMenuRefresh("low");
 
-  // Quick-saving the page you're on → auto-archive it + sync to the web app
-  // (best-effort, non-blocking; only when the saved URL is the current tab).
-  if (target.mode === "save" && isArchivableTab(tab) && sameUrl(prepared.primaryUrl, tab?.url)) {
-    void autoArchiveAndSyncSave(inserted, tab, context);
-  }
-
   const savedActions = [
-    { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl } },
+    { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl, itemId: inserted.id } },
     { label: "Open", action: "OPEN_SEARCH" },
   ];
 
@@ -3274,123 +3736,14 @@ setInterval(() => {
   }
 }, 60 * 1000).unref?.();
 
-const formatArchiveBytes = (bytes: number): string => {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 KB";
-  if (bytes < 1024) return `${bytes} B`;
-  const kb = bytes / 1024;
-  if (kb < 1024) return `${Math.round(kb)} KB`;
-  const mb = kb / 1024;
-  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
-};
-
 const isArchivableTab = (tab?: chrome.tabs.Tab): boolean =>
   typeof tab?.id === "number" && /^https?:\/\//i.test(tab?.url || "");
 
 /**
- * Ensure the current tab exists as a saved item and return its id, reusing the
- * exact quick-save create flow (prepareImportContent → addToFolder) so an
- * archived page looks like any other saved item.
- */
-const ensureTabSavedAsItem = async (
-  context: ImportClickContext,
-  tab: chrome.tabs.Tab | undefined,
-  job: { id: string; label: string }
-): Promise<{ itemId: string; primaryUrl: string }> => {
-  const target: ImportTarget = { mode: "save", spaceId: PUBLIC_SPACE_ID };
-  const prepared = await prepareImportContent(target, context, tab, job);
-  const { folderId, spaceId } = await resolveQuickSaveTarget(target, context, "save");
-  const inserted = await sendForwardedToOffscreen<ItemDocType>({
-    service: "items",
-    type: "addToFolder",
-    payload: toItemPayload({
-      id: prepared.itemId,
-      context,
-      mode: "save",
-      primaryUrl: prepared.primaryUrl,
-      folderId,
-      parentId: null,
-      title: prepared.title,
-      textContent: prepared.textContent,
-      source: prepared.source,
-      iconUrl: prepared.iconUrl,
-      media: prepared.media,
-      displayImageUrl: prepared.displayImageUrl,
-      shouldFetchMetadata: prepared.shouldFetchMetadata,
-      isMetaFetched: prepared.isMetaFetched,
-      deferBackgroundProcessing: false,
-    }),
-  });
-  await recordFolderToLru(folderId, spaceId, autoFolderName(context, "save"));
-  return { itemId: inserted.id, primaryUrl: prepared.primaryUrl };
-};
-
-/** Loosely compare two URLs (ignore hash + trailing slash) — "is this the same page?". */
-const sameUrl = (a?: string, b?: string): boolean => {
-  if (!a || !b) return false;
-  const norm = (u: string) => u.split("#")[0].replace(/\/+$/, "").toLowerCase();
-  return norm(a) === norm(b);
-};
-
-/** Map a saved local item to the neutral shape the cloud push expects. */
-const itemDocToCaptured = (item: ItemDocType): CapturedItem => ({
-  externalId: `save:${item.id}`,
-  url: item.url,
-  title: item.title || item.url,
-  textContent: item.textContent || "",
-  source: (item.source as string) || "web",
-  type: ["twitter", "reddit", "instagram", "tiktok", "linkedin", "substack"].includes((item.source as string) || "")
-    ? "social"
-    : (item.media || []).some((m) => m.type === "video")
-      ? "video"
-      : (item.media || []).some((m) => m.type === "image")
-        ? "image"
-        : "link",
-  authorUsername: item.authorUsername,
-  media: (item.media || [])
-    .map((m) => ({ type: m.type, url: m.s3Url || m.originalUrl || "", thumbnailUrl: m.thumbnailUrl }))
-    .filter((m) => !!m.url),
-  folderId: item.folderId,
-  fields: { externalId: `save:${item.id}`, savedFrom: "extension-quicksave" },
-});
-
-/**
- * Quick-saving the page you're on → also forward it to the web app AND store a
- * full self-contained snapshot against the cloud item. Best-effort + non-blocking:
- * a signed-out user still gets the normal local save (with a gentle hint).
- */
-const autoArchiveAndSyncSave = async (
-  item: ItemDocType,
-  tab: chrome.tabs.Tab | undefined,
-  context: ImportClickContext
-): Promise<void> => {
-  const job = { id: `autosync-${item.id}`, label: `Sync & archive • ${pickHostLabel(context)}` };
-  try {
-    sendProcessStatus(job.id, job.label, "processing", "Syncing this page to Vibesearch…");
-    const cloud = await pushSingleItem(itemDocToCaptured(item));
-    if (!cloud) {
-      sendProcessStatus(job.id, job.label, "success", "Saved locally. Sign in to Vibesearch to sync + archive to the cloud.");
-      return;
-    }
-    sendProcessStatus(job.id, job.label, "processing", "Archiving a full, offline copy…");
-    const capture = await executeScriptInTab<CaptureSnapshotResult>(tab, captureSingleFileSnapshot, [
-      { capturedAtIso: new Date(context.capturedAt || Date.now()).toISOString() },
-    ]).catch(() => null);
-    if (capture?.html) {
-      await uploadArchiveSnapshot(cloud.id, capture.html);
-      sendProcessStatus(job.id, job.label, "success", "Synced + archived to Vibesearch.");
-    } else {
-      sendProcessStatus(job.id, job.label, "success", "Synced to Vibesearch (full snapshot skipped).");
-    }
-  } catch {
-    sendProcessStatus(job.id, job.label, "success", "Saved locally; cloud sync will retry later.");
-  }
-};
-
-/**
- * First-class archive path: save the tab as an item, capture the live DOM as a
- * single self-contained HTML file inside the tab, then upload it to the cloud
- * archive API. Robust by design — a single failed resource never aborts the
- * capture, and every failure mode degrades to a friendly toast + status.
+ * Preserve the web-support branch's explicit Archive action while routing it
+ * through the bounded page-capture session and durable archive outbox. The
+ * former implementation returned a full HTML string through the service worker
+ * and duplicated the archive already queued by runImportAction.
  */
 const runArchiveSnapshotAction = async (
   context: ImportClickContext,
@@ -3412,52 +3765,10 @@ const runArchiveSnapshotAction = async (
     return;
   }
 
-  sendProcessStatus(job.id, job.label, "processing", "Capturing the full page…");
+  sendProcessStatus(job.id, job.label, "processing", "Saving and queuing an offline preview…");
   try {
-    // 1) Capture the live rendered DOM as ONE self-contained HTML file and
-    //    download it locally. This is the first-class path and needs no account.
-    const hostLabel = pickHostLabel(context) || "page";
-    const stamp = new Date(context.capturedAt || Date.now()).toISOString().slice(0, 10);
-    const downloadFilename = `${hostLabel.replace(/[^a-z0-9.-]+/gi, "-").slice(0, 60) || "page"}-${stamp}.html`;
-    const captureOptions: CaptureSnapshotOptions = {
-      capturedAtIso: new Date(context.capturedAt || Date.now()).toISOString(),
-      downloadFilename,
-    };
-    const capture = await executeScriptInTab<CaptureSnapshotResult>(
-      tab,
-      captureSingleFileSnapshot,
-      [captureOptions]
-    );
-    if (!capture || !capture.html) {
-      throw new Error(capture?.error || "Could not capture this page.");
-    }
-    const sizeLabel = formatArchiveBytes(capture.byteSize);
-    const trunc = capture.truncated ? " Some very large media was skipped to stay within limits." : "";
-
-    // 2) Best-effort cloud sync to R2 (needs a signed-in, cloud-synced item).
-    //    Never blocks the local export; failures degrade quietly.
-    let cloud = false;
-    let cloudHint = "";
-    try {
-      const { itemId } = await ensureTabSavedAsItem(context, tab, job);
-      sendProcessStatus(job.id, job.label, "processing", `Syncing to the cloud (${sizeLabel})…`);
-      await uploadArchiveSnapshot(itemId, capture.html);
-      cloud = true;
-    } catch (err) {
-      if (err instanceof ArchiveAuthError) cloudHint = " Sign in to Vibesearch to also keep it in the cloud.";
-    }
-
-    const detail = cloud
-      ? `Archived (${sizeLabel}) — saved to your downloads and synced to the cloud.${trunc}`
-      : `Saved a full, self-contained HTML copy (${sizeLabel}) to your downloads.${cloudHint}${trunc}`;
-    sendProcessStatus(job.id, job.label, "success", detail);
-    await showBrandedToast(
-      tab,
-      cloud ? "Page archived + synced" : "Saved a full-page HTML copy",
-      [{ label: "Open", action: "OPEN_SEARCH" }],
-      4000
-    );
-    scheduleContextMenuRefresh("low");
+    await runImportAction({ mode: "save", spaceId: PUBLIC_SPACE_ID }, context, tab);
+    sendProcessStatus(job.id, job.label, "success", "Saved; the offline preview is queued.");
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Archiving failed.";
     sendProcessStatus(job.id, job.label, "error", detail);
@@ -3597,7 +3908,7 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
     return { success: true, payload: listRecentProcessStatuses(max) };
   }
   if (message.type === "IMPORT_SET_SETTINGS") {
-    return { success: true, payload: await setImportSettings(message?.payload?.reviewBeforeSave === true) };
+    return { success: true, payload: await setImportSettings(importSettingsPatchFromPayload(message?.payload)) };
   }
   if (message.type === "IMPORT_LIST_DRAFTS") {
     const drafts = await filterAccessibleDrafts(await loadDrafts());
@@ -3644,7 +3955,10 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
   if (message.type === "IMPORT_DELETE_DRAFT") {
     const draftId = (message?.payload?.draftId || "").trim();
     if (!draftId) return { success: false, error: "MISSING_DRAFT_ID" };
-    await saveDrafts((await loadDrafts()).filter((entry) => entry.id !== draftId));
+    const drafts = await loadDrafts();
+    const removed = drafts.find((entry) => entry.id === draftId);
+    await saveDrafts(drafts.filter((entry) => entry.id !== draftId));
+    if (removed?.itemId) await markArchiveItemCancelled(removed.itemId);
     return { success: true, payload: { deleted: true } };
   }
   if (message.type === "IMPORT_SUBMIT_DRAFT") {
@@ -3743,6 +4057,17 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
     }
 
     await saveDrafts(drafts.filter((entry) => entry.id !== draft.id));
+    if (draft.archiveUrl) {
+      if (didPrimaryUrlChange || (draft.itemId && inserted.id !== draft.itemId)) {
+        if (draft.itemId) await markArchiveItemCancelled(draft.itemId);
+        cancelledArchiveItems.delete(inserted.id);
+        void queueServerArchive(inserted.id, primaryUrl).catch((error) =>
+          console.warn("[archive] edited draft preview could not be queued", error),
+        );
+      } else {
+        void triggerArchiveOutboxDrain();
+      }
+    }
     if (draft.mode === "shot" && !didPrimaryUrlChange) {
       scheduleScreenshotPostImportWork(inserted.id, primaryUrl);
     }
@@ -3833,12 +4158,16 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   });
 });
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create(SYNC_ALARM_NAME, { periodInMinutes: 6 * 60 });
+  chrome.alarms.create(CLOUD_SYNC_ALARM_NAME, { periodInMinutes: 15 });
   chrome.alarms.create(EMBEDDING_ALARM_NAME, { periodInMinutes: 5 });
   chrome.alarms.create(METADATA_RETRY_ALARM_NAME, { periodInMinutes: 30 });
   void setupConnectorScheduler();
+  chrome.alarms.create(ARCHIVE_OUTBOX_ALARM_NAME, { periodInMinutes: 10 });
   void retryStoredFailedMetadataUrls().catch(() => {});
+  void retryPendingLocalMetadataUrls().catch(() => {});
+  if (details.reason !== "install") requestBrowserBookmarkResync();
   scheduleContextMenuRefresh("high");
 });
 
@@ -3851,20 +4180,47 @@ chrome.runtime.onStartup.addListener(() => {
       isForwarded: true,
     });
     await retryStoredFailedMetadataUrls();
+    await retryPendingLocalMetadataUrls();
+    await triggerCloudSync();
+    await archiveOutbox.cleanup();
+    await triggerArchiveOutboxDrain();
+    requestBrowserBookmarkResync();
   })().catch(() => {});
   scheduleContextMenuRefresh("high");
 });
 
+const onBrowserBookmarkMutation = () => {
+  requestBrowserBookmarkResync();
+};
+
+registerBrowserBookmarkEvents({
+  onMutation: onBrowserBookmarkMutation,
+  onImportBegan: () => {
+    void browserBookmarkResyncScheduler.onImportBegan();
+  },
+  onImportEnded: () => {
+    void browserBookmarkResyncScheduler.onImportEnded();
+  },
+});
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   void (async () => {
+    if (alarm.name === BROWSER_BOOKMARK_RESYNC_ALARM_NAME) {
+      await browserBookmarkResyncScheduler.onFallbackAlarm();
+      return;
+    }
     await setupOffscreenDocument();
     if (alarm.name === SYNC_ALARM_NAME) {
       await chrome.runtime.sendMessage({
         service: "sync",
         type: "rebuildAndCompact",
         target: "offscreen",
-        isForwarded: true,
-      });
+          isForwarded: true,
+        });
+    } else if (alarm.name === CLOUD_SYNC_ALARM_NAME) {
+      await triggerCloudSync();
+    } else if (alarm.name === CLOUD_SYNC_CONTINUATION_ALARM_NAME) {
+      await triggerCloudSync();
     } else if (alarm.name === EMBEDDING_ALARM_NAME) {
       await chrome.runtime.sendMessage({
         type: "TRIGGER_EMBEDDING",
@@ -3873,7 +4229,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       });
     } else if (alarm.name === METADATA_RETRY_ALARM_NAME) {
       await retryStoredFailedMetadataUrls();
-    } else if (alarm.name === CONNECTOR_SYNC_ALARM) {
+      await retryPendingLocalMetadataUrls();
+    } else if (alarm.name === ARCHIVE_OUTBOX_ALARM_NAME || alarm.name === ARCHIVE_OUTBOX_RETRY_ALARM_NAME) {
+      await triggerArchiveOutboxDrain();
+    } else if (alarm.name === CONNECTOR_SYNC_ALARM || alarm.name === CONNECTOR_CONTINUATION_ALARM) {
+      await refreshConnectorCloudAuth();
       await onConnectorAlarm();
     } else if (alarm.name === "opfs-promote-alarm") {
       triggerOpfsPromotion();
@@ -3884,65 +4244,173 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 const isOnline = (): boolean =>
   typeof navigator !== "undefined" ? navigator.onLine : true;
 
+let cloudSyncInFlight: Promise<void> | null = null;
+let cloudSyncRequestVersion = 0;
+
+const scheduleCloudSyncContinuation = async (): Promise<void> => {
+  try {
+    await chrome.alarms.create(CLOUD_SYNC_CONTINUATION_ALARM_NAME, {
+      when: Date.now() + CLOUD_SYNC_CONTINUATION_DELAY_MS,
+    });
+  } catch (error) {
+    console.warn("[cloudSync] continuation alarm was not scheduled", error);
+  }
+};
+
+const triggerCloudSync = (): Promise<void> => {
+  if (!isOnline()) return Promise.resolve();
+  cloudSyncRequestVersion += 1;
+  if (cloudSyncInFlight) return cloudSyncInFlight;
+
+  const runVersion = cloudSyncRequestVersion;
+  const run = (async () => {
+    try {
+      const result = await sendForwardedToOffscreen({
+        service: "cloudSync",
+        type: "drain",
+        payload: { maxBatches: 10 },
+      });
+      if (shouldScheduleCloudSyncContinuation(result) || cloudSyncRequestVersion > runVersion) {
+        await scheduleCloudSyncContinuation();
+      }
+    } catch (error) {
+      console.warn("[cloudSync] upload skipped", error);
+      if (cloudSyncRequestVersion > runVersion) await scheduleCloudSyncContinuation();
+    }
+  })().finally(() => {
+    cloudSyncInFlight = null;
+  });
+  cloudSyncInFlight = run;
+  return run;
+};
+
+const OPFS_PROMOTION_SCAN_PAGE_SIZE = 50;
+const OPFS_PROMOTION_CLEANUP_FILES_PER_RUN = 700;
+
+type OpfsMediaPromotionPage = {
+  items: { id: string; media: NonNullable<ItemDocType["media"]> }[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  scannedCount: number;
+};
+
 const promoteOpfsMediaToR2 = async (): Promise<void> => {
   if (!isOnline()) return;
-  let items: { id: string; media: NonNullable<ItemDocType["media"]> }[];
+  let afterId = "";
+  const cleanupBatch = new BoundedOpfsCleanupBatch(
+    OPFS_PROMOTION_CLEANUP_FILES_PER_RUN
+  );
+
   try {
-    items = await sendForwardedToOffscreen<{
-      id: string;
-      media: NonNullable<ItemDocType["media"]>;
-    }[]>({
-      service: "items",
-      type: "listItemsWithOpfsMedia",
-    });
-  } catch (e) {
-    console.error("[promoteOpfsMedia] list failed", e);
-    return;
-  }
-  if (!items || items.length === 0) return;
+    while (isOnline()) {
+      let page: OpfsMediaPromotionPage;
+      try {
+        page = await sendForwardedToOffscreen<OpfsMediaPromotionPage>({
+          service: "items",
+          type: "listItemsWithOpfsMedia",
+          payload: {
+            afterId,
+            limit: OPFS_PROMOTION_SCAN_PAGE_SIZE,
+          },
+        });
+      } catch (e) {
+        console.error("[promoteOpfsMedia] list failed", e);
+        return;
+      }
+      if (!page) return;
 
-  for (const { id, media } of items) {
-    if (!isOnline()) break;
-    let changed = false;
-    const promotedOpfsPaths: string[] = [];
-    const nextMedia = await Promise.all(
-      (media || []).map(async (entry) => {
-        if (typeof entry?.opfsPath !== "string" || !entry.opfsPath) return entry;
+      for (const { id, media } of page.items || []) {
+        if (!isOnline()) return;
+        const promotions = (
+          await mapWithConcurrencyStable(media || [], 2, async (entry) => {
+            if (typeof entry?.opfsPath !== "string" || !entry.opfsPath) return null;
+            try {
+              const uploaded = await uploadOpfsFileToR2(
+                entry.opfsPath,
+                entry.originalUrl
+              );
+              if (!uploaded) return null;
+              return {
+                opfsPath: entry.opfsPath,
+                s3Url: uploaded.r2Url,
+                sourceIdentity: uploaded.sourceIdentity,
+              };
+            } catch (e) {
+              console.error("[promoteOpfsMedia] upload failed for", entry.opfsPath, e);
+              return null;
+            }
+          })
+        ).filter(
+          (promotion): promotion is {
+            opfsPath: string;
+            s3Url: string;
+            sourceIdentity: OpfsFileIdentity;
+          } => promotion !== null
+        );
+
+        if (promotions.length === 0) continue;
+
         try {
-          const uploaded = await uploadOpfsFileToR2(entry.opfsPath, entry.originalUrl);
-          if (!uploaded) return entry;
-          promotedOpfsPaths.push(entry.opfsPath);
-          changed = true;
-          return {
-            ...entry,
-            s3Url: uploaded.r2Url,
-            storageType: "s3" as const,
-            opfsPath: undefined,
-          };
+          const result = await sendForwardedToOffscreen<{
+            success: boolean;
+            promotedOpfsPaths: string[];
+            error?: string;
+          }>({
+            service: "items",
+            type: "applyOpfsMediaPromotions",
+            payload: { id, promotions },
+          });
+          if (!result?.success) {
+            console.error(
+              "[promoteOpfsMedia] conditional commit failed for",
+              id,
+              result?.error || "UNKNOWN_ERROR"
+            );
+            continue;
+          }
+          const promotionByPath = new Map(
+            promotions.map((promotion) => [promotion.opfsPath, promotion] as const)
+          );
+          for (const opfsPath of result.promotedOpfsPaths || []) {
+            const promotion = promotionByPath.get(opfsPath);
+            if (promotion) {
+              cleanupBatch.add({
+                opfsPath,
+                sourceIdentity: promotion.sourceIdentity,
+              });
+            }
+          }
         } catch (e) {
-          console.error("[promoteOpfsMedia] upload failed for", entry.opfsPath, e);
-          return entry;
+          console.error("[promoteOpfsMedia] conditional commit failed for", id, e);
         }
-      })
-    );
+      }
 
-    if (!changed) continue;
-
-    // Clean undefined keys before persisting
-    const cleaned = nextMedia.map((m) => {
-      const { opfsPath, ...rest } = m as any;
-      return rest;
-    });
-
+      if (!page.hasMore) return;
+      const nextCursor = (page.nextCursor || "").trim();
+      if (!nextCursor || nextCursor <= afterId) {
+        console.error("[promoteOpfsMedia] item scan cursor did not advance");
+        return;
+      }
+      afterId = nextCursor;
+    }
+  } finally {
     try {
-      await sendForwardedToOffscreen({
-        service: "items",
-        type: "updateMedia",
-        payload: { id, media: cleaned, preserveOcr: true },
+      await cleanupBatch.flush(async (files) => {
+        await sendForwardedToOffscreen({
+          service: "items",
+          type: "deleteUnreferencedOpfsMedia",
+          payload: { files },
+        });
       });
-      await Promise.all(promotedOpfsPaths.map((opfsPath) => deleteMediaFromOpfs(opfsPath).catch(() => {})));
+      if (cleanupBatch.overflowed) {
+        console.warn(
+          "[promoteOpfsMedia] deferred excess OPFS cleanup to keep the run bounded"
+        );
+      }
     } catch (e) {
-      console.error("[promoteOpfsMedia] updateMedia failed for", id, e);
+      // Promotion is durable already. Leave local files in place rather than
+      // failing the run or deleting without a complete reference scan.
+      console.warn("[promoteOpfsMedia] cleanup deferred", e);
     }
   }
 };
@@ -3989,13 +4457,26 @@ const forwardProcessingTriggerToOffscreen = async (
 
 // Attempt promotion on startup
 void triggerOpfsPromotion();
+void triggerCloudSync();
+void archiveOutbox.cleanup().then(() => triggerArchiveOutboxDrain()).catch(() => {});
 
 // Listen for connectivity regain (service worker context: self)
 if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
-  self.addEventListener("online", () => triggerOpfsPromotion());
+  self.addEventListener("online", () => {
+    void triggerOpfsPromotion();
+    void triggerCloudSync();
+    void triggerArchiveOutboxDrain();
+  });
 }
 
 chrome.alarms.create("opfs-promote-alarm", { periodInMinutes: 30 });
+chrome.alarms.create(ARCHIVE_OUTBOX_ALARM_NAME, { periodInMinutes: 10 });
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "local" && changes[CLOUD_SYNC_TOKEN_KEY]?.newValue) {
+    void triggerArchiveOutboxDrain();
+  }
+});
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   hoverSaveTargetsByTab.delete(tabId);
@@ -4038,6 +4519,86 @@ if (chrome.commands?.onCommand) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const archiveSenderTabId =
+    sender?.id === chrome.runtime.id && typeof sender.tab?.id === "number" ? sender.tab.id : null;
+  if (
+    message?.target === "background" &&
+    CONNECTOR_MESSAGE_TYPES.has(String(message?.type || "")) &&
+    (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender))
+  ) {
+    sendResponse({ ok: false, error: "UNAUTHORIZED_CONTEXT" });
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === PAGE_ARCHIVE_CHUNK_MESSAGE) {
+    if (archiveSenderTabId === null) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_ARCHIVE_SENDER" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    const sessionId = typeof message?.payload?.sessionId === "string" ? message.payload.sessionId : "";
+    const sequence = Number.isSafeInteger(message?.payload?.sequence) ? Number(message.payload.sequence) : -1;
+    const chunk = typeof message?.payload?.chunk === "string" ? message.payload.chunk : "";
+    if (chunk.length > PAGE_ARCHIVE_CHUNK_CODE_UNITS + 1) {
+      sendResponse({ success: false, error: "ARCHIVE_CHUNK_TOO_LARGE" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    void archiveCaptureSessions
+      .append(sessionId, archiveSenderTabId, sequence, chunk)
+      .then((payload) => sendResponse({ success: true, payload } satisfies ArchiveProtocolResponse))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "ARCHIVE_CHUNK_FAILED",
+        } satisfies ArchiveProtocolResponse),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === PAGE_ARCHIVE_FINISH_MESSAGE) {
+    if (archiveSenderTabId === null) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_ARCHIVE_SENDER" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    const sessionId = typeof message?.payload?.sessionId === "string" ? message.payload.sessionId : "";
+    const chunkCount = Number.isSafeInteger(message?.payload?.chunkCount) ? Number(message.payload.chunkCount) : -1;
+    const capturedUrl = typeof message?.payload?.capturedUrl === "string" ? message.payload.capturedUrl.slice(0, 8192) : "";
+    void archiveCaptureSessions
+      .finish(sessionId, archiveSenderTabId, { chunkCount, capturedUrl })
+      .then((payload) => sendResponse({ success: true, payload } satisfies ArchiveProtocolResponse))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "ARCHIVE_FINISH_FAILED",
+        } satisfies ArchiveProtocolResponse),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === PAGE_ARCHIVE_ABORT_MESSAGE) {
+    if (archiveSenderTabId === null) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_ARCHIVE_SENDER" } satisfies ArchiveProtocolResponse);
+      return true;
+    }
+    const sessionId = typeof message?.payload?.sessionId === "string" ? message.payload.sessionId : "";
+    void archiveCaptureSessions
+      .abort(sessionId, archiveSenderTabId)
+      .then(() => sendResponse({ success: true } satisfies ArchiveProtocolResponse))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "ARCHIVE_ABORT_FAILED",
+        } satisfies ArchiveProtocolResponse),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_SYNC_QUEUED") {
+    if (isTrustedExtensionSender(sender)) {
+      void triggerCloudSync().then(() => triggerArchiveOutboxDrain());
+    }
+    return;
+  }
+
   if (message?.target === "background" && message?.type === "HOVER_SAVE_TARGET") {
     const tabId = sender.tab?.id;
     const url = normalizeHttpUrl(typeof message?.payload?.url === "string" ? message.payload.url : null);
@@ -4118,14 +4679,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.target === "background" && message?.type === "UNDO_SAVE") {
     const primaryUrl = typeof message?.payload?.primaryUrl === "string" ? message.payload.primaryUrl : "";
-    if (primaryUrl) {
-      void sendForwardedToOffscreen({
-        service: "items",
-        type: "deleteByUrl",
-        payload: { url: primaryUrl },
-      }).catch(() => {});
-    }
-    return;
+    const itemId = typeof message?.payload?.itemId === "string" ? message.payload.itemId : "";
+    void (async () => {
+      if (itemId) await markArchiveItemCancelled(itemId);
+      if (primaryUrl) {
+        await sendForwardedToOffscreen({
+          service: "items",
+          type: "deleteByUrl",
+          payload: { url: primaryUrl },
+        });
+      }
+    })()
+      .then(() => sendResponse({ success: true }))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "Undo failed.",
+        }),
+      );
+    return true;
   }
 
   if (message?.target === "background" && message?.type === "OPEN_SEARCH") {
@@ -4175,8 +4747,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.target === "background" && message?.type === "RUN_CONNECTOR_SYNC") {
     const source = String(message?.payload?.source || "");
-    const LABELS: Record<string, string> = { x: "X (Twitter)", reddit: "Reddit", instagram: "Instagram" };
-    const nice = LABELS[source] || "connectors";
+    const accountId = String(message?.payload?.accountId || "");
+    let platform: ConnectorPlatform | null = null;
+    if (source) {
+      if (!isConnectorPlatform(source)) {
+        sendResponse({ ok: false, error: "UNKNOWN_CONNECTOR" });
+        return true;
+      }
+      platform = source;
+    }
+    const nice = platform ? CONNECTOR_LABELS[platform] : "connectors";
     void (async () => {
       const job = { id: `connector-${source || "all"}-${Date.now()}`, label: `Sync • ${nice}` };
       const report = (detail: string) => {
@@ -4185,22 +4765,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       };
       report(source ? `Connecting to ${nice}…` : "Syncing your connected accounts…");
       try {
-        if (source) {
-          const state = await connectConnector(source as ConnectorPlatform);
+        await refreshConnectorCloudAuth();
+        if (platform) {
+          const state = accountId
+            ? (await listConnectors()).find(
+                (entry) => entry.platform === platform && entry.accountId === accountId,
+              )
+            : await connectConnector(platform);
+          if (!state) throw new Error("Connector account not found — reconnect it first.");
           const who = state.handle.startsWith("id:") ? "your account" : `@${state.handle}`;
-          report(`Connected as ${who}. Reading your saved items…`);
-          const r = await syncConnector(source as ConnectorPlatform, state.accountId, report);
+          report(`Reading saved items for ${who}…`);
+          const r = await syncConnector(platform, state.accountId, report);
           sendProcessStatus(
             job.id,
             job.label,
             r.error ? "error" : "success",
-            r.error
-              ? r.error
-              : r.cancelled
-                ? `${who}: cancelled — ${r.pushed} synced before stopping.`
-                : r.fetched === 0
-                  ? `${who}: already up to date — nothing new to sync.`
-                  : `${who}: ${r.pushed} new item${r.pushed === 1 ? "" : "s"} synced${r.skipped ? `, ${r.skipped} already saved` : ""}${r.failed ? `, ${r.failed} failed` : ""}.`,
+            describeConnectorOutcome(who, r),
           );
         } else {
           const results = await syncAllConnected(report);
@@ -4209,11 +4789,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         sendResponse({ ok: true });
       } catch (err) {
-        if (err instanceof ArchiveAuthError) {
-          sendProcessStatus(job.id, job.label, "error", "Sign in to Vibesearch to sync connectors to the cloud.");
-        } else {
-          sendProcessStatus(job.id, job.label, "error", err instanceof Error ? err.message : "Sync failed.");
-        }
+        sendProcessStatus(job.id, job.label, "error", err instanceof Error ? err.message : "Sync failed.");
         sendResponse({ ok: false });
       }
     })();
@@ -4222,7 +4798,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.target === "background" && message?.type === "CANCEL_CONNECTOR_SYNC") {
     const source = String(message?.payload?.source || "");
-    if (source) cancelConnectorSync(source as ConnectorPlatform);
+    if (isConnectorPlatform(source)) cancelConnectorSync(source);
     sendResponse({ ok: true });
     return true;
   }
@@ -4237,7 +4813,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.target === "background" && message?.type === "CONNECTOR_CONNECT") {
     void (async () => {
       try {
-        const state = await connectConnector(String(message?.payload?.platform) as ConnectorPlatform);
+        const platform = String(message?.payload?.platform || "");
+        if (!isConnectorPlatform(platform)) throw new Error("Unknown connector.");
+        const state = await connectConnector(platform);
         sendResponse({ ok: true, state });
       } catch (err) {
         sendResponse({ ok: false, error: err instanceof Error ? err.message : "Connect failed." });
@@ -4248,8 +4826,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.target === "background" && message?.type === "CONNECTOR_DISCONNECT") {
     void (async () => {
+      const platform = String(message?.payload?.platform || "");
+      if (!isConnectorPlatform(platform)) throw new Error("Unknown connector.");
       await disconnectConnector(
-        String(message?.payload?.platform) as ConnectorPlatform,
+        platform,
         String(message?.payload?.accountId),
       );
       sendResponse({ ok: true });
@@ -4259,42 +4839,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.target === "background" && message?.type === "CONNECTOR_SET_AUTOSYNC") {
     void (async () => {
+      const platform = String(message?.payload?.platform || "");
+      if (!isConnectorPlatform(platform)) throw new Error("Unknown connector.");
       await setConnectorAutoSync(
-        String(message?.payload?.platform) as ConnectorPlatform,
+        platform,
         String(message?.payload?.accountId),
         !!message?.payload?.on,
       );
-      sendResponse({ ok: true });
-    })().catch(() => sendResponse({ ok: false }));
-    return true;
-  }
-
-  if (message?.target === "background" && message?.type === "CLOUD_STATUS") {
-    void (async () => sendResponse({ ok: true, account: await getCloudAccount() }))().catch(() =>
-      sendResponse({ ok: false, account: null }),
-    );
-    return true;
-  }
-
-  if (message?.target === "background" && message?.type === "CLOUD_SIGN_IN") {
-    void (async () => {
-      try {
-        const mode = message?.payload?.mode;
-        const session =
-          mode === "test"
-            ? await signInWithTestCredentials(String(message?.payload?.email), String(message?.payload?.password))
-            : await signInWithGoogle(true);
-        sendResponse({ ok: true, account: { uid: session.uid, email: session.email } });
-      } catch (err) {
-        sendResponse({ ok: false, error: err instanceof Error ? err.message : "Sign-in failed." });
-      }
-    })();
-    return true;
-  }
-
-  if (message?.target === "background" && message?.type === "CLOUD_SIGN_OUT") {
-    void (async () => {
-      await signOutCloud();
       sendResponse({ ok: true });
     })().catch(() => sendResponse({ ok: false }));
     return true;
@@ -4458,9 +5009,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   void (async () => {
     try {
-      if ((import.meta as any)?.env?.MODE === "development" && FORCE_DEV_OFFSCREEN_RESET) {
+      if (import.meta.env.MODE === "development" && FORCE_DEV_OFFSCREEN_RESET) {
         try {
-          await (chrome.offscreen as any).closeDocument?.();
+          const offscreenApi = (chrome as any)["offscreen"];
+          await offscreenApi?.["closeDocument"]?.();
         } catch {}
       }
 

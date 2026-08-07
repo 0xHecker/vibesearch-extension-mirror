@@ -7,8 +7,10 @@
     "utils",
     "vite.config.base.ts",
     "vite.config.firefox.ts",
+    "extension-manifest-config.ts",
     "manifest.base.json",
     "manifest.firefox.json",
+    "manifest.host-permissions.json",
     "manifest.json",
     "manifest.dev.json"
   ],

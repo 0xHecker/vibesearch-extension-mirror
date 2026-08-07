@@ -1,5 +1,5 @@
 import * as React from "react";
-import { AtSign, Camera, Check, Cloud, Loader2, MessageCircle, Plus, RefreshCw, TriangleAlert, X } from "lucide-react";
+import { AtSign, Camera, Loader2, MessageCircle, Plus, RefreshCw, TriangleAlert, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@src/components/ui/button";
 import { showErrorToast, showSuccessToast } from "@src/utils/toast-feedback";
@@ -27,11 +27,6 @@ const PLATFORMS: { platform: Platform; label: string; icon: LucideIcon; hint: st
 
 const bg = <T,>(type: string, payload?: Record<string, unknown>): Promise<T> =>
   chrome.runtime.sendMessage({ target: "background", type, payload }) as Promise<T>;
-
-// Test account (dev only): the button below is shown only when these are set in
-// the build env (.env.local), so it never ships in a normal production build.
-const TEST_EMAIL = import.meta.env.VITE_TEST_EMAIL;
-const TEST_PASSWORD = import.meta.env.VITE_TEST_PASSWORD;
 
 const relativeTime = (ts?: number): string => {
   if (!ts) return "not yet";
@@ -76,26 +71,17 @@ function PlatformIcon({ Icon }: { Icon: LucideIcon }) {
   );
 }
 
-export function SocialConnectors() {
-  const [account, setAccount] = React.useState<{ uid: string; email?: string } | null>(null);
-  const [cloudBusy, setCloudBusy] = React.useState(false);
-  const [loading, setLoading] = React.useState(true);
+export function SocialConnectors({ cloudConnected }: { cloudConnected: boolean }) {
   const [connectors, setConnectors] = React.useState<ConnectorStateView[]>([]);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [syncingPlatform, setSyncingPlatform] = React.useState<Platform | null>(null);
 
   const refresh = React.useCallback(async () => {
     try {
-      const [status, list] = await Promise.all([
-        bg<{ account: { uid: string; email?: string } | null }>("CLOUD_STATUS"),
-        bg<{ connectors: ConnectorStateView[] }>("CONNECTOR_LIST"),
-      ]);
-      setAccount(status?.account ?? null);
+      const list = await bg<{ connectors: ConnectorStateView[] }>("CONNECTOR_LIST");
       setConnectors(Array.isArray(list?.connectors) ? list.connectors : []);
     } catch {
       /* background not ready */
-    } finally {
-      setLoading(false);
     }
   }, []);
 
@@ -103,56 +89,12 @@ export function SocialConnectors() {
     void refresh();
   }, [refresh]);
 
-  const signedIn = !!account;
-
-  const signIn = async () => {
-    setCloudBusy(true);
-    try {
-      const res = await bg<{ ok: boolean; account?: { uid: string; email?: string }; error?: string }>("CLOUD_SIGN_IN", { mode: "google" });
-      if (res?.ok) {
-        setAccount(res.account ?? null);
-        showSuccessToast("Signed in — your saved items will sync to Vibesearch.");
-      } else showErrorToast(res?.error || "Sign-in failed.");
-    } finally {
-      setCloudBusy(false);
-    }
-  };
-
-  const signInTest = async () => {
-    if (!TEST_EMAIL || !TEST_PASSWORD) return;
-    setCloudBusy(true);
-    try {
-      const res = await bg<{ ok: boolean; account?: { uid: string; email?: string }; error?: string }>("CLOUD_SIGN_IN", {
-        mode: "test",
-        email: TEST_EMAIL,
-        password: TEST_PASSWORD,
-      });
-      if (res?.ok) {
-        setAccount(res.account ?? null);
-        showSuccessToast("Signed in with the test account.");
-      } else showErrorToast(res?.error || "Test sign-in failed.");
-    } finally {
-      setCloudBusy(false);
-    }
-  };
-
-  const signOut = async () => {
-    setCloudBusy(true);
-    try {
-      await bg("CLOUD_SIGN_OUT");
-      setAccount(null);
-      showSuccessToast("Signed out of Vibesearch cloud.");
-    } finally {
-      setCloudBusy(false);
-    }
-  };
-
   const accountsFor = (platform: Platform) => connectors.filter((c) => c.platform === platform);
 
-  const runSync = async (platform: Platform) => {
+  const runSync = async (platform: Platform, accountId: string) => {
     setSyncingPlatform(platform);
     try {
-      await bg("RUN_CONNECTOR_SYNC", { source: platform });
+      await bg("RUN_CONNECTOR_SYNC", { source: platform, accountId });
     } finally {
       setSyncingPlatform(null);
       await refresh();
@@ -166,11 +108,11 @@ export function SocialConnectors() {
 
   const connect = async (platform: Platform) => {
     setBusy(`connect:${platform}`);
-    let ok = false;
+    let connectedAccountId = "";
     try {
-      const res = await bg<{ ok: boolean; error?: string }>("CONNECTOR_CONNECT", { platform });
-      if (res?.ok) {
-        ok = true;
+      const res = await bg<{ ok: boolean; state?: ConnectorStateView; error?: string }>("CONNECTOR_CONNECT", { platform });
+      if (res?.ok && res.state) {
+        connectedAccountId = res.state.accountId;
         showSuccessToast(`Connected — syncing your saved items…`);
       } else {
         showErrorToast(res?.error || `Couldn't connect ${platform}.`);
@@ -179,7 +121,7 @@ export function SocialConnectors() {
     } finally {
       setBusy(null);
     }
-    if (ok) await runSync(platform);
+    if (connectedAccountId) await runSync(platform, connectedAccountId);
   };
 
   const toggleAccount = async (c: ConnectorStateView) => {
@@ -196,7 +138,8 @@ export function SocialConnectors() {
     }
   };
 
-  const syncNow = (platform: Platform) => void runSync(platform);
+  const syncNow = (connector: ConnectorStateView) =>
+    void runSync(connector.platform, connector.accountId);
 
   const statusLine = (c: ConnectorStateView): string => {
     if (!c.connected) return c.lastError || "Paused — turn on to reconnect.";
@@ -206,44 +149,10 @@ export function SocialConnectors() {
   return (
     <SettingGroup label="Saved from social">
       <p className="-mt-1 mb-3 px-1 text-xs leading-relaxed text-foreground-tertiary">
-        Connect an account and Vibesearch pulls in your bookmarks &amp; saved posts — then keeps them in sync automatically, in the background. Everything flows one way, into your Vibesearch library.
+        {cloudConnected
+          ? "Connect an account and Vibesearch pulls in bookmarks and saved posts, then keeps them synced in the background."
+          : "Connect Cloud library above first, then add the social accounts you want to sync."}
       </p>
-
-      {/* Cloud account — the destination. Required before syncing. */}
-      <SettingRow
-        title={
-          <span className="flex items-center gap-2">
-            <Cloud className={signedIn ? "size-4 text-foreground-positive" : "size-4 text-foreground-tertiary"} />
-            Vibesearch account
-          </span>
-        }
-        description={signedIn ? "Your saved items sync here." : "Sign in to choose where your saved items go."}
-      >
-        {loading ? (
-          <Loader2 className="size-4 animate-spin text-foreground-tertiary" />
-        ) : signedIn ? (
-          <>
-            <span className="inline-flex items-center gap-1 rounded-full bg-background-positive-faded px-2 py-0.5 text-xs font-medium text-foreground-positive">
-              <Check className="size-3" /> {account?.email || "Signed in"}
-            </span>
-            <Button type="button" variant="ghost" size="sm" onClick={() => void signOut()} disabled={cloudBusy} className="text-foreground-tertiary hover:text-foreground-danger">
-              Sign out
-            </Button>
-          </>
-        ) : (
-          <div className="flex items-center gap-1.5">
-            <Button type="button" size="sm" onClick={() => void signIn()} disabled={cloudBusy} static={cloudBusy}>
-              {cloudBusy ? <Loader2 className="size-4 animate-spin" /> : <Cloud className="size-4" />}
-              Sign in with Google
-            </Button>
-            {TEST_EMAIL && (
-              <Button type="button" variant="ghost" size="sm" onClick={() => void signInTest()} disabled={cloudBusy} className="text-foreground-tertiary">
-                Use test account
-              </Button>
-            )}
-          </div>
-        )}
-      </SettingRow>
 
       {/* One block per platform: connected accounts (multi) + a connect affordance. */}
       {PLATFORMS.map(({ platform, label, icon, hint }) => {
@@ -260,9 +169,9 @@ export function SocialConnectors() {
                     {label}
                   </span>
                 }
-                description={signedIn ? hint : "Sign in above first, then connect."}
+                description={cloudConnected ? hint : "Connect Cloud library above first."}
               >
-                <Switch on={false} busy={connecting} disabled={!signedIn} onToggle={() => void connect(platform)} label={`Connect ${label}`} />
+                <Switch on={false} busy={connecting} disabled={!cloudConnected} onToggle={() => void connect(platform)} label={`Connect ${label}`} />
               </SettingRow>
             ) : (
               accounts.map((c, i) => {
@@ -292,16 +201,16 @@ export function SocialConnectors() {
                         <X className="size-4" /> Cancel
                       </Button>
                     ) : c.connected ? (
-                      <Button type="button" variant="ghost" size="sm" onClick={() => void syncNow(platform)} className="text-foreground-secondary">
+                      <Button type="button" variant="ghost" size="sm" onClick={() => syncNow(c)} className="text-foreground-secondary">
                         <RefreshCw className="size-4" /> Sync now
                       </Button>
                     ) : null}
-                    <Switch on={c.connected} busy={toggling} disabled={!signedIn || isSyncing} onToggle={() => void toggleAccount(c)} label={`${c.connected ? "Disconnect" : "Reconnect"} ${label}`} />
+                    <Switch on={c.connected} busy={toggling} disabled={!cloudConnected || isSyncing} onToggle={() => void toggleAccount(c)} label={`${c.connected ? "Disconnect" : "Reconnect"} ${label}`} />
                   </SettingRow>
                 );
               })
             )}
-            {accounts.length > 0 && signedIn && (
+            {accounts.length > 0 && cloudConnected && (
               <button
                 type="button"
                 onClick={() => void connect(platform)}

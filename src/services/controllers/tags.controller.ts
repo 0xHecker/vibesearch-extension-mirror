@@ -31,7 +31,9 @@ export class TagsController {
     const requestedScope = accessContext?.searchScope || "global";
     const privateUnlocked = spaceSessionService.isUnlocked(PRIVATE_SPACE_ID);
 
-    const spaceDocs = await db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec();
+    const spaceDocs = await db.spaces
+      .find({ selector: { isArchived: { $eq: false }, deletedAt: { $eq: 0 } } })
+      .exec();
     const spaces = spaceDocs.map((doc: any) => doc.toMutableJSON() as any);
     const allSpaceIds = spaces.map((space: any) => space.id as string);
     const nonPrivateSpaceIds = spaces

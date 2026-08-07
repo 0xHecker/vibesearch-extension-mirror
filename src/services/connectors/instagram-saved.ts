@@ -53,15 +53,17 @@ async function detectAccount(): Promise<ConnectorAccount | null> {
   return { platform: "instagram", accountId: dsUserId, handle, displayName, avatarUrl };
 }
 
-async function fetchSaved(opts: { sinceId?: string; maxPages?: number; onProgress?: (d: string) => void; shouldCancel?: () => boolean }): Promise<FetchSavedResult> {
+async function fetchSaved(opts: { sinceId?: string; cursor?: string; maxPages?: number; onProgress?: (d: string) => void; shouldCancel?: () => boolean }): Promise<FetchSavedResult> {
   const account = await detectAccount();
   if (!account) throw new Error("You're not logged in to Instagram in this browser. Open instagram.com and sign in.");
   console.log("[Vibesearch · Instagram] fetching saved for @" + account.handle, { sinceId: opts.sinceId ?? null });
   const items: CapturedItem[] = [];
-  const maxPages = opts.maxPages ?? 20;
-  let maxId: string | undefined;
+  const maxPages = Math.max(1, Math.min(opts.maxPages ?? 10, 50));
+  let maxId = opts.cursor;
+  let nextCursor = opts.cursor;
   let newestId: string | undefined;
   let reachedKnown = false;
+  let complete = false;
 
   for (let page = 0; page < maxPages; page++) {
     if (opts.shouldCancel?.()) {
@@ -73,11 +75,15 @@ async function fetchSaved(opts: { sinceId?: string; maxPages?: number; onProgres
     const res = await igFetch(`/api/v1/feed/saved/posts/?${qs.toString()}`);
     if (!res || !res.ok) {
       if (page === 0) throw new Error("Instagram didn't return saved posts (session may be invalid or rate-limited).");
+      nextCursor = maxId;
       break;
     }
     const raw = await res.json().catch(() => null);
-    if (!raw) break;
-    console.log(`[Vibesearch · Instagram] response (page ${page + 1}) ↓`, raw);
+    if (!raw) {
+      if (page === 0) throw new Error("Instagram returned an invalid saved-posts response.");
+      nextCursor = maxId;
+      break;
+    }
     const entries = findEntryList(raw);
     console.log(`[Vibesearch · Instagram] page ${page + 1}: found ${entries.length} saved post(s)`);
     for (const el of entries) {
@@ -101,12 +107,18 @@ async function fetchSaved(opts: { sinceId?: string; maxPages?: number; onProgres
     const next = findCursor(raw);
     console.log(`[Vibesearch · Instagram] collected ${items.length} saved post(s) so far${next ? " — more pages…" : " — last page."}`);
     opts.onProgress?.(`Read ${items.length} saved post${items.length === 1 ? "" : "s"}${next ? " so far…" : "."}`);
-    if (reachedKnown || !next || next === maxId || entries.length === 0) break;
+    if (reachedKnown || !next || next === maxId || entries.length === 0) {
+      complete = true;
+      nextCursor = undefined;
+      break;
+    }
+    nextCursor = next;
+    if (page + 1 >= maxPages) break;
     maxId = next;
     await politeDelay();
   }
   console.log(`[Vibesearch · Instagram] done — ${items.length} saved post(s) ready to sync.`);
-  return { items, newestId };
+  return { items, newestId, nextCursor, complete };
 }
 
 export const instagramConnector: ConnectorModule = {
@@ -114,6 +126,9 @@ export const instagramConnector: ConnectorModule = {
   label: "Instagram",
   origins: ["https://www.instagram.com/*"],
   detectAccount,
-  checkAlive: async () => (await detectAccount()) != null,
+  checkAlive: async (accountId) => {
+    const account = await detectAccount();
+    return account !== null && (!accountId || account.accountId === accountId);
+  },
   fetchSaved,
 };

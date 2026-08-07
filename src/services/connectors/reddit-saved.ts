@@ -37,15 +37,17 @@ async function detectAccount(): Promise<ConnectorAccount | null> {
   };
 }
 
-async function fetchSaved(opts: { sinceId?: string; maxPages?: number; onProgress?: (d: string) => void; shouldCancel?: () => boolean }): Promise<FetchSavedResult> {
+async function fetchSaved(opts: { sinceId?: string; cursor?: string; maxPages?: number; onProgress?: (d: string) => void; shouldCancel?: () => boolean }): Promise<FetchSavedResult> {
   const account = await detectAccount();
   if (!account) throw new Error("You're not logged in to Reddit in this browser. Open reddit.com and sign in.");
   console.log("[Vibesearch · Reddit] fetching saved for u/" + account.handle, { sinceId: opts.sinceId ?? null });
   const items: CapturedItem[] = [];
-  const maxPages = opts.maxPages ?? 20;
-  let after: string | undefined;
+  const maxPages = Math.max(1, Math.min(opts.maxPages ?? 10, 50));
+  let after = opts.cursor;
+  let nextCursor = opts.cursor;
   let newestId: string | undefined;
   let reachedKnown = false;
+  let complete = false;
 
   for (let page = 0; page < maxPages; page++) {
     if (opts.shouldCancel?.()) {
@@ -59,9 +61,9 @@ async function fetchSaved(opts: { sinceId?: string; maxPages?: number; onProgres
     );
     if (!raw) {
       if (page === 0) throw new Error("Reddit didn't return saved items (session may be invalid).");
+      nextCursor = after;
       break;
     }
-    console.log(`[Vibesearch · Reddit] response (page ${page + 1}) ↓`, raw);
     const entries = findEntryList(raw);
     console.log(`[Vibesearch · Reddit] page ${page + 1}: found ${entries.length} saved item(s)`);
     for (const el of entries) {
@@ -82,14 +84,21 @@ async function fetchSaved(opts: { sinceId?: string; maxPages?: number; onProgres
       }
       items.push(item);
     }
-    after = findCursor(raw);
-    console.log(`[Vibesearch · Reddit] collected ${items.length} saved item(s) so far${after ? " — more pages…" : " — last page."}`);
-    opts.onProgress?.(`Read ${items.length} saved item${items.length === 1 ? "" : "s"}${after ? " so far…" : "."}`);
-    if (reachedKnown || !after || entries.length === 0) break;
+    const next = findCursor(raw);
+    console.log(`[Vibesearch · Reddit] collected ${items.length} saved item(s) so far${next ? " — more pages…" : " — last page."}`);
+    opts.onProgress?.(`Read ${items.length} saved item${items.length === 1 ? "" : "s"}${next ? " so far…" : "."}`);
+    if (reachedKnown || !next || next === after || entries.length === 0) {
+      complete = true;
+      nextCursor = undefined;
+      break;
+    }
+    nextCursor = next;
+    if (page + 1 >= maxPages) break;
+    after = next;
     await politeDelay();
   }
   console.log(`[Vibesearch · Reddit] done — ${items.length} saved item(s) ready to sync.`);
-  return { items, newestId };
+  return { items, newestId, nextCursor, complete };
 }
 
 export const redditConnector: ConnectorModule = {
@@ -97,6 +106,9 @@ export const redditConnector: ConnectorModule = {
   label: "Reddit",
   origins: ["https://www.reddit.com/*", "https://oauth.reddit.com/*"],
   detectAccount,
-  checkAlive: async () => (await detectAccount()) != null,
+  checkAlive: async (accountId) => {
+    const account = await detectAccount();
+    return account !== null && (!accountId || account.accountId === accountId);
+  },
   fetchSaved,
 };

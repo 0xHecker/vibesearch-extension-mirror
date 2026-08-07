@@ -90,4 +90,3 @@ async function getTokenWithWebAuthFlow(interactive: boolean): Promise<GoogleToke
     grantedScopes: scope ? scope.split(/\s+/).filter(Boolean) : undefined,
   };
 }
-    

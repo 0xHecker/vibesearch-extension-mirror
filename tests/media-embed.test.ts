@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { getExternalEmbedSandbox } from "../src/utils/media-embed";
+import { getExternalEmbedSandbox, getPreferredYouTubeVideoId } from "../src/utils/media-embed";
 
 describe("getExternalEmbedSandbox", () => {
   test("retains same-origin permission only for remote web embeds", () => {
@@ -20,5 +20,22 @@ describe("getExternalEmbedSandbox", () => {
         "allow-scripts allow-forms allow-presentation"
       );
     }
+  });
+});
+
+describe("getPreferredYouTubeVideoId", () => {
+  test("prefers a right-clicked YouTube link over the current watch page", () => {
+    expect(
+      getPreferredYouTubeVideoId(
+        "https://www.youtube.com/watch?v=clicked12345",
+        "https://www.youtube.com/watch?v=current12345"
+      )
+    ).toBe("clicked12345");
+  });
+
+  test("falls back to the current page when there is no clicked YouTube link", () => {
+    expect(getPreferredYouTubeVideoId(null, "https://www.youtube.com/watch?v=current12345")).toBe(
+      "current12345"
+    );
   });
 });

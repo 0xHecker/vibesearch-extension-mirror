@@ -7,7 +7,7 @@
  * harvester (`findEntryList` + `normalizeEntry` + `findCursor`), so field/nesting
  * changes don't break extraction. Only the endpoint + auth + cursor param are here.
  */
-import { pushCapturedItems, type CapturedItem, type CloudPushResult } from "../cloud-sync.service";
+import type { CapturedItem } from "../cloud-sync.service";
 import type { ConnectorAccount, ConnectorModule, FetchSavedResult } from "./types";
 import { findEntryList, normalizeEntry, findCursor, politeDelay } from "./harvest";
 
@@ -73,15 +73,14 @@ async function fetchPage(creds: XCredentials, cursor?: string): Promise<unknown>
   try {
     res = await fetch(url, {
       signal: AbortSignal.timeout(20000),
+      credentials: "include",
       headers: {
         Authorization: `Bearer ${BEARER}`,
         "X-Csrf-Token": creds.ct0,
-        Cookie: `auth_token=${creds.authToken}; ct0=${creds.ct0}`,
         "X-Twitter-Auth-Type": "OAuth2Session",
         "X-Twitter-Active-User": "yes",
         "X-Twitter-Client-Language": "en",
         Accept: "*/*",
-        Referer: "https://x.com/i/bookmarks",
       },
     });
   } catch (err) {
@@ -100,6 +99,7 @@ async function fetchPage(creds: XCredentials, cursor?: string): Promise<unknown>
 
 export interface XSyncOptions {
   sinceId?: string;
+  cursor?: string;
   maxPages?: number;
   onProgress?: (detail: string) => void;
   shouldCancel?: () => boolean;
@@ -108,23 +108,31 @@ export interface XSyncOptions {
 /** Fetch X bookmarks as normalized items via the dynamic harvester. */
 export async function fetchXBookmarks(
   opts: XSyncOptions = {},
-): Promise<{ items: CapturedItem[]; newestId?: string; reachedKnown: boolean }> {
+): Promise<FetchSavedResult & { reachedKnown: boolean }> {
   const creds = await readXCredentials();
   if (!creds) throw new Error("You're not logged in to X in this browser. Open x.com, sign in, then retry.");
   console.log("[Vibesearch · X] fetching bookmarks…", { sinceId: opts.sinceId ?? null });
   const items: CapturedItem[] = [];
-  const maxPages = opts.maxPages ?? 50;
-  let cursor: string | undefined;
+  const maxPages = Math.max(1, Math.min(opts.maxPages ?? 10, 50));
+  let cursor = opts.cursor;
+  let nextCursor = opts.cursor;
   let newestId: string | undefined;
   let reachedKnown = false;
+  let complete = false;
 
   for (let page = 0; page < maxPages; page++) {
     if (opts.shouldCancel?.()) {
       console.log("[Vibesearch · X] cancelled by user.");
       break;
     }
-    const raw = await fetchPage(creds, cursor);
-    console.log(`[Vibesearch · X] response (page ${page + 1}) ↓`, raw);
+    let raw: unknown;
+    try {
+      raw = await fetchPage(creds, cursor);
+    } catch (error) {
+      if (page === 0) throw error;
+      nextCursor = cursor;
+      break;
+    }
     const entries = findEntryList(raw);
     console.log(`[Vibesearch · X] page ${page + 1}: found ${entries.length} entries`);
     for (const el of entries) {
@@ -147,12 +155,18 @@ export async function fetchXBookmarks(
     const next = findCursor(raw);
     console.log(`[Vibesearch · X] collected ${items.length} bookmark(s) so far${next ? " — more pages…" : " — last page."}`);
     opts.onProgress?.(`Read ${items.length} bookmark${items.length === 1 ? "" : "s"}${next ? " so far…" : "."}`);
-    if (reachedKnown || !next || next === cursor || entries.length === 0) break;
+    if (reachedKnown || !next || next === cursor || entries.length === 0) {
+      complete = true;
+      nextCursor = undefined;
+      break;
+    }
+    nextCursor = next;
+    if (page + 1 >= maxPages) break;
     cursor = next;
     await politeDelay();
   }
   console.log(`[Vibesearch · X] done — ${items.length} bookmark(s) ready to sync.`);
-  return { items, newestId, reachedKnown };
+  return { items, newestId, nextCursor, complete, reachedKnown };
 }
 
 // ── account detection + heartbeat ────────────────────────────────────────────
@@ -165,10 +179,10 @@ async function detectXAccount(): Promise<ConnectorAccount | null> {
   let handle = `id:${accountId}`;
   try {
     const res = await fetch("https://api.x.com/1.1/account/settings.json", {
+      credentials: "include",
       headers: {
         Authorization: `Bearer ${BEARER}`,
         "X-Csrf-Token": creds.ct0,
-        Cookie: `auth_token=${creds.authToken}; ct0=${creds.ct0}`,
         "X-Twitter-Auth-Type": "OAuth2Session",
       },
     });
@@ -183,42 +197,15 @@ async function detectXAccount(): Promise<ConnectorAccount | null> {
   return { platform: "x", accountId, handle, displayName: handle.startsWith("id:") ? undefined : `@${handle}` };
 }
 
-async function checkXAlive(): Promise<boolean> {
+async function checkXAlive(accountId?: string): Promise<boolean> {
   // Lightweight: the account/settings probe in detectXAccount, not a full
   // bookmarks fetch — keeps heartbeats cheap so we don't hammer X.
   try {
-    return (await detectXAccount()) != null;
+    const account = await detectXAccount();
+    return account !== null && (!accountId || account.accountId === accountId);
   } catch {
     return false;
   }
-}
-
-const SINCE_KEY = "vibesearch:xBookmarksSinceId";
-
-export interface XSyncResult extends CloudPushResult {
-  fetched: number;
-  reachedKnown: boolean;
-}
-
-/** Standalone X sync (fetch + push + remember cursor). Also used by the registry. */
-export async function runXBookmarksSync(): Promise<XSyncResult> {
-  let sinceId: string | undefined;
-  try {
-    const row = await chrome.storage.local.get(SINCE_KEY);
-    if (typeof row?.[SINCE_KEY] === "string") sinceId = row[SINCE_KEY];
-  } catch {
-    /* ignore */
-  }
-  const { items, newestId, reachedKnown } = await fetchXBookmarks({ sinceId });
-  const push = await pushCapturedItems(items);
-  if (newestId) {
-    try {
-      await chrome.storage.local.set({ [SINCE_KEY]: newestId });
-    } catch {
-      /* best-effort */
-    }
-  }
-  return { fetched: items.length, reachedKnown, ...push };
 }
 
 export const xConnector: ConnectorModule = {
@@ -228,7 +215,6 @@ export const xConnector: ConnectorModule = {
   detectAccount: detectXAccount,
   checkAlive: checkXAlive,
   fetchSaved: async (opts): Promise<FetchSavedResult> => {
-    const { items, newestId } = await fetchXBookmarks(opts);
-    return { items, newestId };
+    return fetchXBookmarks(opts);
   },
 };

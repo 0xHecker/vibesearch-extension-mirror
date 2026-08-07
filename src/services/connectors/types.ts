@@ -30,6 +30,10 @@ export interface FetchSavedResult {
   items: CapturedItem[];
   /** Newest platform id seen this run — stored as the incremental cursor. */
   newestId?: string;
+  /** Opaque page cursor used to resume a bounded backlog on the next run. */
+  nextCursor?: string;
+  /** True only when the known item or the end of the remote collection was reached. */
+  complete: boolean;
   folders?: SavedFolder[];
 }
 
@@ -42,10 +46,11 @@ export interface ConnectorModule {
   /** Read the currently logged-in account from the browser session, or null. */
   detectAccount(): Promise<ConnectorAccount | null>;
   /** Heartbeat: is the session still valid + can we call the API? */
-  checkAlive(): Promise<boolean>;
+  checkAlive(accountId?: string): Promise<boolean>;
   /** Fetch saved/bookmarked items (incremental via `sinceId`), with folders. */
   fetchSaved(opts: {
     sinceId?: string;
+    cursor?: string;
     maxPages?: number;
     onProgress?: (detail: string) => void;
     shouldCancel?: () => boolean;
@@ -62,6 +67,10 @@ export interface ConnectorState {
   connected: boolean;
   autoSync: boolean;
   sinceId?: string;
+  /** Opaque remote page cursor for a backlog that spans bounded sync runs. */
+  continuationCursor?: string;
+  /** New high-water mark held until the backlog reaches its safe commit point. */
+  pendingNewestId?: string;
   lastSyncAt?: number;
   lastHeartbeatAt?: number;
   lastError?: string;

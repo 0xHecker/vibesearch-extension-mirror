@@ -1,14 +1,16 @@
 import { memo, useEffect, useMemo, useState } from "react";
-import { ChevronLeft, ChevronRight, CornerUpRight, Globe2, Lock } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, CornerUpRight, Globe2, Lock, Minus } from "lucide-react";
 import { FlatItem } from "@components/TabGroups/FlatItem";
 import { GridItem } from "@components/TabGroups/GridItem";
 import { Masonry } from "react-plock";
 import { ViewToggle } from "@components/TabGroups/ViewToggle";
+import { useSelection } from "@components/TabGroups/SelectionContext";
 import type { SpaceMoveOption } from "@components/TabGroups/TabGroups";
 import { TooltipProvider } from "@components/ui/tooltip";
 import { cn } from "@src/lib/utils";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import type { QueryRankDebugScore } from "@src/search-core/contracts";
+import { getVisibleSelectionState } from "@src/pages/search/selection-state";
 
 /** Spaces here carry their collection (space-group) link for the breadcrumb. */
 export type SearchSpaceInfo = SpaceMoveOption & { spaceGroupId?: string | null };
@@ -67,6 +69,9 @@ const SearchResultsComponent = ({
       localStorage.setItem(VIEW_STORAGE_KEY, viewMode);
     } catch {}
   }, [viewMode]);
+
+  const { selectedIds, toggleSelectAll } = useSelection();
+  const { allVisibleSelected, someVisibleSelected } = getVisibleSelectionState(items, selectedIds);
 
   const spaceById = useMemo(() => new Map(spaces.map((space) => [space.id, space])), [spaces]);
   const folderById = useMemo(
@@ -153,7 +158,39 @@ const SearchResultsComponent = ({
   return (
     <TooltipProvider>
       <div className="w-full max-w-[1090px] mx-auto mt-1 pb-16">
-        <div className="mb-3 flex items-center justify-end px-4">
+        <div className="mb-3 flex items-center justify-between gap-3 px-4">
+          <button
+            type="button"
+            onClick={() => toggleSelectAll(items)}
+            disabled={items.length === 0}
+            aria-pressed={allVisibleSelected}
+            title={allVisibleSelected ? "Deselect results on this page" : "Select results on this page"}
+            className={cn(
+              "inline-flex h-9 shrink-0 items-center gap-2 rounded-lg border px-3 text-[13px] font-medium transition-colors",
+              allVisibleSelected
+                ? "border-accent bg-accent text-background-neutral"
+                : "border-border-neutral-faded text-foreground-secondary hover:border-border-neutral hover:bg-background-neutral-faded hover:text-foreground-neutral",
+              items.length === 0 && "cursor-not-allowed opacity-40"
+            )}
+          >
+            <span
+              className={cn(
+                "grid size-4 place-items-center rounded-[5px] border transition-colors",
+                allVisibleSelected
+                  ? "border-background-neutral bg-background-neutral text-accent"
+                  : someVisibleSelected
+                  ? "border-accent bg-accent/40 text-background-neutral"
+                  : "border-current"
+              )}
+            >
+              {allVisibleSelected ? (
+                <Check size={11} strokeWidth={3} />
+              ) : someVisibleSelected ? (
+                <Minus size={11} strokeWidth={3} />
+              ) : null}
+            </span>
+            {allVisibleSelected ? "Deselect page" : "Select page"}
+          </button>
           <ViewToggle view={viewMode} onViewChange={setViewMode} />
         </div>
 

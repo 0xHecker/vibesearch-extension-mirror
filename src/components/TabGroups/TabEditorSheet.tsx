@@ -544,7 +544,8 @@ export const TabEditorSheet = ({
           opfsPath,
           altText: file.name,
         };
-        const next = (mediaItems || []).map((m, i) =>
+        const expectedMedia = mediaItems || [];
+        const next = expectedMedia.map((m, i) =>
           i === indexToReplace ? newEntry : m
         );
         await withToast({
@@ -556,7 +557,7 @@ export const TabEditorSheet = ({
               service: "items",
               type: "updateMedia",
               target: "offscreen",
-              payload: { id: item.id, media: next },
+              payload: { id: item.id, media: next, expectedMedia },
             });
             if (res?.success === false || res?.payload?.success === false) {
               throw new Error(res?.error || res?.payload?.error || "Failed to replace media.");
@@ -578,7 +579,8 @@ export const TabEditorSheet = ({
             altText: file.name,
           });
         }
-        const next = [...(mediaItems || []), ...newEntries];
+        const expectedMedia = mediaItems || [];
+        const next = [...expectedMedia, ...newEntries];
         await withToast({
           loading: files.length > 1 ? `Uploading ${files.length} files...` : "Uploading media...",
           success: files.length > 1 ? `${files.length} files uploaded.` : "Media uploaded.",
@@ -588,7 +590,7 @@ export const TabEditorSheet = ({
               service: "items",
               type: "updateMedia",
               target: "offscreen",
-              payload: { id: item.id, media: next },
+              payload: { id: item.id, media: next, expectedMedia },
             });
             if (res?.success === false || res?.payload?.success === false) {
               throw new Error(res?.error || res?.payload?.error || "Failed to upload media.");
@@ -638,7 +640,8 @@ export const TabEditorSheet = ({
 
   const handleSetPrimaryMedia = async (index: number) => {
     if (index === 0) return;
-    const arr = (mediaItems || []).slice();
+    const expectedMedia = mediaItems || [];
+    const arr = expectedMedia.slice();
     if (index < 0 || index >= arr.length) return;
     const [moved] = arr.splice(index, 1);
     arr.unshift(moved);
@@ -655,7 +658,7 @@ export const TabEditorSheet = ({
             service: "items",
             type: "updateMedia",
             target: "offscreen",
-            payload: { id: item.id, media: arr },
+            payload: { id: item.id, media: arr, expectedMedia },
           });
           if (res?.success === false || res?.payload?.success === false) {
             throw new Error(res?.error || res?.payload?.error || "Failed to set default media.");

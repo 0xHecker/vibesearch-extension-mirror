@@ -17,6 +17,7 @@ If you only read one page, read this one — then jump to whichever subsystem yo
 | [search.md](search.md) | RxDB, the FlexSearch index, the query language, and hybrid ranking |
 | [ocr.md](ocr.md) | On-device OCR in a sandboxed page (PaddleOCR) |
 | [import.md](import.md) | Bookmarks, GitHub stars, the metadata pipeline, media storage |
+| [offline-archives.md](offline-archives.md) | SingleFile live capture, OPFS outbox, API/R2 upload, retries |
 | [backup-and-sync.md](backup-and-sync.md) | Sharing, JSON/Google Drive backup, migration, vector maintenance |
 
 ---

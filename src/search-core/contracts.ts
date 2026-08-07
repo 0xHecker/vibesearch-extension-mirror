@@ -129,6 +129,30 @@ export const parseQueryMode = (raw: string): QueryMode | null => {
 export const getQueryModeFeatures = (mode: QueryMode): QueryModeFeatures =>
   QUERY_MODE_DEFINITIONS[mode];
 
+/**
+ * Resolve requested channels for a concrete query. Semantic embedding has a
+ * minimum useful input length; a vector-only query below that threshold must
+ * fall back to exact lexical matching instead of becoming an unconstrained
+ * browse request with every channel disabled.
+ */
+export const resolveEffectiveQueryChannels = (input: {
+  requested: QueryModeFeatures;
+  query: string;
+  vectorMinChars: number;
+}): QueryModeFeatures => {
+  const queryLength = input.query.trim().length;
+  const vector = input.requested.vector && queryLength >= input.vectorMinChars;
+  const fuzzy = input.requested.fuzzy;
+  const needsKeywordFallback =
+    queryLength > 0 && !input.requested.keyword && !fuzzy && !vector;
+
+  return {
+    keyword: input.requested.keyword || needsKeywordFallback,
+    fuzzy,
+    vector,
+  };
+};
+
 export type QueryScope = "current" | "global" | "private" | "public";
 export type QuerySortBy = "relevance" | "createdAt" | "updatedAt" | "title" | "source";
 export type QuerySortOrder = "asc" | "desc";
@@ -357,6 +381,10 @@ export type RankQueryWorkerPayload = {
   limit: number;
   afterCursor?: RankQueryCursor | null;
   lexicalScores: Array<[string, number]>;
+  /** Normalized positive query terms; array position maps into bitset words. */
+  lexicalMatchTerms?: string[];
+  /** Per-item 32-bit words identifying which lexical query terms matched. */
+  lexicalMatchMasksById?: Array<[string, number[]]>;
   vectorScoresByIndex: Array<[number, number]>;
   includeDebug?: boolean;
 };

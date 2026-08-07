@@ -133,8 +133,8 @@ export const FlatItem = memo(({
 
   const handleDelete = async () => {
     await withToast({
-      loading: "Deleting tab...",
-      success: "Tab deleted.",
+      loading: "Moving tab to Bin...",
+      success: "Tab moved to Bin.",
       error: (err) => resolveToastErrorMessage(err, "Failed to delete tab."),
       action: async () => {
         const response = await chrome.runtime.sendMessage({
@@ -565,9 +565,9 @@ export const FlatItem = memo(({
         <ConfirmDialog
           open={isDeleteDialogOpen}
           onOpenChange={setIsDeleteDialogOpen}
-          title="Delete this tab?"
-          description={`This will remove "${item.title}" from this tab group. You can't undo this action.`}
-          confirmLabel="Delete tab"
+          title="Move this tab to Bin?"
+          description={`This moves "${item.title}" from this tab group to Bin. It is removed from search and can be recovered from Bin.`}
+          confirmLabel="Move to Bin"
           onConfirm={handleDelete}
           variant="danger"
         />

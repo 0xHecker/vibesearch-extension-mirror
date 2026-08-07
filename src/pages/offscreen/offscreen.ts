@@ -8,11 +8,18 @@ import { foldersController } from "@src/services/controllers/folders.controller"
 import { tagsController } from "@src/services/controllers/tags.controller";
 import { spacesController } from "@src/services/controllers/spaces.controller";
 import { spaceGroupsController } from "@src/services/controllers/space-groups.controller";
+import { binController } from "@src/services/controllers/bin.controller";
 import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordinator";
 import { queryRankerService } from "@src/services/query-ranker.service";
 import { browserBookmarkImportService } from "@src/services/browser-bookmark-import";
 import { githubStarsImportService } from "@src/services/github-stars-import";
-import { ocrService, OCR_MODEL_VERSION } from "@src/services/ocr.service";
+import { cloudSyncService } from "@src/services/cloud-sync";
+import { cloudAuthService } from "@src/services/cloud-auth";
+import {
+  ocrService,
+  OCR_MODEL_VERSION,
+  OCR_SUPPORTED,
+} from "@src/services/ocr.service";
 import {
   isEmbeddingStateOnlyItemChange,
   isFolderCollapseOnlyChange,
@@ -209,12 +216,26 @@ console.log("[Offscreen] Document script loaded.");
 const router = new OffscreenRouter();
 const ocrController = {
   async extractImageText(payload: { url?: string }) {
+    if (!OCR_SUPPORTED) {
+      throw new Error(
+        "Local image OCR is unavailable in this browser build."
+      );
+    }
     const url = typeof payload?.url === "string" ? payload.url : "";
-    return ocrService.processImageUrl(url);
+    try {
+      return await ocrService.processImageUrl(url);
+    } finally {
+      // This ad-hoc path bypasses the OCR queue, so it must arrange the same
+      // idle teardown or the model iframe stays resident for the session.
+      ocrService.scheduleIdleRelease();
+    }
   },
 };
 
 const browserBookmarkImportController = {
+  async hasImported() {
+    return browserBookmarkImportService.hasImported();
+  },
   async importTree(payload: Parameters<typeof browserBookmarkImportService.importTree>[0]) {
     dbChangeSuppressionDepth += 1;
     try {
@@ -246,6 +267,30 @@ const githubStarsImportController = {
   },
 };
 
+const cloudSyncController = {
+  async status() {
+    return cloudSyncService.status();
+  },
+  async drain(payload: Parameters<typeof cloudSyncService.drain>[0]) {
+    return cloudSyncService.drain(payload);
+  },
+  async pushItem(payload: { itemId?: string }) {
+    return cloudSyncService.pushItem(typeof payload?.itemId === "string" ? payload.itemId : "");
+  },
+};
+
+const cloudAuthController = {
+  async status(payload?: { refresh?: boolean }) {
+    return cloudAuthService.status(payload);
+  },
+  async connect() {
+    return cloudAuthService.connect();
+  },
+  async disconnect() {
+    return cloudAuthService.disconnect();
+  },
+};
+
 // Register all the services that the offscreen document will manage.
 router.registerService("dbManager", databaseManager, {
   methods: [
@@ -262,10 +307,16 @@ router.registerService("dbManager", databaseManager, {
   ],
 });
 router.registerService("browserBookmarks", browserBookmarkImportController, {
-  methods: ["importTree"],
+  methods: ["hasImported", "importTree"],
 });
 router.registerService("githubStars", githubStarsImportController, {
   methods: ["importStars"],
+});
+router.registerService("cloudSync", cloudSyncController, {
+  methods: ["status", "drain", "pushItem"],
+});
+router.registerService("cloudAuth", cloudAuthController, {
+  methods: ["status", "connect", "disconnect"],
 });
 router.registerService("sync", syncService, {
   methods: ["rebuildAndCompact"],
@@ -278,18 +329,23 @@ router.registerService("items", itemsController, {
     "queryLocal",
     "addToFolder",
     "addMany",
+    "getPendingMetadataUrls",
     "refetchMetadata",
     "moveToSpace",
     "copyToSpace",
     "moveToFolder",
     "reorder",
     "delete",
+    "restoreFromBin",
+    "deleteForever",
     "update",
     "updateMedia",
     "removeMedia",
     "addMedia",
     "replaceMedia",
     "listItemsWithOpfsMedia",
+    "applyOpfsMediaPromotions",
+    "deleteUnreferencedOpfsMedia",
   ],
 });
 router.registerService("folders", foldersController, {
@@ -301,12 +357,18 @@ router.registerService("folders", foldersController, {
     "setCollapsed",
     "rename",
     "delete",
+    "restoreFromBin",
+    "deleteForever",
+    "countItemsInTree",
     "reorder",
     "moveToSpace",
     "copyToSpace",
     "moveToParent",
     "mergeInto",
   ],
+});
+router.registerService("bin", binController, {
+  methods: ["listContents"],
 });
 router.registerService("tags", tagsController, {
   methods: [
@@ -371,7 +433,7 @@ const EMBEDDING_BATCH_SIZE = 20; // Process 20 items at a time for embeddings
 const MAX_SENTENCES_PER_EMBED_REQUEST = 16;
 const EMBEDDING_SCHEMA_VERSION_STORAGE_KEY = "vibe.search.embeddingTextVersion";
 const EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY = "vibe.search.embeddingStateRepairVersion";
-const EMBEDDING_STATE_REPAIR_VERSION = "v1";
+const EMBEDDING_STATE_REPAIR_VERSION = "v2-vector-bounds";
 let isEmbeddingRunning = false;
 let embeddingScheduled = false;
 let embeddingCheckTimer: number | null = null;
@@ -386,8 +448,16 @@ const queuedOcrItemIds = new Map<string, boolean>();
 
 type EmbeddingBatchItem = Pick<
   ItemDocType,
-  "id" | "title" | "textContent" | "ocrText" | "url" | "source" | "authorUsername" | "media"
->;
+  | "id"
+  | "title"
+  | "textContent"
+  | "ocrText"
+  | "url"
+  | "source"
+  | "authorUsername"
+  | "media"
+  | "updatedAt"
+> & { expectedRevision: string };
 
 const getExtensionStorageLocal = (): chrome.storage.LocalStorageArea | null => {
   const runtimeChrome = (globalThis as typeof globalThis & { chrome?: typeof chrome }).chrome;
@@ -490,7 +560,20 @@ const ensureEmbeddingSchemaVersion = async () => {
 const ensureEmbeddingStateRepair = async () => {
   try {
     const currentVersion = await getStoredEmbeddingStateRepairVersion();
-    if (currentVersion === EMBEDDING_STATE_REPAIR_VERSION) return;
+    const vectorCount = await vectorStoreService.getVectorCount();
+    const markerPrefix = `${EMBEDDING_STATE_REPAIR_VERSION}:`;
+    const previousVectorCount = currentVersion.startsWith(markerPrefix)
+      ? Number(currentVersion.slice(markerPrefix.length))
+      : Number.NaN;
+    // Growth cannot invalidate an older in-range reference. A missing file or
+    // compaction shrink must rerun the bounded-reference audit.
+    if (
+      vectorCount > 0 &&
+      Number.isSafeInteger(previousVectorCount) &&
+      vectorCount >= previousVectorCount
+    ) {
+      return;
+    }
 
     sendProcessStatus({
       id: "embedding-state",
@@ -498,8 +581,8 @@ const ensureEmbeddingStateRepair = async () => {
       state: "processing",
       detail: "Repairing records that are missing vectors...",
     });
-    const repairedCount = await databaseManager.repairItemsMissingVectors();
-    await setStoredEmbeddingStateRepairVersion(EMBEDDING_STATE_REPAIR_VERSION);
+    const repairedCount = await databaseManager.repairItemsMissingVectors(vectorCount);
+    await setStoredEmbeddingStateRepairVersion(`${markerPrefix}${vectorCount}`);
     sendProcessStatus({
       id: "embedding-state",
       label: "Embedding state",
@@ -617,6 +700,8 @@ const processEmbeddingQueue = async () => {
       try {
         const appendedCount = await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
           id: item.id,
+          expectedRevision: item.expectedRevision,
+          expectedUpdatedAt: item.updatedAt,
           vector_index: vectorIndexes[0] ?? -1,
           vector_indexes: vectorIndexes,
           isEmbedded: true,
@@ -653,6 +738,8 @@ const processEmbeddingQueue = async () => {
       try {
         await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
           id: item.id,
+          expectedRevision: item.expectedRevision,
+          expectedUpdatedAt: item.updatedAt,
           vector_index: vectorIndexes[0] ?? -1,
           vector_indexes: vectorIndexes,
           isEmbedded: true,
@@ -937,12 +1024,18 @@ const processOcrQueue = async () => {
     isOcrRunning = false;
     if (ocrScheduled) {
       window.setTimeout(processOcrQueue, 500);
+    } else if (queuedOcrItemIds.size === 0 && activeOcrItemIds.size === 0) {
+      // PaddleOCR keeps a sizeable WASM model in the sandbox iframe. The
+      // offscreen document lives for the browser session, so release that
+      // iframe once the queue is quiet instead of retaining the model forever.
+      ocrService.scheduleIdleRelease();
     }
     scheduleEmbeddingIfNeeded();
   }
 };
 
 export const triggerOcr = () => {
+  if (!OCR_SUPPORTED) return;
   if (isOcrRunning) {
     ocrScheduled = true;
   } else {
@@ -951,6 +1044,7 @@ export const triggerOcr = () => {
 };
 
 const scheduleOcrIfNeeded = () => {
+  if (!OCR_SUPPORTED) return;
   if (ocrCheckTimer !== null) return;
   ocrCheckTimer = window.setTimeout(async () => {
     ocrCheckTimer = null;
@@ -983,6 +1077,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "TRIGGER_OCR" && message.isForwarded) {
     if (!isTrustedForwarderSender(sender)) {
       sendResponse({ success: false, error: "UNAUTHORIZED_FORWARDER" });
+      return true;
+    }
+
+    if (!OCR_SUPPORTED) {
+      sendResponse({
+        success: false,
+        error: "Local image OCR is unavailable in this browser build.",
+      });
       return true;
     }
 

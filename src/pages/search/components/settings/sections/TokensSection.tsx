@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, KeyRound, Loader2, Plug, Unplug } from "lucide-react";
+import { Check, Cloud, KeyRound, Loader2, Plug, Unplug } from "lucide-react";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
 import { showErrorToast, showSuccessToast } from "@src/utils/toast-feedback";
@@ -7,9 +7,23 @@ import { getGoogleAccessToken, clearGoogleAccessToken } from "@src/services/goog
 import { SectionHeading, SettingGroup, SettingRow } from "../SettingsPrimitives";
 import { GitHubIcon, GoogleIcon } from "../BrandIcons";
 import { SocialConnectors } from "./SocialConnectors";
+import type { CloudAuthStatus } from "@src/services/cloud-auth";
 
 /** chrome.storage.local key for the persisted GitHub personal access token. */
 export const GITHUB_TOKEN_STORAGE_KEY = "vibesearch:githubToken";
+
+type RuntimeResponse<T> = { success?: boolean; payload?: T; error?: string };
+
+const callCloudAuth = async <T,>(type: "status" | "connect" | "disconnect", payload?: unknown): Promise<T> => {
+  const response = await chrome.runtime.sendMessage({
+    service: "cloudAuth",
+    type,
+    target: "offscreen",
+    payload,
+  }) as RuntimeResponse<T>;
+  if (!response?.success) throw new Error(response?.error || `Cloud account ${type} failed.`);
+  return response.payload as T;
+};
 
 const maskToken = (token: string) => {
   const trimmed = token.trim();
@@ -27,6 +41,8 @@ export function TokensSection() {
     "unknown"
   );
   const [googleBusy, setGoogleBusy] = React.useState(false);
+  const [cloudState, setCloudState] = React.useState<CloudAuthStatus | null>(null);
+  const [cloudBusy, setCloudBusy] = React.useState(false);
 
   // Load persisted GitHub token + probe Google connection (non-interactive).
   React.useEffect(() => {
@@ -40,6 +56,15 @@ export function TokensSection() {
     void getGoogleAccessToken(false)
       .then(() => active && setGoogleState("connected"))
       .catch(() => active && setGoogleState("disconnected"));
+    void callCloudAuth<CloudAuthStatus>("status", { refresh: true })
+      .then((status) => active && setCloudState(status))
+      .catch(() => active && setCloudState({
+        connected: false,
+        optedIn: false,
+        needsReconnect: false,
+        expiresAt: 0,
+        user: null,
+      }));
     return () => {
       active = false;
     };
@@ -100,12 +125,101 @@ export function TokensSection() {
     }
   };
 
+  const connectCloud = async () => {
+    setCloudBusy(true);
+    try {
+      const status = await callCloudAuth<CloudAuthStatus>("connect");
+      setCloudState(status);
+      showSuccessToast("Cloud backup connected. Pending saves are uploading now.");
+    } catch (cause) {
+      showErrorToast(cause instanceof Error ? cause.message : "Could not connect cloud backup.");
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const disconnectCloud = async () => {
+    setCloudBusy(true);
+    try {
+      setCloudState(await callCloudAuth<CloudAuthStatus>("disconnect"));
+      showSuccessToast("Cloud backup disconnected. Local capture still works.");
+    } catch (cause) {
+      showErrorToast(cause instanceof Error ? cause.message : "Could not disconnect cloud backup.");
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
   return (
     <div>
       <SectionHeading
         title="Data connectors"
         description="Connect the services VibeSearch imports from and syncs with. Credentials are stored locally on this device and only ever sent to the service you connect."
       />
+
+      <SettingGroup label="Vibesearch">
+        <SettingRow
+          title={
+            <span className="flex items-center gap-2">
+              <Cloud className="size-4 text-foreground-accent" />
+              Cloud library
+            </span>
+          }
+          description={
+            cloudState?.user?.email
+              ? `One-way backup from this extension to ${cloudState.user.email}. Web and mobile edits never overwrite this local library.`
+              : "Back up extension saves one-way to your web and mobile library. Web and mobile edits never overwrite this local library."
+          }
+        >
+          <span
+            className={
+              cloudState?.connected
+                ? "inline-flex items-center gap-1 rounded-full bg-background-positive-faded px-2 py-0.5 text-xs font-medium text-foreground-positive"
+                : cloudState?.needsReconnect
+                  ? "inline-flex items-center gap-1 rounded-full bg-background-warning px-2 py-0.5 text-xs font-medium text-foreground-warning"
+                  : "inline-flex items-center gap-1 rounded-full bg-background-page-secondary px-2 py-0.5 text-xs font-medium text-foreground-tertiary"
+            }
+          >
+            {cloudState?.connected ? (
+              <Check className="size-3" />
+            ) : (
+              <span className="size-1.5 rounded-full bg-current opacity-70" />
+            )}
+            {cloudState === null
+              ? "Checking…"
+              : cloudState.connected
+                ? "Connected"
+                : cloudState.needsReconnect
+                  ? "Reconnect"
+                  : "Not connected"}
+          </span>
+          {cloudState?.connected ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => void disconnectCloud()}
+              disabled={cloudBusy}
+              className="text-foreground-tertiary hover:text-foreground-danger"
+            >
+              {cloudBusy ? <Loader2 className="size-4 animate-spin" /> : <Unplug className="size-4" />}
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void connectCloud()}
+              disabled={cloudBusy || cloudState === null}
+              static={cloudBusy}
+            >
+              {cloudBusy ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
+              {cloudState?.needsReconnect ? "Reconnect" : "Connect"}
+            </Button>
+          )}
+        </SettingRow>
+      </SettingGroup>
 
       <SettingGroup label="GitHub">
         <SettingRow
@@ -198,7 +312,7 @@ export function TokensSection() {
         </SettingRow>
       </SettingGroup>
 
-      <SocialConnectors />
+      <SocialConnectors cloudConnected={cloudState?.connected === true} />
     </div>
   );
 }

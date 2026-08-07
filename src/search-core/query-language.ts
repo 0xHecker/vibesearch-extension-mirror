@@ -310,6 +310,29 @@ const tokenize = (input: string): QueryToken[] => {
   return tokens;
 };
 
+export const removePillRangesFromQuery = (
+  input: string,
+  pills: readonly Pick<QueryPill, "start" | "end">[]
+): string => {
+  if (pills.length === 0) return input.replace(/\s{2,}/g, " ").trim();
+  const ranges = [...pills]
+    .map((pill) => ({
+      start: Math.max(0, Math.min(input.length, pill.start)),
+      end: Math.max(0, Math.min(input.length, pill.end)),
+    }))
+    .filter((range) => range.end > range.start)
+    .sort((left, right) => left.start - right.start);
+
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start > cursor) chunks.push(input.slice(cursor, range.start));
+    cursor = Math.max(cursor, range.end);
+  }
+  if (cursor < input.length) chunks.push(input.slice(cursor));
+  return chunks.join(" ").replace(/\s{2,}/g, " ").trim();
+};
+
 const resolveActiveToken = (
   input: string,
   cursor: number,
@@ -1114,7 +1137,17 @@ const tokenizeExpression = (freeTokens: string[]): ExpressionToken[] => {
     }
 
     let end = index;
-    while (end < input.length && !/\s/.test(input[end]) && input[end] !== "(" && input[end] !== ")") {
+    let inQuotes = false;
+    while (end < input.length) {
+      const current = input[end];
+      if (current === '"') {
+        inQuotes = !inQuotes;
+        end += 1;
+        continue;
+      }
+      if (!inQuotes && (/\s/.test(current) || current === "(" || current === ")")) {
+        break;
+      }
       end += 1;
     }
     pushTerm(input.slice(index, end));

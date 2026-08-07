@@ -17,16 +17,60 @@ import {
   type ClipboardFormat,
 } from "../clipboard-format";
 import { OPEN_ON_NEW_TAB_STORAGE_KEY, setOpenOnNewTab } from "@src/common/new-tab-pref";
+import {
+  DEFAULT_IMPORT_SETTINGS,
+  normalizeImportSettings,
+  type ImportSettings,
+} from "@src/common/import-settings";
+
+type RuntimeResponse<T> = {
+  success?: boolean;
+  payload?: T;
+  error?: string;
+};
+
+const callImportSettings = async (
+  type: "IMPORT_GET_SETTINGS" | "IMPORT_SET_SETTINGS",
+  payload?: unknown
+): Promise<ImportSettings> => {
+  const response = (await chrome.runtime.sendMessage({
+    target: "background",
+    type,
+    payload,
+  })) as RuntimeResponse<ImportSettings>;
+
+  if (!response?.success) {
+    throw new Error(response?.error || `${type} failed`);
+  }
+
+  return normalizeImportSettings(response.payload);
+};
 
 export function MiscSection() {
   const [format, setFormat] = React.useState<ClipboardFormat>(getClipboardFormat);
   const [openOnNewTab, setOpenOnNewTabState] = React.useState(false);
+  const [importSettings, setImportSettingsState] =
+    React.useState<ImportSettings>(DEFAULT_IMPORT_SETTINGS);
 
   React.useEffect(() => {
     let active = true;
     void chrome.storage.local.get(OPEN_ON_NEW_TAB_STORAGE_KEY).then((result) => {
       if (active) setOpenOnNewTabState(result?.[OPEN_ON_NEW_TAB_STORAGE_KEY] === true);
     });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  React.useEffect(() => {
+    let active = true;
+    void callImportSettings("IMPORT_GET_SETTINGS")
+      .then((settings) => {
+        if (active) setImportSettingsState(settings);
+      })
+      .catch((error) => {
+        console.error("[Settings] failed to load import settings", error);
+      });
     return () => {
       active = false;
     };
@@ -41,6 +85,18 @@ export function MiscSection() {
   const handleToggleNewTab = (next: boolean) => {
     setOpenOnNewTabState(next);
     void setOpenOnNewTab(next);
+  };
+
+  const handleToggleCloseTabsAfterSave = (next: boolean) => {
+    const previous = importSettings;
+    setImportSettingsState((current) => ({ ...current, closeTabsAfterSave: next }));
+
+    void callImportSettings("IMPORT_SET_SETTINGS", { closeTabsAfterSave: next })
+      .then(setImportSettingsState)
+      .catch((error) => {
+        console.error("[Settings] failed to update import settings", error);
+        setImportSettingsState(previous);
+      });
   };
 
   return (
@@ -87,6 +143,17 @@ export function MiscSection() {
               ))}
             </SelectContent>
           </Select>
+        </SettingRow>
+
+        <SettingRow
+          title="Close tabs after saving"
+          description="Close browser tabs automatically after Save tabs stores them in VibeSearch."
+        >
+          <SettingSwitch
+            checked={importSettings.closeTabsAfterSave}
+            onCheckedChange={handleToggleCloseTabsAfterSave}
+            label="Close browser tabs after saving them"
+          />
         </SettingRow>
 
         <SettingRow

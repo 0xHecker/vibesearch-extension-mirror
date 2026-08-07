@@ -27,6 +27,7 @@ interface TabGroupsProps {
   items: ItemDocType[];
   spaces: SpaceMoveOption[];
   preserveInputOrder?: boolean;
+  revealItemId?: string;
   debugScoresByItemId?: Record<string, QueryRankDebugScore>;
   showDebugScores?: boolean;
   onShareSelectedItems?: (itemIds: string[]) => void;
@@ -40,6 +41,7 @@ const TabGroupsComponent = ({
   items,
   spaces,
   preserveInputOrder = false,
+  revealItemId,
   debugScoresByItemId,
   showDebugScores = false,
   onShareSelectedItems,
@@ -139,8 +141,40 @@ const TabGroupsComponent = ({
   // Memoized per-folder items so TabGroup props stay referentially stable
   // and memo'd TabGroup/FlatItem/GridItem don't re-render on unrelated parent updates.
   const itemsByFolder = useMemo(() => {
-    return groupItemsByFolder(orderedFolders, itemsState, preserveInputOrder);
-  }, [orderedFolders, itemsState, preserveInputOrder]);
+    return groupItemsByFolder(
+      orderedFolders,
+      itemsState,
+      preserveInputOrder,
+      revealItemId
+    );
+  }, [orderedFolders, itemsState, preserveInputOrder, revealItemId]);
+
+  const itemCountsByFolderTree = useMemo(() => {
+    const childrenByParent = new Map<string | null, FolderDocType[]>();
+    for (const folder of orderedFolders) {
+      const parentId = folder.parentId ?? null;
+      const children = childrenByParent.get(parentId) || [];
+      children.push(folder);
+      childrenByParent.set(parentId, children);
+    }
+
+    const counts = new Map<string, number>();
+    const countTree = (folderId: string): number => {
+      const cached = counts.get(folderId);
+      if (cached !== undefined) return cached;
+      let count = itemsByFolder.get(folderId)?.length || 0;
+      for (const child of childrenByParent.get(folderId) || []) {
+        count += countTree(child.id);
+      }
+      counts.set(folderId, count);
+      return count;
+    };
+
+    for (const folder of orderedFolders) {
+      countTree(folder.id);
+    }
+    return counts;
+  }, [itemsByFolder, orderedFolders]);
 
   // Ref to track sent URLs to avoid effect re-runs causing observer churn
   const sentForFetchRef = useRef(sentForFetch);
@@ -475,6 +509,7 @@ const TabGroupsComponent = ({
                     folder={folder}
                     items={folderItems}
                     allFolders={orderedFolders}
+                    treeItemCount={itemCountsByFolderTree.get(folder.id) ?? folderItems.length}
                     spaces={spaces}
                     viewMode={viewMode}
                     debugScoresByItemId={debugScoresByItemId}
@@ -482,6 +517,7 @@ const TabGroupsComponent = ({
                     onShareSelectedItems={onShareSelectedItems}
                     onShareFolder={onShareFolder}
                     dragMode={dragMode}
+                    revealItemId={revealItemId}
                   />
                 );
               })}

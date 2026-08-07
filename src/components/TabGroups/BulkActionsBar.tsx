@@ -48,6 +48,7 @@ import {
   showSuccessToast,
   withToast,
 } from "@src/utils/toast-feedback";
+import { getVisibleSelectionState } from "@src/pages/search/selection-state";
 
 interface BulkActionsBarProps {
   items?: ItemDocType[];
@@ -79,8 +80,7 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
   const selectedItems = getSelectedItems();
   const selectedItemIds = Array.from(selectedIds);
   const selectedLabel = `${selectedCount} tab${selectedCount === 1 ? "" : "s"}`;
-  const allVisibleSelected = items.length > 0 && items.every((i) => selectedIds.has(i.id));
-  const someVisibleSelected = !allVisibleSelected && items.some((i) => selectedIds.has(i.id));
+  const { allVisibleSelected, someVisibleSelected } = getVisibleSelectionState(items, selectedIds);
 
   const assertResponseSuccess = (response: any, fallbackMessage: string) => {
     if (response?.success === false || response?.payload?.success === false) {
@@ -110,8 +110,8 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
 
   const handleDelete = async () => {
     await withToast({
-      loading: `Deleting ${selectedLabel}...`,
-      success: `Deleted ${selectedLabel}.`,
+      loading: `Moving ${selectedLabel} to Bin...`,
+      success: `Moved ${selectedLabel} to Bin.`,
       error: (err) => resolveToastErrorMessage(err, `Failed to delete ${selectedLabel}.`),
       action: async () => {
         for (const id of selectedItemIds) {
@@ -583,11 +583,11 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
       <ConfirmDialog
         open={isDeleteDialogOpen}
         onOpenChange={setIsDeleteDialogOpen}
-        title={`Delete ${selectedCount} item${selectedCount !== 1 ? "s" : ""}?`}
-        description={`This will permanently remove ${selectedCount} tab${
+        title={`Move ${selectedCount} tab${selectedCount !== 1 ? "s" : ""} to Bin?`}
+        description={`This moves ${selectedCount} tab${
           selectedCount !== 1 ? "s" : ""
-        }. This action cannot be undone.`}
-        confirmLabel="Delete"
+        } to Bin. They are removed from search and can be recovered from Bin.`}
+        confirmLabel="Move to Bin"
         variant="danger"
         onConfirm={handleDelete}
       />

@@ -26,6 +26,11 @@ export const getYouTubeVideoIdFromUrl = (value: string): string | null => {
   }
 };
 
+export const getPreferredYouTubeVideoId = (
+  clickedUrl: string | null | undefined,
+  pageUrl: string | null | undefined
+): string | null => getYouTubeVideoIdFromUrl(clickedUrl || "") || getYouTubeVideoIdFromUrl(pageUrl || "");
+
 export const getWorkerYouTubeEmbedUrl = (videoId: string): string | null => {
   if (!YOUTUBE_VIDEO_ID_PATTERN.test(videoId)) return null;
   return `${METADATA_WORKER_BASE_URL}/embed/youtube/${encodeURIComponent(videoId)}`;

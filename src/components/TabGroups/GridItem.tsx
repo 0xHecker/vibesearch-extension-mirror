@@ -41,7 +41,7 @@ import { Star, Maximize2 } from "lucide-react";
 import { useSelection } from "./SelectionContext";
 import { WebsitePreview } from "./WebsitePreview";
 import { ItemMediaPreview } from "./ItemMediaPreview";
-import { resolveOpfsMedia, revokeObjectUrl } from "@src/services/media-storage";
+import { ObjectUrlOwner, resolveOpfsMedia } from "@src/services/media-storage";
 import { useDraggable, useDroppable, type DraggableAttributes, type DraggableSyntheticListeners } from "@dnd-kit/core";
 import type { SpaceMoveOption } from "./TabGroups";
 import type { QueryRankDebugScore } from "@src/search-core/contracts";
@@ -91,6 +91,7 @@ export const GridItem = memo(({
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const [lightboxEntries, setLightboxEntries] = useState<LightboxEntry[]>([]);
+  const lightboxUrlOwnerRef = useRef<ObjectUrlOwner | null>(null);
   const [isFavorite, setIsFavorite] = useState(item.isFavorite);
   const [isUpdatingFavorite, setIsUpdatingFavorite] = useState(false);
   const [tags, setTags] = useState<{ id: string; name: string; color?: string | null }[]>([]);
@@ -262,9 +263,16 @@ export const GridItem = memo(({
 
   useEffect(() => {
     setIsExpanded(false);
+    return () => {
+      lightboxUrlOwnerRef.current?.dispose();
+      lightboxUrlOwnerRef.current = null;
+    };
   }, [item.id]);
 
   const handleOpenLightbox = useCallback(async (): Promise<boolean> => {
+    lightboxUrlOwnerRef.current?.dispose();
+    const urlOwner = new ObjectUrlOwner();
+    lightboxUrlOwnerRef.current = urlOwner;
     const entries: LightboxEntry[] = [];
     const seen = new Set<string>();
     const isYouTube =
@@ -287,7 +295,10 @@ export const GridItem = memo(({
         src = normalizeIframeEmbedUrl(m.embedUrl);
         if (src) embedType = m.embedType || "iframe";
       }
-      if (m.opfsPath) src = await resolveOpfsMedia(m.opfsPath);
+      if (m.opfsPath) {
+        src = urlOwner.own(await resolveOpfsMedia(m.opfsPath));
+        if (!urlOwner.isActive || lightboxUrlOwnerRef.current !== urlOwner) return false;
+      }
       if (!src) src = m.s3Url || m.originalUrl;
       if (!src) continue;
       const isVertical = (() => {
@@ -334,10 +345,13 @@ export const GridItem = memo(({
         return aEmbedVideo ? -1 : 1;
       });
     }
+    if (!urlOwner.isActive || lightboxUrlOwnerRef.current !== urlOwner) return false;
     if (entries.length > 0) {
       setLightboxEntries(entries);
       return true;
     }
+    urlOwner.dispose();
+    if (lightboxUrlOwnerRef.current === urlOwner) lightboxUrlOwnerRef.current = null;
     return false;
   }, [item.displayImageUrl, item.media, item.source, item.url]);
 
@@ -836,20 +850,20 @@ export const GridItem = memo(({
           open={isDeleteDialogOpen}
           onOpenChange={setIsDeleteDialogOpen}
           title={
-            deleteScope === "all" ? "Delete this tab everywhere?" : "Delete from this tab group?"
+            deleteScope === "all" ? "Move this tab to Bin everywhere?" : "Move this tab to Bin?"
           }
           description={
             deleteScope === "all"
-              ? `This will delete "${item.title}" from every tab group. This action cannot be undone.`
-              : `This will remove "${item.title}" from this tab group. You can't undo this action.`
+              ? `This moves "${item.title}" to Bin from every tab group. It is removed from search and can be recovered from Bin.`
+              : `This moves "${item.title}" from this tab group to Bin. It is removed from search and can be recovered from Bin.`
           }
-          confirmLabel={deleteScope === "all" ? "Delete from all groups" : "Delete tab"}
+          confirmLabel="Move to Bin"
           variant="danger"
           onConfirm={async () => {
             await withToast({
-              loading: "Deleting tab...",
+              loading: "Moving tab to Bin...",
               success:
-                deleteScope === "all" ? "Tab deleted from all groups." : "Tab deleted from group.",
+                deleteScope === "all" ? "Tab moved to Bin from all groups." : "Tab moved to Bin.",
               error: (err) => resolveToastErrorMessage(err, "Failed to delete tab."),
               action: async () => {
                 const response = await chrome.runtime.sendMessage({
@@ -897,7 +911,8 @@ export const GridItem = memo(({
         entries={lightboxEntries}
         metadata={lightboxMetadata}
         onClose={() => {
-          lightboxEntries.forEach((entry) => revokeObjectUrl(entry.src));
+          lightboxUrlOwnerRef.current?.dispose();
+          lightboxUrlOwnerRef.current = null;
           setLightboxEntries([]);
         }}
       />

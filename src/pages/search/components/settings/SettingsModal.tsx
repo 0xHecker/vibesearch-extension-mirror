@@ -44,7 +44,7 @@ const SECTIONS: SectionDef[] = [
   { id: "tags", label: "Tags", icon: Tag, keywords: "tags color favorite rename delete count organize" },
   { id: "search", label: "Search", icon: SearchIcon, keywords: "search mode scope default hybrid keyword semantic vector fuzzy everywhere global collection folder results" },
   { id: "history", label: "Search history", icon: History, keywords: "history clear recent queries bin recently deleted privacy" },
-  { id: "misc", label: "Misc", icon: SlidersHorizontal, keywords: "clipboard format markdown json html plain new tab open preferences" },
+  { id: "misc", label: "Misc", icon: SlidersHorizontal, keywords: "clipboard format markdown json html plain new tab open close tabs after saving preferences" },
   { id: "shortcuts", label: "Shortcuts", icon: Command, keywords: "keyboard shortcuts keys hotkeys popup screenshot save organize search" },
   { id: "feedback", label: "Feedback", icon: MessageSquare, keywords: "feedback open source github issue bug author star x twitter contact" },
 ];

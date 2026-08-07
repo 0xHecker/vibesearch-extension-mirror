@@ -1,4 +1,40 @@
+import type { ItemDocType } from "@src/schemas/item_schema";
+
 const MEDIA_DIR = "media";
+
+export type OpfsFileIdentity = {
+  size: number;
+  lastModified: number;
+  sampleSha256: string;
+};
+
+const OPFS_IDENTITY_EDGE_BYTES = 64 * 1024;
+const OPFS_MUTATION_LOCK_NAME = "vibesearch:opfs-media-mutation:v1";
+let opfsMutationTail: Promise<void> = Promise.resolve();
+
+/**
+ * Serializes DB-reference changes with OPFS overwrites/deletes. Web Locks also
+ * coordinate the background worker and offscreen document when both are alive;
+ * the promise tail is a deterministic fallback for test/older environments.
+ */
+export const withOpfsMutationLock = async <T>(work: () => Promise<T>): Promise<T> => {
+  const locks = globalThis.navigator?.locks;
+  if (locks?.request) {
+    return locks.request(OPFS_MUTATION_LOCK_NAME, work);
+  }
+
+  const previous = opfsMutationTail;
+  let release = () => {};
+  opfsMutationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+};
 
 const getMediaDir = async () => {
   const root = await navigator.storage.getDirectory();
@@ -57,6 +93,35 @@ export const revokeObjectUrl = (url: string | null | undefined): void => {
   URL.revokeObjectURL(url);
 };
 
+/** Owns transient blob URLs and revokes even URLs delivered after cancellation. */
+export class ObjectUrlOwner {
+  private active = true;
+  private readonly urls = new Set<string>();
+
+  constructor(private readonly revoke: (url: string) => void = revokeObjectUrl) {}
+
+  get isActive(): boolean {
+    return this.active;
+  }
+
+  own(url: string | null | undefined): string | null {
+    if (!url) return null;
+    if (!this.active) {
+      if (isObjectUrl(url)) this.revoke(url);
+      return null;
+    }
+    if (isObjectUrl(url)) this.urls.add(url);
+    return url;
+  }
+
+  dispose(): void {
+    if (!this.active) return;
+    this.active = false;
+    for (const url of this.urls) this.revoke(url);
+    this.urls.clear();
+  }
+}
+
 export const resolveOpfsMedia = async (
   opfsPath: string
 ): Promise<string | null> => {
@@ -70,10 +135,17 @@ export const resolveOpfsMedia = async (
   }
 };
 
-export const deleteMediaFromOpfs = async (opfsPath: string): Promise<void> => {
+export const deleteMediaFromOpfs = async (
+  opfsPath: string,
+  expectedIdentity?: OpfsFileIdentity
+): Promise<boolean> => {
   try {
+    if (expectedIdentity) {
+      const currentIdentity = await readOpfsFileIdentity(opfsPath);
+      if (!opfsFileIdentitiesEqual(currentIdentity, expectedIdentity)) return false;
+    }
     const parts = opfsPath.split("/");
-    if (parts.length < 3) return;
+    if (parts.length < 3) return false;
     const root = await navigator.storage.getDirectory();
     const dirPath = parts.slice(0, -1);
     const fileName = parts[parts.length - 1];
@@ -82,8 +154,10 @@ export const deleteMediaFromOpfs = async (opfsPath: string): Promise<void> => {
       dir = await dir.getDirectoryHandle(part);
     }
     await dir.removeEntry(fileName);
+    return true;
   } catch {
     // File may not exist; ignore
+    return false;
   }
 };
 
@@ -176,7 +250,7 @@ const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.de
 const IMPORT_MEDIA_ENDPOINT = `${METADATA_WORKER_BASE_URL}/import-media`;
 const IMPORT_MEDIA_UPLOAD_TOKEN = import.meta.env.VITE_IMPORT_MEDIA_UPLOAD_TOKEN?.trim() || "";
 const IMPORT_MEDIA_UPLOAD_RETRIES = 2;
-const IMPORT_MEDIA_UPLOAD_TIMEOUT_MS = 45_000;
+const IMPORT_MEDIA_UPLOAD_TIMEOUT_MS = 25_000;
 const IMPORT_MEDIA_RETRY_BASE_DELAY_MS = 350;
 
 type MediaUploadResponse = { url?: string | null; key?: string; error?: string };
@@ -193,9 +267,6 @@ const buildImportUploadHeaders = (contentType: string): Headers => {
 };
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const cloneArrayBuffer = (buffer: ArrayBuffer): ArrayBuffer =>
-  buffer.slice(0);
 
 const isRetryableStatus = (status: number): boolean =>
   status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
@@ -271,14 +342,166 @@ export const readOpfsFile = async (opfsPath: string): Promise<File | null> => {
   }
 };
 
+const bytesToHex = (bytes: Uint8Array): string =>
+  Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+
+const fallbackSampleHash = (bytes: Uint8Array): string => {
+  let hash = 0x811c9dc5;
+  for (const value of bytes) {
+    hash ^= value;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+};
+
+export const getBlobIdentity = async (
+  blob: Blob,
+  lastModified = blob instanceof File ? blob.lastModified : 0
+): Promise<OpfsFileIdentity> => {
+  const edge = OPFS_IDENTITY_EDGE_BYTES;
+  const sample =
+    blob.size <= edge * 2
+      ? blob
+      : new Blob([blob.slice(0, edge), blob.slice(blob.size - edge)]);
+  const sampleBytes = new Uint8Array(await sample.arrayBuffer());
+  const subtle = globalThis.crypto?.subtle;
+  const sampleSha256 = subtle
+    ? bytesToHex(new Uint8Array(await subtle.digest("SHA-256", sampleBytes)))
+    : fallbackSampleHash(sampleBytes);
+  return { size: blob.size, lastModified, sampleSha256 };
+};
+
+export const readOpfsFileIdentity = async (
+  opfsPath: string
+): Promise<OpfsFileIdentity | null> => {
+  const file = await readOpfsFile(opfsPath);
+  return file ? getBlobIdentity(file, file.lastModified) : null;
+};
+
+export const opfsFileIdentitiesEqual = (
+  left: OpfsFileIdentity | null | undefined,
+  right: OpfsFileIdentity | null | undefined
+): boolean =>
+  !!left &&
+  !!right &&
+  left.size === right.size &&
+  left.lastModified === right.lastModified &&
+  left.sampleSha256 === right.sampleSha256;
+
+export const cloneOpfsMediaEntriesForItem = async (
+  media: ItemDocType["media"],
+  destinationItemId: string,
+  options?: {
+    readOpfsFile?: typeof readOpfsFile;
+    saveMediaToOpfs?: typeof saveMediaToOpfs;
+  }
+): Promise<{
+  media: ItemDocType["media"];
+  pathMap: Map<string, string>;
+}> => {
+  if (!media?.length) return { media, pathMap: new Map() };
+
+  const pathMap = new Map<string, string>();
+  const cloned = [] as NonNullable<ItemDocType["media"]>;
+  const readFile = options?.readOpfsFile || readOpfsFile;
+  const saveFile = options?.saveMediaToOpfs || saveMediaToOpfs;
+  for (const entry of media) {
+    const sourcePath = typeof entry?.opfsPath === "string" ? entry.opfsPath : "";
+    if (!sourcePath) {
+      cloned.push({ ...entry });
+      continue;
+    }
+
+    let destinationPath = pathMap.get(sourcePath);
+    if (!destinationPath) {
+      const sourceFile = await readFile(sourcePath);
+      if (!sourceFile) throw new Error(`OPFS_MEDIA_COPY_SOURCE_MISSING:${sourcePath}`);
+      const saved = await saveFile(destinationItemId, sourceFile);
+      destinationPath = saved.opfsPath;
+      pathMap.set(sourcePath, destinationPath);
+    }
+    cloned.push({ ...entry, opfsPath: destinationPath, storageType: "opfs" });
+  }
+  return { media: cloned, pathMap };
+};
+
+/** Bounded parallel map that always writes results at the source index. */
+export const mapWithConcurrencyStable = async <Input, Output>(
+  values: readonly Input[],
+  concurrency: number,
+  mapper: (value: Input, index: number) => Promise<Output>
+): Promise<Output[]> => {
+  if (values.length === 0) return [];
+  const workerCount = Math.max(1, Math.min(values.length, Math.floor(concurrency) || 1));
+  const results = new Array<Output>(values.length);
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= values.length) return;
+        results[index] = await mapper(values[index], index);
+      }
+    })
+  );
+  return results;
+};
+
+export type OpfsCleanupFile = {
+  opfsPath: string;
+  sourceIdentity: OpfsFileIdentity;
+};
+
+/**
+ * Collects one bounded promotion-run cleanup request. Overflow is deliberately
+ * left in OPFS: leaking an orphan is safer than retaining an unbounded path set
+ * or triggering another full-library reference scan.
+ */
+export class BoundedOpfsCleanupBatch {
+  private readonly filesByPath = new Map<string, OpfsCleanupFile>();
+  private didOverflow = false;
+
+  constructor(private readonly maxFiles: number) {}
+
+  add(file: OpfsCleanupFile): void {
+    const opfsPath = typeof file?.opfsPath === "string" ? file.opfsPath : "";
+    if (!opfsPath || this.filesByPath.has(opfsPath)) return;
+    if (this.filesByPath.size >= Math.max(0, Math.floor(this.maxFiles))) {
+      this.didOverflow = true;
+      return;
+    }
+    this.filesByPath.set(opfsPath, file);
+  }
+
+  get size(): number {
+    return this.filesByPath.size;
+  }
+
+  get overflowed(): boolean {
+    return this.didOverflow;
+  }
+
+  async flush(
+    cleanup: (files: OpfsCleanupFile[]) => Promise<void>
+  ): Promise<boolean> {
+    if (this.filesByPath.size === 0) return false;
+    const files = Array.from(this.filesByPath.values());
+    this.filesByPath.clear();
+    await cleanup(files);
+    return true;
+  }
+}
+
 export const uploadOpfsFileToR2 = async (
   opfsPath: string,
   fileName?: string
-): Promise<UploadedMedia | null> => {
+): Promise<(UploadedMedia & { sourceIdentity: OpfsFileIdentity }) | null> => {
   const file = await readOpfsFile(opfsPath);
   if (!file) return null;
-
-  return uploadBlobToR2(file, fileName || file.name);
+  const sourceIdentity = await getBlobIdentity(file, file.lastModified);
+  const uploaded = await uploadBlobToR2(file, fileName || file.name);
+  return uploaded ? { ...uploaded, sourceIdentity } : null;
 };
 
 export const uploadBlobToR2 = async (
@@ -289,13 +512,14 @@ export const uploadBlobToR2 = async (
   if (blob.size <= 0) throw new Error("IMPORT_MEDIA_EMPTY_FILE");
 
   const contentType = blob.type || "application/octet-stream";
-  const body = await blob.arrayBuffer();
   const payload = await postImportMedia(
     () => {
       const headers = buildImportUploadHeaders(contentType);
       if (fileName) headers.set("X-VS-File-Name", fileName);
       if (options?.sourcePageUrl) headers.set("X-VS-Source-Url", options.sourcePageUrl);
-      return { method: "POST", headers, body: cloneArrayBuffer(body) };
+      // Blob/File bodies are reusable by fetch. Keeping the original object
+      // avoids one full-file ArrayBuffer plus another clone on every retry.
+      return { method: "POST", headers, body: blob };
     },
     options?.label || "Media upload"
   );

@@ -31,9 +31,17 @@ import {
   DialogTitle,
 } from "@src/components/ui/dialog";
 import { analyzeQuery } from "@src/search-core/query-language";
-import { getQueryModeFeatures } from "@src/search-core/contracts";
+import {
+  getQueryModeFeatures,
+  resolveEffectiveQueryChannels,
+} from "@src/search-core/contracts";
 import { resolveSearchSpaceIds } from "@src/search-core/space-scope";
-import { MAX_GRID_QUERY_LIMIT } from "@src/search-core/pagination";
+import {
+  DEFAULT_GRID_PAGE_LIMIT,
+  getSearchScoreBudget,
+  MAX_GRID_QUERY_LIMIT,
+  shouldUseCursorPagination,
+} from "@src/search-core/pagination";
 import { mergeItemsById } from "@src/search-core/item-patch";
 import type {
   QueryDebugPayload,
@@ -54,6 +62,13 @@ import {
   PUBLIC_SPACE_ID,
 } from "@src/common/spaces";
 import { Sidebar, type SidebarHandlers, type SidebarSpace } from "@src/pages/search/components/Sidebar/Sidebar";
+import {
+  DEFAULT_BIN_PAGE_SIZE,
+  toBinEntryCursor,
+  type BinContentsPage,
+  type BinEntry,
+  type BinEntryCursor,
+} from "@src/common/bin";
 import { ShareDialog } from "@src/pages/search/components/share/ShareDialog";
 import { ImportSharedDialog } from "@src/pages/search/components/share/ImportSharedDialog";
 import { SettingsModal } from "@src/pages/search/components/settings/SettingsModal";
@@ -64,6 +79,23 @@ import {
   useDefaultSearchMode,
   useDefaultSearchScope,
 } from "@src/pages/search/search-preferences";
+import {
+  buildFolderLoadKey,
+  buildSearchSelectionSearch,
+  includePendingRevealItem,
+  resolveFolderSelectionContext,
+  resolveSearchResultSelectionContext,
+} from "@src/pages/search/selection-state";
+import {
+  resolveNamedFilterValues,
+  resolveSearchFolderFilterIds,
+} from "@src/pages/search/filter-values";
+import {
+  findItemElementByDataId,
+  revalidateRevealItem,
+} from "@src/pages/search/reveal-target";
+import { getOrCreateSearchClientId } from "@src/pages/search/search-client-id";
+import { shouldPreserveSearchResultsForError } from "@src/pages/search/query-error-state";
 import { SearchResults } from "@src/pages/search/components/SearchResults";
 import { SearchControlsBar } from "@src/pages/search/components/SearchControls";
 import { GITHUB_TOKEN_STORAGE_KEY } from "@src/pages/search/components/settings/sections/TokensSection";
@@ -101,13 +133,21 @@ const SPACE_ACTIVITY_TOUCH_THROTTLE_MS = 12_000;
 const SPACE_ACCESS_POLL_MS = 20_000;
 const PROCESS_STATUS_MAX_ENTRIES = 80;
 const PROCESS_STATUS_SUCCESS_TTL_MS = 15 * 60 * 1000;
+const PROCESS_STATUS_PROCESSING_TTL_MS = 45 * 60 * 1000;
+const PROCESS_STATUS_PRUNE_INTERVAL_MS = 60 * 1000;
 const QUERY_REQUEST_TIMEOUT_MS = 20_000;
 const VECTOR_QUERY_MIN_CHARS = 3;
 /** Flat search shows up to this many per page; crossing it reveals the pager. */
 const SEARCH_PAGE_SIZE = 100;
 const SEARCH_DEBUG_STORAGE_KEY = "vibe.search.debug";
 const SEARCH_DEBUG_QUERY_PARAM = "debugSearch";
-const DEFAULT_QUERY_LIMIT = MAX_GRID_QUERY_LIMIT;
+const DEFAULT_QUERY_LIMIT = DEFAULT_GRID_PAGE_LIMIT;
+
+const isProcessStatusFresh = (row: SearchProcessStatusItem, now = Date.now()): boolean => {
+  if (row.state === "success") return now - row.updatedAt <= PROCESS_STATUS_SUCCESS_TTL_MS;
+  if (row.state === "processing") return now - row.updatedAt <= PROCESS_STATUS_PROCESSING_TTL_MS;
+  return true;
+};
 
 type SpaceListItem = Pick<
   SpaceDocType,
@@ -324,10 +364,18 @@ const SearchInner = () => {
   const [githubStarsImporting, setGithubStarsImporting] = useState(false);
   const [githubStarsError, setGithubStarsError] = useState<string | null>(null);
 
-  // Warn before a reload/close interrupts in-progress background work. The guard
-  // is installed below (see `hasBackgroundProcessing`), once that state is known.
+  // Warn before a reload/close interrupts an in-progress bulk import. The write
+  // itself runs in the offscreen document and survives a reload, but reloading
+  // drops this page's progress UI and closing the tab can interrupt in-flight
+  // writes and the background metadata pass.
+  useBeforeUnloadGuard(browserBookmarksImporting || githubStarsImporting);
   const [folders, setFolders] = useState<FolderDocType[]>([]);
-  const [binSpaces, setBinSpaces] = useState<SpaceListItem[]>([]);
+  const [binEntries, setBinEntries] = useState<BinEntry[]>([]);
+  const [binTotal, setBinTotal] = useState(0);
+  const [binHasMore, setBinHasMore] = useState(false);
+  const [binPageLoading, setBinPageLoading] = useState(false);
+  const [binPageCursor, setBinPageCursor] = useState<BinEntryCursor | null>(null);
+  const [binCursorHistory, setBinCursorHistory] = useState<Array<BinEntryCursor | null>>([]);
   const [items, setItems] = useState<ItemDocType[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -352,7 +400,7 @@ const SearchInner = () => {
   // Set when the user reveals a result in its space; powers the "Back to
   // results" pill that restores the search they jumped away from.
   const [revealReturn, setRevealReturn] = useState<{ query: string } | null>(null);
-  const pendingRevealItemIdRef = useRef<string | null>(null);
+  const pendingRevealItemRef = useRef<ItemDocType | null>(null);
   const [queryAnalysis, setQueryAnalysis] = useState<QueryAnalysis>(defaultAnalysis);
   const [querySubmitMeta, setQuerySubmitMeta] = useState<SearchQuerySubmitMeta | null>(null);
   const [resultDebug, setResultDebug] = useState<QueryDebugPayload | null>(null);
@@ -364,6 +412,8 @@ const SearchInner = () => {
       return "all";
     }
   });
+  const pendingUrlFolderIdRef = useRef<string | null>(selectedFolderId !== "all" ? selectedFolderId : null);
+  const [loadedFolderKey, setLoadedFolderKey] = useState<string | null>(null);
   const [resultMeta, setResultMeta] = useState<{
     total: number;
     totalIsExact: boolean;
@@ -399,6 +449,11 @@ const SearchInner = () => {
   const [retryingProcessId, setRetryingProcessId] = useState<string | null>(null);
 
   const requestIdRef = useRef(0);
+  const revealRequestIdRef = useRef(0);
+  const binLoadRequestRef = useRef(0);
+  const searchClientIdRef = useRef<string | null>(null);
+  const searchClientId = getOrCreateSearchClientId(searchClientIdRef);
+  const folderLoadRequestRef = useRef(0);
   const refreshTimerRef = useRef<number | null>(null);
   const createSpaceGroupIdRef = useRef<string | null | undefined>(undefined);
   const tagReloadTimerRef = useRef<number | null>(null);
@@ -446,12 +501,6 @@ const SearchInner = () => {
     [processStatuses]
   );
 
-  // Warn before a reload/close interrupts in-progress background work (imports,
-  // connector syncs, archiving). The work runs in the service worker and largely
-  // survives, but closing the tab drops this progress UI and can interrupt
-  // in-flight uploads.
-  useBeforeUnloadGuard(browserBookmarksImporting || githubStarsImporting || hasBackgroundProcessing);
-
   const upsertProcessStatus = useCallback((status: SearchProcessStatusItem) => {
     setProcessStatusById((prev) => {
       const next = {
@@ -460,14 +509,26 @@ const SearchInner = () => {
       };
       const now = Date.now();
       const entries = Object.values(next)
-        .filter(
-          (row) => row.state !== "success" || now - row.updatedAt <= PROCESS_STATUS_SUCCESS_TTL_MS
-        )
+        .filter((row) => isProcessStatusFresh(row, now))
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, PROCESS_STATUS_MAX_ENTRIES);
       return Object.fromEntries(entries.map((row) => [row.id, row]));
     });
   }, []);
+
+  const pruneProcessStatuses = useCallback(() => {
+    setProcessStatusById((prev) => {
+      const now = Date.now();
+      const entries = Object.values(prev).filter((row) => isProcessStatusFresh(row, now));
+      if (entries.length === Object.keys(prev).length) return prev;
+      return Object.fromEntries(entries.map((row) => [row.id, row]));
+    });
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(pruneProcessStatuses, PROCESS_STATUS_PRUNE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [pruneProcessStatuses]);
 
   const clearProcessStatus = useCallback((statusId: string) => {
     setProcessStatusById((prev) => {
@@ -552,6 +613,16 @@ const SearchInner = () => {
   // Browsing (no query) shows the space you're standing in; searching resolves
   // the scope (Everywhere by default) and ignores sidebar boundaries.
   const requestedScope: QueryScope = hasActiveQuery ? effectiveScope : "current";
+  const currentFolderLoadKey = useMemo(
+    () =>
+      buildFolderLoadKey({
+        activeSpaceId,
+        searchScope: activeSpaceGroupId ? "global" : requestedScope,
+        spaceIds: activeSpaceGroupId ? activeSpaceGroupSpaceIds : undefined,
+      }),
+    [activeSpaceGroupId, activeSpaceGroupSpaceIds, activeSpaceId, requestedScope]
+  );
+  const hasLoadedCurrentFolders = loadedFolderKey === currentFolderLoadKey;
   const requestedScopeLabel = useMemo(() => {
     switch (effectiveScope) {
       case "current":
@@ -592,12 +663,48 @@ const SearchInner = () => {
   // Reveal-in-space: jump the browse context to where a result lives, drop the
   // query, and remember the search so it can be restored.
   const handleRevealItem = useCallback(
-    (item: ItemDocType) => {
+    async (item: ItemDocType) => {
+      const revealRequestId = ++revealRequestIdRef.current;
+      let currentItem: ItemDocType | null;
+      try {
+        currentItem = await revalidateRevealItem(item, async (itemId) => {
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "getByIds",
+            target: "offscreen",
+            payload: {
+              itemIds: [itemId],
+              accessContext: {
+                activeSpaceId: PUBLIC_SPACE_ID,
+                searchScope: "global",
+              },
+            },
+          });
+          if (!response?.success) {
+            throw new Error(response?.error || "Could not refresh this result's location.");
+          }
+          return Array.isArray(response.payload) ? response.payload : [];
+        });
+      } catch (revealError) {
+        if (revealRequestId !== revealRequestIdRef.current) return;
+        showErrorToast(
+          resolveToastErrorMessage(revealError, "Could not refresh this result's location.")
+        );
+        return;
+      }
+      if (revealRequestId !== revealRequestIdRef.current) return;
+      if (!currentItem) {
+        setItems((current) => current.filter((entry) => entry.id !== item.id));
+        showErrorToast("This result moved to Bin or is no longer available.");
+        setRefreshToken((value) => value + 1);
+        return;
+      }
+
       setRevealReturn((current) => current ?? (queryText.trim() ? { query: queryText } : null));
-      const space = spaces.find((candidate) => candidate.id === item.spaceId) || null;
-      setActiveSpaceId(item.spaceId);
-      setActiveSpaceGroupId(space?.spaceGroupId ?? null);
-      setSelectedFolderId("all");
+      const selection = resolveSearchResultSelectionContext(currentItem);
+      setActiveSpaceId(selection.activeSpaceId);
+      setActiveSpaceGroupId(selection.activeSpaceGroupId);
+      setSelectedFolderId(selection.selectedFolderId);
       const cleared = analyzeQuery({
         type: "ANALYZE_QUERY",
         requestId: Date.now(),
@@ -612,10 +719,10 @@ const SearchInner = () => {
       setCursorAfter(null);
       setCursorPage(1);
       setCursorHistory([]);
-      pendingRevealItemIdRef.current = item.id;
+      pendingRevealItemRef.current = currentItem;
       setRefreshToken((value) => value + 1);
     },
-    [catalogs, queryText, spaces]
+    [catalogs, queryText]
   );
 
   const handleBackToResults = useCallback(() => {
@@ -792,21 +899,21 @@ const SearchInner = () => {
   // Once the revealed item's space has rendered in browse mode, scroll to it
   // and flash an accent ring. Honours reduced-motion.
   useEffect(() => {
-    const targetId = pendingRevealItemIdRef.current;
+    const targetId = pendingRevealItemRef.current?.id;
     if (!targetId || hasActiveQuery || isLoading) return;
-    pendingRevealItemIdRef.current = null;
     const prefersReduced =
       typeof window !== "undefined" &&
       !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     const timer = window.setTimeout(() => {
-      const node = document.querySelector<HTMLElement>(`[data-item-id="${targetId}"]`);
+      const node = findItemElementByDataId<HTMLElement>(document, targetId);
       if (!node) return;
+      pendingRevealItemRef.current = null;
       node.scrollIntoView({ behavior: prefersReduced ? "auto" : "smooth", block: "center" });
       node.classList.add("search-reveal-flash");
       window.setTimeout(() => node.classList.remove("search-reveal-flash"), 1300);
     }, 220);
     return () => window.clearTimeout(timer);
-  }, [hasActiveQuery, isLoading, items]);
+  }, [folders, hasActiveQuery, isLoading, items]);
 
   const preserveInputOrder = useMemo(() => {
     if (!isAnalysisCurrent) return false;
@@ -815,10 +922,33 @@ const SearchInner = () => {
 
   useEffect(() => {
     if (selectedFolderId === "all") return;
-    if (!activeSpaceFolders.some((folder) => folder.id === selectedFolderId)) {
-      setSelectedFolderId("all");
+    const selectedFolder = folders.find((folder) => folder.id === selectedFolderId);
+    if (selectedFolder) {
+      pendingUrlFolderIdRef.current = null;
+      const selectedSpaceId = selectedFolder.spaceId || PUBLIC_SPACE_ID;
+      const isInActiveContext = activeSpaceGroupId
+        ? activeSpaceGroupSpaceIds.includes(selectedSpaceId)
+        : activeSpaceId === selectedSpaceId;
+      if (!isInActiveContext && spaces.some((space) => space.id === selectedSpaceId)) {
+        setActiveSpaceId(selectedSpaceId);
+        setActiveSpaceGroupId(null);
+      }
+      return;
     }
-  }, [activeSpaceFolders, selectedFolderId]);
+    if (!hasLoadedCurrentFolders) return;
+    if (activeSpaceId === PRIVATE_SPACE_ID && (!privateSpace || !privateSpace.access.isUnlocked)) return;
+    pendingUrlFolderIdRef.current = null;
+    setSelectedFolderId("all");
+  }, [
+    activeSpaceGroupId,
+    activeSpaceGroupSpaceIds,
+    activeSpaceId,
+    folders,
+    hasLoadedCurrentFolders,
+    privateSpace,
+    selectedFolderId,
+    spaces,
+  ]);
 
   useEffect(() => {
     setCursorAfter(null);
@@ -892,22 +1022,69 @@ const SearchInner = () => {
     }
   }, []);
 
-  const loadBinSpaces = useCallback(async (): Promise<SpaceListItem[]> => {
+  const loadBinPage = useCallback(async (after: BinEntryCursor | null): Promise<boolean> => {
+    const requestId = ++binLoadRequestRef.current;
+    setBinPageLoading(true);
     try {
       const response = await chrome.runtime.sendMessage({
-        service: "spaces",
-        type: "listBinSpaces",
+        service: "bin",
+        type: "listContents",
         target: "offscreen",
+        payload: {
+          limit: DEFAULT_BIN_PAGE_SIZE,
+          after,
+        },
       });
-      if (!response?.success) return [];
-      const rows = (response.payload as SpaceListItem[]) || [];
-      setBinSpaces(rows);
-      return rows;
+      if (!response?.success) return false;
+      if (requestId !== binLoadRequestRef.current) return false;
+
+      // Accept the old array response during a rolling extension reload, then
+      // switch to the bounded page contract once the offscreen page updates.
+      const payload = response.payload as BinContentsPage | BinEntry[] | undefined;
+      const page: BinContentsPage = Array.isArray(payload)
+        ? {
+            entries: payload.slice(0, DEFAULT_BIN_PAGE_SIZE),
+            total: payload.length,
+            hasMore: false,
+            nextCursor: null,
+          }
+        : payload || { entries: [], total: 0, hasMore: false, nextCursor: null };
+      setBinEntries(page.entries.slice(0, DEFAULT_BIN_PAGE_SIZE));
+      setBinTotal(page.total);
+      setBinHasMore(page.hasMore);
+      return true;
     } catch (loadError) {
-      console.error("Failed to load bin spaces:", loadError);
-      return [];
+      console.error("Failed to load bin contents:", loadError);
+      return false;
+    } finally {
+      if (requestId === binLoadRequestRef.current) setBinPageLoading(false);
     }
   }, []);
+
+  const loadBinContents = useCallback(async (): Promise<void> => {
+    const loaded = await loadBinPage(null);
+    if (loaded) {
+      setBinPageCursor(null);
+      setBinCursorHistory([]);
+    }
+  }, [loadBinPage]);
+
+  const loadNextBinPage = useCallback(async () => {
+    if (binPageLoading || !binHasMore || binEntries.length === 0) return;
+    const lastEntry = binEntries[binEntries.length - 1];
+    const nextCursor = toBinEntryCursor(lastEntry);
+    if (!(await loadBinPage(nextCursor))) return;
+    setBinCursorHistory((history) => [...history, binPageCursor]);
+    setBinPageCursor(nextCursor);
+  }, [binEntries, binHasMore, binPageCursor, binPageLoading, loadBinPage]);
+
+  const loadPreviousBinPage = useCallback(async () => {
+    if (binPageLoading || binCursorHistory.length === 0) return;
+    const previousCursor = binCursorHistory[binCursorHistory.length - 1];
+    if (!(await loadBinPage(previousCursor))) return;
+    setBinCursorHistory((history) => history.slice(0, -1));
+    setBinPageCursor(previousCursor);
+  }, [binCursorHistory, binPageLoading, loadBinPage]);
 
   const loadFolders = useCallback(async (context?: {
     activeSpaceId?: string;
@@ -916,6 +1093,13 @@ const SearchInner = () => {
   }) => {
     const contextActiveSpaceId = context?.activeSpaceId ?? activeSpaceId;
     const contextSearchScope = context?.searchScope ?? requestedScope;
+    const resolvedSearchScope = context?.spaceIds?.length ? "global" : contextSearchScope;
+    const loadKey = buildFolderLoadKey({
+      activeSpaceId: contextActiveSpaceId,
+      searchScope: resolvedSearchScope,
+      spaceIds: context?.spaceIds,
+    });
+    const requestId = ++folderLoadRequestRef.current;
     try {
       const foldersResponse = await chrome.runtime.sendMessage({
         service: "dbManager",
@@ -924,23 +1108,25 @@ const SearchInner = () => {
         payload: {
           accessContext: {
             activeSpaceId: contextActiveSpaceId,
-            searchScope: context?.spaceIds?.length ? "global" : contextSearchScope,
+            searchScope: resolvedSearchScope,
           },
           spaceIds: context?.spaceIds,
         },
       });
 
       if (foldersResponse?.success) {
+        if (requestId !== folderLoadRequestRef.current) return;
         const next = sortFolders((foldersResponse.payload as FolderDocType[]) || []).map((folder) => ({
           ...folder,
           spaceId: folder.spaceId || PUBLIC_SPACE_ID,
         }));
         setFolders(next);
+        setLoadedFolderKey(loadKey);
       }
     } catch (loadError) {
       console.error("Failed to load folders:", loadError);
     }
-  }, [activeSpaceId, requestedScope]);
+  }, [activeSpaceId, isPrivateUnlocked, requestedScope]);
 
   const loadTags = useCallback(async () => {
     try {
@@ -965,7 +1151,7 @@ const SearchInner = () => {
     } catch (loadError) {
       console.error("Failed to load tags:", loadError);
     }
-  }, [activeSpaceId, requestedScope]);
+  }, [activeSpaceId, isPrivateUnlocked, requestedScope]);
 
   const scheduleTagReload = useCallback(() => {
     if (tagReloadTimerRef.current !== null) {
@@ -1058,6 +1244,8 @@ const SearchInner = () => {
   const handleSelectSpace = useCallback(
     async (space: SpaceListItem) => {
       if (space.isPrivate && !space.access.isUnlocked) {
+        setActiveSpaceGroupId(null);
+        setSelectedFolderId("all");
         setUnlockDialogMode(space.access.requiresPassword ? "setup" : "unlock");
         resetUnlockDialogState();
         setUnlockDialogOpen(true);
@@ -1235,10 +1423,15 @@ const SearchInner = () => {
       }
 
       await loadSpaces();
+      const shouldPreservePrivateFolder =
+        activeSpaceId === PRIVATE_SPACE_ID && selectedFolderId !== "all";
       setActiveSpaceId(PRIVATE_SPACE_ID);
-      setSelectedFolderId("all");
+      if (!shouldPreservePrivateFolder) {
+        setSelectedFolderId("all");
+      }
       setUnlockDialogOpen(false);
       resetUnlockDialogState();
+      setRefreshToken((value) => value + 1);
       upsertProcessStatus({
         id: "private-space",
         label: "Private space",
@@ -1276,6 +1469,8 @@ const SearchInner = () => {
     unlockAnswer2,
     unlockPassword,
     unlockConfirmPassword,
+    activeSpaceId,
+    selectedFolderId,
     upsertProcessStatus,
   ]);
 
@@ -1434,7 +1629,7 @@ const SearchInner = () => {
       }, 0);
       setBrowserBookmarksDialogOpen(false);
       showSuccessToast(
-        `${result.bookmarkCount.toLocaleString()} bookmarks synced across ${result.spaceIds.length.toLocaleString()} spaces.`,
+        `${result.bookmarkCount.toLocaleString()} bookmarks imported across ${result.spaceIds.length.toLocaleString()} spaces.`,
         { id: toastId }
       );
     } catch (importError) {
@@ -1449,7 +1644,7 @@ const SearchInner = () => {
   const importGitHubStars = useCallback(async () => {
     setGithubStarsError(null);
     setGithubStarsImporting(true);
-    const toastId = showLoadingToast("Syncing GitHub stars — keep this tab open…");
+    const toastId = showLoadingToast("Importing GitHub stars — keep this tab open…");
     try {
       const response = await chrome.runtime.sendMessage({
         target: "background",
@@ -1467,7 +1662,7 @@ const SearchInner = () => {
       setGithubStarsDialogOpen(false);
       setRefreshToken((value) => value + 1);
       showSuccessToast(
-        `${result.importedCount.toLocaleString()} GitHub stars synced across ${result.spaceIds.length.toLocaleString()} spaces.`,
+        `${result.importedCount.toLocaleString()} GitHub stars imported across ${result.spaceIds.length.toLocaleString()} spaces.`,
         { id: toastId }
       );
     } catch (importError) {
@@ -1529,13 +1724,16 @@ const SearchInner = () => {
       const rows = await loadSpaces();
       const privateRow = rows.find((space) => space.id === PRIVATE_SPACE_ID);
       if (activeSpaceId === PRIVATE_SPACE_ID && privateRow && !privateRow.access.isUnlocked) {
-        setActiveSpaceId(PUBLIC_SPACE_ID);
-        setSelectedFolderId("all");
+        if (!unlockDialogOpen) {
+          setUnlockDialogMode(privateRow.access.requiresPassword ? "setup" : "unlock");
+          resetUnlockDialogState();
+          setUnlockDialogOpen(true);
+        }
         upsertProcessStatus({
           id: "private-space",
           label: "Private space",
           state: "success",
-          detail: "Private space auto-locked after inactivity.",
+          detail: "Private space is locked. Unlock it to keep browsing this private folder.",
           updatedAt: Date.now(),
         });
       }
@@ -1552,7 +1750,7 @@ const SearchInner = () => {
         accessPollTimerRef.current = null;
       }
     };
-  }, [activeSpaceId, loadSpaces, upsertProcessStatus]);
+  }, [activeSpaceId, loadSpaces, resetUnlockDialogState, unlockDialogOpen, upsertProcessStatus]);
 
   const scheduleQueryRefresh = useCallback(
     (priority: "high" | "low" = "high") => {
@@ -1592,15 +1790,6 @@ const SearchInner = () => {
     }
     scheduleQueryRefresh("high");
   }, [activeSpaceId, scheduleQueryRefresh]);
-
-  // Keep ?space= query param in sync so reload stays in the same space.
-  useEffect(() => {
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.set("space", activeSpaceId);
-      window.history.replaceState(window.history.state, "", url.toString());
-    } catch {}
-  }, [activeSpaceId]);
 
   useEffect(() => {
     visibleItemIdsRef.current = new Set(items.map((item) => item.id));
@@ -1659,14 +1848,12 @@ const SearchInner = () => {
   // same place. replaceState avoids polluting history or triggering navigation.
   useEffect(() => {
     try {
-      const params = new URLSearchParams(window.location.search);
-      if (activeSpaceId && activeSpaceId !== PUBLIC_SPACE_ID) params.set("space", activeSpaceId);
-      else params.delete("space");
-      if (activeSpaceGroupId) params.set("group", activeSpaceGroupId);
-      else params.delete("group");
-      if (selectedFolderId && selectedFolderId !== "all") params.set("folder", selectedFolderId);
-      else params.delete("folder");
-      const qs = params.toString();
+      const qs = buildSearchSelectionSearch({
+        currentSearch: window.location.search,
+        activeSpaceId,
+        activeSpaceGroupId,
+        selectedFolderId,
+      });
       window.history.replaceState(
         window.history.state,
         "",
@@ -1855,29 +2042,11 @@ const SearchInner = () => {
   );
 
   const resolveFolderFilterValues = (values: string[]): string[] => {
-    if (values.length === 0) return [];
-    const byName = new Map(folders.map((folder) => [folder.name.toLowerCase(), folder.id]));
-    return unique(
-      values
-        .map((value) => {
-          if (folders.some((folder) => folder.id === value)) return value;
-          return byName.get(value.toLowerCase()) || null;
-        })
-        .filter((value): value is string => !!value)
-    );
+    return resolveNamedFilterValues(values, folders);
   };
 
   const resolveSpaceFilterValues = (values: string[]): string[] => {
-    if (values.length === 0) return [];
-    const byName = new Map(spaces.map((space) => [space.name.toLowerCase(), space.id]));
-    return unique(
-      values
-        .map((value) => {
-          if (spaces.some((space) => space.id === value)) return value;
-          return byName.get(value.toLowerCase()) || null;
-        })
-        .filter((value): value is string => !!value)
-    );
+    return resolveNamedFilterValues(values, spaces);
   };
 
   const sendMessageWithTimeout = useCallback(
@@ -1968,10 +2137,14 @@ const SearchInner = () => {
     const effectiveFilters = analysisCurrent ? queryAnalysis.filters : defaultAnalysis.filters;
     const freeText = analysisCurrent ? queryAnalysis.freeText.trim() : queryText.trim();
     const mode = effectiveMode;
-    const modeFeatures = getQueryModeFeatures(mode);
+    const modeFeatures = resolveEffectiveQueryChannels({
+      requested: getQueryModeFeatures(mode),
+      query: freeText,
+      vectorMinChars: VECTOR_QUERY_MIN_CHARS,
+    });
     const useLexicalSearch = modeFeatures.keyword || modeFeatures.fuzzy;
-    const canUseVector = modeFeatures.vector && freeText.length >= VECTOR_QUERY_MIN_CHARS;
-    const useCursorPagination = effectiveDirectives.page === undefined && !hasActiveQuery;
+    const canUseVector = modeFeatures.vector;
+    const useCursorPagination = shouldUseCursorPagination(effectiveDirectives.page);
     const page = effectiveDirectives.page ?? cursorPage;
 
     const parsedFolderIds = resolveFolderFilterValues(effectiveFilters.folderIds);
@@ -2002,8 +2175,11 @@ const SearchInner = () => {
       accessScope = requestedScope;
     }
 
-    const includeFolderIds =
-      selectedFolderId === "all" ? parsedFolderIds : unique([...parsedFolderIds, selectedFolderId]);
+    const includeFolderIds = resolveSearchFolderFilterIds({
+      hasActiveQuery,
+      parsedFolderIds,
+      selectedFolderId,
+    });
 
     const limit = effectiveDirectives.limit ?? (hasActiveQuery ? SEARCH_PAGE_SIZE : DEFAULT_QUERY_LIMIT);
 
@@ -2050,6 +2226,7 @@ const SearchInner = () => {
           type: "queryLocal",
           target: "offscreen",
           payload: {
+            searchClientId,
             query: freeText,
             text: {
               groups: analysisCurrent ? queryAnalysis.textGroups : [],
@@ -2060,10 +2237,13 @@ const SearchInner = () => {
             useKeyword: useLexicalSearch && modeFeatures.keyword,
             useFuzzy: useLexicalSearch && modeFeatures.fuzzy,
             minScore: effectiveDirectives.minScore,
-            topK: Math.min(
-              MAX_VECTOR_TOPK,
-              Math.max(limit * SCORE_BUDGET_MULTIPLIER, MIN_SCORE_BUDGET)
-            ),
+            topK: getSearchScoreBudget({
+              page: pageToLoad,
+              limit,
+              minimum: MIN_SCORE_BUDGET,
+              maximum: MAX_VECTOR_TOPK,
+              multiplier: SCORE_BUDGET_MULTIPLIER,
+            }),
             pagination: {
               page: pageToLoad,
               limit,
@@ -2125,7 +2305,13 @@ const SearchInner = () => {
         return;
       }
 
-      setItems(payload.items || []);
+      const pageItems = payload.items || [];
+      const nextItems = includePendingRevealItem(pageItems, pendingRevealItemRef.current, {
+        activeSpaceId,
+        activeSpaceGroupId,
+        selectedFolderId,
+      });
+      setItems(nextItems);
       setResultDebug(isDebugSearchEnabled ? payload.debug || null : null);
       setResultMeta({
         total: payload.total || 0,
@@ -2260,20 +2446,22 @@ const SearchInner = () => {
       }
       const message = queryError instanceof Error ? queryError.message : "Failed to run query.";
       setError(message);
-      setItems([]);
-      setResultDebug(null);
-      setResultMeta({
-        total: 0,
-        totalIsExact: true,
-        vectorHits: 0,
-        lexicalHits: 0,
-        vectorError: null,
-        page,
-        limit,
-        hasMore: false,
-        nextCursor: null,
-        mode,
-      });
+      if (!shouldPreserveSearchResultsForError(message)) {
+        setItems([]);
+        setResultDebug(null);
+        setResultMeta({
+          total: 0,
+          totalIsExact: true,
+          vectorHits: 0,
+          lexicalHits: 0,
+          vectorError: null,
+          page,
+          limit,
+          hasMore: false,
+          nextCursor: null,
+          mode,
+        });
+      }
       upsertProcessStatus({
         id: "search-query",
         label: "Search query",
@@ -2302,6 +2490,7 @@ const SearchInner = () => {
     querySubmitMeta,
     queryText,
     requestedScope,
+    searchClientId,
     selectedFolderId,
     sendMessageWithTimeout,
     spaces,
@@ -2316,7 +2505,7 @@ const SearchInner = () => {
       searchScope: activeSpaceGroupId ? "global" : requestedScope,
       spaceIds: activeSpaceGroupId ? activeSpaceGroupSpaceIds : undefined,
     });
-  }, [activeSpaceGroupId, activeSpaceGroupSpaceIds, activeSpaceId, loadFolders, requestedScope]);
+  }, [activeSpaceGroupId, activeSpaceGroupSpaceIds, activeSpaceId, isPrivateUnlocked, loadFolders, requestedScope]);
 
   useEffect(() => {
     loadTags();
@@ -2325,8 +2514,8 @@ const SearchInner = () => {
   useEffect(() => {
     void loadSpaces();
     void loadSpaceGroups();
-    void loadBinSpaces();
-  }, [loadBinSpaces, loadSpaceGroups, loadSpaces]);
+    void loadBinContents();
+  }, [loadBinContents, loadSpaceGroups, loadSpaces]);
 
   useEffect(() => {
     chrome.storage.local.get("sidePanelOpen", (result) => {
@@ -2370,6 +2559,7 @@ const SearchInner = () => {
           searchScope: activeSpaceGroupId ? "global" : requestedScope,
           spaceIds: activeSpaceGroupId ? activeSpaceGroupSpaceIds : undefined,
         });
+        void loadBinContents();
       }
 
       if (msg.scope === "space_groups") {
@@ -2380,7 +2570,7 @@ const SearchInner = () => {
       if (msg.scope === "spaces") {
         void loadSpaces();
         void loadSpaceGroups();
-        void loadBinSpaces();
+        void loadBinContents();
         void loadFolders({
           activeSpaceId,
           searchScope: activeSpaceGroupId ? "global" : requestedScope,
@@ -2391,6 +2581,13 @@ const SearchInner = () => {
       }
 
       if (msg.scope === "items" || msg.scope === "folders") {
+        // Metadata enrichment can emit continuously while a large library is
+        // being indexed. It does not change bin membership, so do not rescan
+        // the full bin on every title/OCR/media patch; opening the bin always
+        // refreshes page one.
+        if (msg.scope === "items" && msg.itemChangeKind !== "metadata") {
+          void loadBinContents();
+        }
         scheduleTagReload();
         if (msg.scope === "items" && Array.isArray(msg.changedItemIds) && msg.changedItemIds.length > 0) {
           const changedIds: string[] = msg.changedItemIds.filter(
@@ -2478,18 +2675,12 @@ const SearchInner = () => {
     setRefreshToken((value) => value + 1);
   };
 
-  const useCursorPagination = queryAnalysis.directives.page === undefined && !hasActiveQuery;
+  const useCursorPagination = shouldUseCursorPagination(queryAnalysis.directives.page);
   const prevDisabled = isLoading || (useCursorPagination ? cursorHistory.length === 0 : resultMeta.page <= 1);
   const nextDisabled = isLoading || (useCursorPagination ? !resultMeta.nextCursor : !resultMeta.hasMore);
   const resultModeFeatures = getQueryModeFeatures(resultMeta.mode);
 
   const goPrevPage = () => {
-    if (hasActiveQuery && queryAnalysis.directives.page === undefined) {
-      if (resultMeta.page <= 1) return;
-      setCursorPage((value) => Math.max(1, value - 1));
-      window.scrollTo({ top: 0, behavior: "smooth" });
-      return;
-    }
     if (!useCursorPagination) {
       setPageDirective(resultMeta.page - 1);
       return;
@@ -2499,15 +2690,11 @@ const SearchInner = () => {
     setCursorHistory(cursorHistory.slice(0, -1));
     setCursorAfter(previousCursor);
     setCursorPage((value) => Math.max(1, value - 1));
+    setRefreshToken((value) => value + 1);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const goNextPage = () => {
-    if (hasActiveQuery && queryAnalysis.directives.page === undefined) {
-      if (!resultMeta.hasMore) return;
-      setCursorPage((value) => value + 1);
-      window.scrollTo({ top: 0, behavior: "smooth" });
-      return;
-    }
     if (!useCursorPagination) {
       setPageDirective(resultMeta.page + 1);
       return;
@@ -2516,24 +2703,21 @@ const SearchInner = () => {
     setCursorHistory((previous) => [...previous, cursorAfter]);
     setCursorAfter(resultMeta.nextCursor);
     setCursorPage((value) => value + 1);
+    setRefreshToken((value) => value + 1);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   useEffect(() => {
-    if (binSpaces.length === 0) return;
+    if (binEntries.length === 0) return;
     const timer = window.setInterval(() => setNowTick(Date.now()), 60_000);
     return () => window.clearInterval(timer);
-  }, [binSpaces.length]);
+  }, [binEntries.length]);
 
   const sidebarSpaces = useMemo<SidebarSpace[]>(
     () => spaces.map((space) => ({ ...space, deletedAt: (space as any).deletedAt ?? 0, purgeAt: (space as any).purgeAt ?? 0 })),
     [spaces]
   );
-  const sidebarBinSpaces = useMemo<SidebarSpace[]>(
-    () => binSpaces.map((space) => ({ ...space, deletedAt: (space as any).deletedAt ?? 0, purgeAt: (space as any).purgeAt ?? 0 })),
-    [binSpaces]
-  );
-
   const refreshSidebarFolders = useCallback(() => {
     void loadFolders({
       activeSpaceId,
@@ -2554,6 +2738,14 @@ const SearchInner = () => {
       // same trigger the space / space-group handlers use. Without this the
       // folder shows whatever was already loaded — often nothing — until a
       // full page reload re-runs the query.
+      pendingUrlFolderIdRef.current = null;
+      if (folderId !== "all") {
+        const context = resolveFolderSelectionContext(folderId, folders, spaces);
+        if (context) {
+          setActiveSpaceId(context.activeSpaceId);
+          setActiveSpaceGroupId(null);
+        }
+      }
       setSelectedFolderId(folderId);
       setRefreshToken((value) => value + 1);
     },
@@ -2705,7 +2897,7 @@ const SearchInner = () => {
           showErrorToast(response?.error || "Could not delete tab group.");
           return;
         }
-        showSuccessToast("Tab group deleted.");
+        showSuccessToast("Tab group moved to Bin.");
       } catch (deleteError) {
         showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete tab group.");
       }
@@ -2713,30 +2905,16 @@ const SearchInner = () => {
     },
     getFolderItemCount: async (ids) => {
       try {
-        const result = await sendMessageWithTimeout<{
+        const response = await sendMessageWithTimeout<{
           success?: boolean;
           payload?: Record<string, number>;
         }>({
-          service: "dbManager",
-          type: "getImportTargets",
+          service: "folders",
+          type: "countItemsInTree",
           target: "offscreen",
-          payload: {
-            accessContext: {
-              activeSpaceId,
-              searchScope: activeSpaceGroupId ? "global" : requestedScope,
-            },
-          },
+          payload: { ids },
         }, QUERY_REQUEST_TIMEOUT_MS);
-        const targets = (result?.payload as any) || {};
-        const counts: Record<string, number> = {};
-        for (const topLevel of (targets.spaces || [])) {
-          for (const folder of (topLevel.folders || [])) {
-            if (ids.includes(folder.id)) {
-              counts[folder.id] = folder.itemCount ?? (folder.recentItems?.length ?? 0);
-            }
-          }
-        }
-        return counts;
+        return response?.payload || {};
       } catch {
         return {};
       }
@@ -2815,7 +2993,7 @@ const SearchInner = () => {
         showErrorToast(binError instanceof Error ? binError.message : "Could not move space to bin.");
       }
       void loadSpaces();
-      void loadBinSpaces();
+      void loadBinContents();
     },
     restoreSpaceFromBin: async (id) => {
       try {
@@ -2829,20 +3007,23 @@ const SearchInner = () => {
           showErrorToast(response?.error || "Could not restore space.");
           return;
         }
-        showSuccessToast("Space restored.");
+        const result = response.payload as { message?: string; relocated?: boolean } | undefined;
+        showSuccessToast(result?.message || "Space restored.", {
+          tempo: result?.relocated ? "long" : "default",
+        });
       } catch (restoreError) {
         showErrorToast(restoreError instanceof Error ? restoreError.message : "Could not restore space.");
       }
       void loadSpaces();
-      void loadBinSpaces();
+      void loadBinContents();
     },
-    deleteSpaceForever: async (id) => {
+    deleteSpaceForever: async (id, expectedDeletedAt) => {
       try {
         const response = await chrome.runtime.sendMessage({
           service: "spaces",
           type: "deleteSpaceForever",
           target: "offscreen",
-          payload: { id },
+          payload: { id, expectedDeletedAt },
         });
         if (!response?.success) {
           showErrorToast(response?.error || "Could not delete space.");
@@ -2853,7 +3034,91 @@ const SearchInner = () => {
         showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete space.");
       }
       void loadSpaces();
-      void loadBinSpaces();
+      void loadBinContents();
+    },
+    restoreFolderFromBin: async (id) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "folders",
+          type: "restoreFromBin",
+          target: "offscreen",
+          payload: { id },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not restore folder.");
+          return;
+        }
+        const result = response.payload as { message?: string; relocated?: boolean } | undefined;
+        showSuccessToast(result?.message || "Folder restored.", {
+          tempo: result?.relocated ? "long" : "default",
+        });
+      } catch (restoreError) {
+        showErrorToast(restoreError instanceof Error ? restoreError.message : "Could not restore folder.");
+      }
+      refreshSidebarFolders();
+      void loadBinContents();
+      scheduleQueryRefresh("high");
+    },
+    deleteFolderForever: async (id, expectedDeletedAt) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "folders",
+          type: "deleteForever",
+          target: "offscreen",
+          payload: { id, expectedDeletedAt },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not delete folder.");
+          return;
+        }
+        showSuccessToast("Folder permanently deleted.");
+      } catch (deleteError) {
+        showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete folder.");
+      }
+      refreshSidebarFolders();
+      void loadBinContents();
+      scheduleQueryRefresh("high");
+    },
+    restoreItemFromBin: async (id) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "items",
+          type: "restoreFromBin",
+          target: "offscreen",
+          payload: { id },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not restore saved tab.");
+          return;
+        }
+        const result = response.payload as { message?: string; relocated?: boolean } | undefined;
+        showSuccessToast(result?.message || "Saved tab restored.", {
+          tempo: result?.relocated ? "long" : "default",
+        });
+      } catch (restoreError) {
+        showErrorToast(restoreError instanceof Error ? restoreError.message : "Could not restore saved tab.");
+      }
+      void loadBinContents();
+      scheduleQueryRefresh("high");
+    },
+    deleteItemForever: async (id, expectedDeletedAt) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "items",
+          type: "deleteForever",
+          target: "offscreen",
+          payload: { id, expectedDeletedAt },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not delete saved tab.");
+          return;
+        }
+        showSuccessToast("Saved tab permanently deleted.");
+      } catch (deleteError) {
+        showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete saved tab.");
+      }
+      void loadBinContents();
+      scheduleQueryRefresh("high");
     },
     reorderSpaceGroups: async (orderedIds) => {
       try {
@@ -2900,7 +3165,7 @@ const SearchInner = () => {
         }
         showSuccessToast(
           mode === "deleteContents"
-            ? "Space group and its contents deleted."
+            ? "Space group moved to bin. Restore spaces from Bin within 30 days."
             : "Space group deleted. Spaces moved to Ungrouped."
         );
       } catch (deleteError) {
@@ -2908,6 +3173,7 @@ const SearchInner = () => {
       }
       void loadSpaceGroups();
       void loadSpaces();
+      void loadBinContents();
     },
     newSpace: (groupId) => {
       setCreateSpaceError(null);
@@ -2984,10 +3250,10 @@ const SearchInner = () => {
     activeSpaceGroupId,
     activeSpaceGroupSpaceIds,
     activeSpaceId,
-    binSpaces,
+    folders,
     handleSelectSpace,
     handleSelectSpaceGroup,
-    loadBinSpaces,
+    loadBinContents,
     loadFolders,
     loadSpaceGroups,
     loadSpaces,
@@ -2996,6 +3262,7 @@ const SearchInner = () => {
     requestedScope,
     resetUnlockDialogState,
     sendMessageWithTimeout,
+    spaces,
     setBrowserBookmarksDialogOpen,
     setBrowserBookmarksError,
     setChangePasswordConfirm,
@@ -3023,7 +3290,7 @@ const SearchInner = () => {
       data-theme={theme}
       className={cn(
         "min-h-dvh bg-background-page relative transition-[padding] duration-400 ease-in-out",
-        isOpen && "md:pl-[272px] 2xl:pl-0"
+        isOpen && "md:pl-[272px]"
       )}
     >
       <div>
@@ -3059,7 +3326,14 @@ const SearchInner = () => {
             activeSpaceId={activeSpaceId}
             activeSpaceGroupId={activeSpaceGroupId}
             selectedFolderId={selectedFolderId}
-            binSpaces={sidebarBinSpaces}
+            binEntries={binEntries}
+            binTotal={binTotal}
+            binHasMore={binHasMore}
+            binPage={binCursorHistory.length + 1}
+            binPageLoading={binPageLoading}
+            onNextBinPage={loadNextBinPage}
+            onPreviousBinPage={loadPreviousBinPage}
+            onOpenBin={loadBinContents}
             now={nowTick}
             openBinNonce={binNonce}
             handlers={sidebarHandlers}
@@ -3097,7 +3371,7 @@ const SearchInner = () => {
         onClick={() => setSettingsOpen(true)}
         aria-label="Open settings"
         title="Settings"
-        className="group fixed bottom-5 left-5 z-40 grid size-10 place-items-center rounded-full border border-border-neutral-faded bg-background-neutral text-foreground-secondary shadow-lg shadow-black/10 backdrop-blur transition-[transform,color,box-shadow] duration-150 hover:text-foreground-neutral focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1"
+        className="group fixed bottom-5 left-5 z-40 grid size-10 place-items-center rounded-full border border-border-neutral-faded bg-background-neutral text-foreground-secondary shadow-lg shadow-black/10 backdrop-blur transition-[transform,color,box-shadow] duration-150 hover:text-foreground-neutral focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1 cursor-pointer"
       >
         <Settings className="size-[18px] transition-transform duration-300 group-hover:rotate-45" />
       </button>
@@ -3111,7 +3385,7 @@ const SearchInner = () => {
         onDataChanged={() => {
           void loadSpaces();
           void loadSpaceGroups();
-          void loadBinSpaces();
+          void loadBinContents();
           refreshSidebarFolders();
           setRefreshToken((value) => value + 1);
         }}
@@ -3849,6 +4123,7 @@ const SearchInner = () => {
           items={items}
           spaces={spaces}
           preserveInputOrder={preserveInputOrder}
+          revealItemId={pendingRevealItemRef.current?.id}
           debugScoresByItemId={isDebugSearchEnabled ? debugScoresByItemId : undefined}
           showDebugScores={isDebugSearchEnabled}
           onShareSelectedItems={(itemIds) => {

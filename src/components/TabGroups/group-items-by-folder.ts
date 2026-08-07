@@ -15,7 +15,8 @@ const compareFolderItems = (a: ItemDocType, b: ItemDocType) => {
 export const groupItemsByFolder = (
   folders: readonly Pick<FolderDocType, "id">[],
   items: readonly ItemDocType[],
-  preserveInputOrder: boolean
+  preserveInputOrder: boolean,
+  prioritizedItemId?: string
 ): Map<string, ItemDocType[]> => {
   const itemsByFolder = new Map<string, ItemDocType[]>();
 
@@ -31,6 +32,16 @@ export const groupItemsByFolder = (
   if (!preserveInputOrder) {
     for (const bucket of itemsByFolder.values()) {
       bucket.sort(compareFolderItems);
+    }
+  }
+
+  if (prioritizedItemId) {
+    for (const bucket of itemsByFolder.values()) {
+      const index = bucket.findIndex((item) => item.id === prioritizedItemId);
+      if (index <= 0) continue;
+      const [prioritizedItem] = bucket.splice(index, 1);
+      bucket.unshift(prioritizedItem);
+      break;
     }
   }
 

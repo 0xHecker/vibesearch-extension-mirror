@@ -61,7 +61,7 @@ function normalizeIncomingUrls(input: unknown): string[] {
       for (const part of rawParts) add(maybeDecode(part));
       return;
     }
-    if (/%[0-9a-fA-F]{2}/.test(trimmed)) {
+    if (!trimmed.includes("://") && /%[0-9a-fA-F]{2}/.test(trimmed)) {
       const decoded = maybeDecode(trimmed);
       out.push(decoded);
       return;
@@ -117,10 +117,10 @@ const fetchMetadataEndpoint = async (
   const legacyUrl = `${LEGACY_METADATA_WORKER_BASE_URL}${suffix}`;
   const primaryInit = usePost
     ? {
-        method: "POST" as const,
-        headers: { "Content-Type": "application/json", "X-VS-Metadata-Source": "extension" },
-        body: JSON.stringify({ urls, revalidate, refreshImage: revalidate, cacheOnly }),
-      }
+      method: "POST" as const,
+      headers: { "Content-Type": "application/json", "X-VS-Metadata-Source": "extension" },
+      body: JSON.stringify({ urls, revalidate, refreshImage: revalidate, cacheOnly }),
+    }
     : { method: "GET" as const };
 
   const timeoutFetch = (url: string, init: RequestInit): Promise<Response> => {
@@ -133,7 +133,7 @@ const fetchMetadataEndpoint = async (
     const primary = await timeoutFetch(primaryUrl, primaryInit);
     if (primary.ok) return primary;
     if (usePost) return primary;
-  } catch {}
+  } catch { }
 
   return timeoutFetch(legacyUrl, { method: "GET" as const });
 };
@@ -379,11 +379,13 @@ const fetchMetadataForUrls = async (
       const responseRetryAfterSeconds = Number(res.headers.get("Retry-After") || 0);
       const arr = (await res.json()) as any[];
       if (Array.isArray(arr)) {
+        const accountedUrls = new Set<string>();
         for (let i = 0; i < arr.length; i++) {
           const entry = arr[i] ?? {};
           const inputUrl = group[i];
           const key = inputUrl || entry.url;
           if (!key) continue;
+          accountedUrls.add(key);
 
           if (isQueuedMetadataEntry(entry)) {
             result.queuedUrls.add(key);
@@ -425,17 +427,17 @@ const fetchMetadataForUrls = async (
           const imageAssets = collectMetadataImageAssets(entry, imageFields, key);
           const preferredShortThumbnail = isYouTubeShortsUrl(key)
             ? imageAssets.find(
-                (asset) =>
-                  typeof asset.width === "number" &&
-                  typeof asset.height === "number" &&
-                  asset.height > asset.width
-              )
+              (asset) =>
+                typeof asset.width === "number" &&
+                typeof asset.height === "number" &&
+                asset.height > asset.width
+            )
             : undefined;
           const orderedImageAssets = preferredShortThumbnail
             ? [
-                preferredShortThumbnail,
-                ...imageAssets.filter((asset) => asset.url !== preferredShortThumbnail.url),
-              ]
+              preferredShortThumbnail,
+              ...imageAssets.filter((asset) => asset.url !== preferredShortThumbnail.url),
+            ]
             : imageAssets;
 
           const title = pickStringField(entry, titleFields);
@@ -448,11 +450,11 @@ const fetchMetadataForUrls = async (
               try {
                 const origin = new URL(key).origin;
                 favicon = origin + favicon;
-              } catch {}
+              } catch { }
             } else if (!favicon.includes("://")) {
               try {
                 favicon = new URL(favicon, key).toString();
-              } catch {}
+              } catch { }
             }
           }
           let displayImageUrl = preferredShortThumbnail?.url || pickImageField(entry, imageFields);
@@ -519,8 +521,21 @@ const fetchMetadataForUrls = async (
           if (entry.url && entry.url !== key) {
             result.metadata[entry.url] = mapped;
             result.successfulUrls.add(entry.url);
+            accountedUrls.add(entry.url);
           }
         }
+        for (const url of group) {
+          if (
+            !accountedUrls.has(url) &&
+            !result.successfulUrls.has(url) &&
+            !result.queuedUrls.has(url) &&
+            !result.failedUrls.has(url)
+          ) {
+            result.successfulUrls.add(url);
+          }
+        }
+      } else {
+        for (const url of group) result.failedUrls.add(url);
       }
     } catch (e) {
       console.error("Error fetching metadata for group:", group, e);
@@ -604,6 +619,7 @@ const FAILED_METADATA_STORAGE_KEY = "vibesearch:metadata:failed-v1";
 let lastUrlStateCleanupAt = 0;
 const failedMetadataUrls = new Set<string>();
 const periodicRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const queuedPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 type MetadataPipelineStats = {
   scheduledUrls: number;
@@ -681,7 +697,7 @@ const notifyMetadataProgress = () => {
       failed: failedMetadataUrls.size,
       scheduled: pipelineStats.scheduledUrls,
     });
-  } catch {}
+  } catch { }
 };
 
 type QueueItem = {
@@ -704,6 +720,12 @@ const clearPeriodicRetryTimer = (url: string) => {
   const timer = periodicRetryTimers.get(url);
   if (timer) clearTimeout(timer);
   periodicRetryTimers.delete(url);
+};
+
+const clearQueuedPollTimer = (url: string) => {
+  const timer = queuedPollTimers.get(url);
+  if (timer) clearTimeout(timer);
+  queuedPollTimers.delete(url);
 };
 
 const getStorageLocal = (): chrome.storage.LocalStorageArea | null => {
@@ -815,6 +837,7 @@ const markSkippedUrlsMetadataComplete = (urls: string[]) => {
 
 const queueFailedMetadataRetry = (url: string, state: UrlEntry): boolean => {
   if (state.status === "done") {
+    clearQueuedPollTimer(url);
     removeStoredFailedMetadata(url);
     return false;
   }
@@ -826,6 +849,7 @@ const queueFailedMetadataRetry = (url: string, state: UrlEntry): boolean => {
   if (state.status === "queued" || state.status === "inflight") return false;
 
   failedMetadataUrls.delete(url);
+  clearQueuedPollTimer(url);
   state.status = "queued";
   state.attempts = 0;
   state.pollCount = 0;
@@ -870,6 +894,7 @@ const markUrlFailedForNow = (
   state: UrlEntry,
   payloadMap?: Record<string, Partial<ItemDocType>>
 ) => {
+  clearQueuedPollTimer(url);
   state.status = "failed";
   touchEntry(state);
   if (payloadMap) payloadMap[url] = { isMetaFetched: true };
@@ -928,6 +953,7 @@ const cleanupUrlState = (force = false) => {
     const age = now - state.updatedAt;
     if (state.status === "done" && age > URL_STATE_DONE_TTL) {
       clearPeriodicRetryTimer(url);
+      clearQueuedPollTimer(url);
       failedMetadataUrls.delete(url);
       removeStoredFailedMetadata(url);
       urlState.delete(url);
@@ -936,6 +962,7 @@ const cleanupUrlState = (force = false) => {
     }
     if (state.status === "failed" && age > URL_STATE_FAILED_TTL) {
       clearPeriodicRetryTimer(url);
+      clearQueuedPollTimer(url);
       failedMetadataUrls.delete(url);
       removeStoredFailedMetadata(url);
       urlState.delete(url);
@@ -961,6 +988,7 @@ const cleanupUrlState = (force = false) => {
       break;
     }
     clearPeriodicRetryTimer(url);
+    clearQueuedPollTimer(url);
     failedMetadataUrls.delete(url);
     removeStoredFailedMetadata(url);
     urlState.delete(url);
@@ -979,7 +1007,7 @@ const takeNextBatch = (): QueueItem[] => {
   if (!first) return [];
   const batch: QueueItem[] = [first];
 
-  for (let i = 0; i < queue.length && batch.length < BATCH_SIZE; ) {
+  for (let i = 0; i < queue.length && batch.length < BATCH_SIZE;) {
     if (!isCompatibleQueueItem(first, queue[i])) {
       i += 1;
       continue;
@@ -1064,6 +1092,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
     for (const url of fetchResult.successfulUrls) {
       const state = urlState.get(url);
       if (state) {
+        clearQueuedPollTimer(url);
         state.status = "done";
         state.periodicRetryCount = 0;
         touchEntry(state);
@@ -1085,17 +1114,24 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
         // don't all re-poll on the same 30s tick.
         const base = fetchResult.queuedRetryDelays.get(url) || QUEUED_METADATA_POLL_DELAY;
         const pollDelay = withJitter(Math.min(base * (1 + state.pollCount * 0.2), 90_000));
-        setTimeout(() => {
-          state.status = "queued";
-          state.revalidate = false;
-          state.cacheOnly = true;
-          state.applyForceRefresh = applyForceRefreshOnPoll;
-          touchEntry(state);
+        clearQueuedPollTimer(url);
+        const timer = setTimeout(() => {
+          queuedPollTimers.delete(url);
+          const current = urlState.get(url);
+          if (!current || current !== state || current.status === "done" || current.status === "failed") {
+            return;
+          }
+          current.status = "queued";
+          current.revalidate = false;
+          current.cacheOnly = true;
+          current.applyForceRefresh = applyForceRefreshOnPoll;
+          touchEntry(current);
           addUrlToPipeline(url, false, {
             cacheOnly: true,
             applyForceRefresh: applyForceRefreshOnPoll,
           });
         }, pollDelay);
+        queuedPollTimers.set(url, timer);
       } else {
         markUrlFailedForNow(url, state, payloadMap);
         console.warn(`[MetadataPipeline] Queued metadata did not materialize after ${MAX_QUEUE_POLLS} polls:`, url);
@@ -1114,6 +1150,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
         console.log(`[MetadataPipeline] Scheduling retry for ${url} in ${delay}ms`);
         pipelineStats.retriesScheduled += 1;
         setTimeout(() => {
+          if (state.status === "done") return;
           state.status = "queued";
           touchEntry(state);
           addUrlToPipeline(url, state.revalidate, {
@@ -1148,6 +1185,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
         const delay = withJitter(backoff);
         pipelineStats.retriesScheduled += 1;
         setTimeout(() => {
+          if (state.status === "done") return;
           state.status = "queued";
           touchEntry(state);
           addUrlToPipeline(url, state.revalidate, {
@@ -1251,6 +1289,7 @@ export const scheduleForProcessing = (urls: string[], forceRefresh = false) => {
       state.applyForceRefresh = false;
       failedMetadataUrls.delete(url);
       clearPeriodicRetryTimer(url);
+      clearQueuedPollTimer(url);
       removeStoredFailedMetadata(url);
       touchEntry(state);
       addUrlToPipeline(url, true);
@@ -1266,6 +1305,7 @@ export const scheduleForProcessing = (urls: string[], forceRefresh = false) => {
       state.applyForceRefresh = false;
       failedMetadataUrls.delete(url);
       clearPeriodicRetryTimer(url);
+      clearQueuedPollTimer(url);
       removeStoredFailedMetadata(url);
       touchEntry(state);
       addUrlToPipeline(url, false);

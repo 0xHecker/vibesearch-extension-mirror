@@ -1,0 +1,21 @@
+{
+  "description": "Local-first search for tabs, bookmarks, screenshots, and saved pages, with on-device semantic AI.",
+  "background": {
+    "scripts": ["src/workers/background.firefox.ts"],
+    "type": "module"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "vibesearch@vibesearch.app",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": [
+          "authenticationInfo",
+          "bookmarksInfo",
+          "browsingActivity",
+          "websiteContent"
+        ]
+      }
+    }
+  }
+}

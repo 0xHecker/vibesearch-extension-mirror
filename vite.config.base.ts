@@ -3,9 +3,8 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { resolve } from "path";
-import { stripDevIcons, crxI18n } from "./custom-vite-plugins";
+import { crxI18n } from "./custom-vite-plugins";
 
-const isDev = process.env.NODE_ENV !== "production";
 const localize = false;
 
 export default defineConfig({
@@ -13,7 +12,6 @@ export default defineConfig({
     tailwindcss(),
     tsconfigPaths(),
     react(),
-    stripDevIcons(isDev),
     crxI18n({ localize, src: "./src/locales" }),
   ],
   optimizeDeps: {

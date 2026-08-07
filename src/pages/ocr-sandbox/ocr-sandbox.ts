@@ -118,7 +118,7 @@ const getRunner = async (): Promise<OcrRunner> => {
       },
     }) as Promise<OcrRunner>).catch((error) => {
       runnerPromise = null;
-      throw error;
+      throw error``;
     });
   }
   return runnerPromise;

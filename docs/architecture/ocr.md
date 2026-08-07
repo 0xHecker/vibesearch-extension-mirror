@@ -39,7 +39,7 @@ flowchart TB
     Q["OCR queue<br/>(offscreen.ts)"] --> SVC["OcrService<br/>candidates · fetch · normalize"]
     SVC --> CL["OcrSandboxClient<br/>iframe + model cache"]
     CL <-->|postMessage| SBX["ocr-sandbox page<br/>PaddleOCR + ORT"]
-    CL -->|model bytes (proxied)| MW["metadata worker /ocr-model/&lt;id&gt;"]
+    CL -->|"model bytes (proxied)"| MW["metadata worker /ocr-model/&lt;id&gt;"]
     SVC --> DB[("RxDB items")]
 ```
 

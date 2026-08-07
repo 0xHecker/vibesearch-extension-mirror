@@ -2,29 +2,40 @@ import { getDb } from "@src/services/DatabaseService";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { FolderDocType } from "@src/schemas/folder_schema";
 import {
-  saveMediaToOpfs,
-  deleteMediaFromOpfs,
-  deleteAllMediaForItem,
+  cloneOpfsMediaEntriesForItem,
   inferMediaType,
   isGifUrl,
   categorizeMedia,
   getMediaCounts,
   canAddMedia,
   MEDIA_LIMITS,
+  opfsFileIdentitiesEqual,
+  readOpfsFileIdentity,
+  withOpfsMutationLock,
+  type OpfsFileIdentity,
   type MediaCategory,
 } from "@src/services/media-storage";
+import {
+  deleteUnreferencedOpfsFiles,
+  deleteUnreferencedOpfsItemDirectories,
+} from "@src/services/opfs-media-lifecycle";
 import type {
   QueryDebugPayload,
   QueryTextExpression,
   RankQueryCursor,
   RankableItem,
 } from "@src/search-core/contracts";
+import { resolveEffectiveQueryChannels } from "@src/search-core/contracts";
 import { v4 as uuidv4 } from "uuid";
 import { databaseManager } from "@src/services/db-manager";
 import { appendOcrTextToTextContent } from "@src/services/ocr-text";
 import { isYouTubeShortsUrl } from "@src/utils/media-embed";
-import { vectorStoreService } from "@src/services/vector-store.service";
+import {
+  vectorStoreService,
+  type VectorQueryLease,
+} from "@src/services/vector-store.service";
 import { localSearchIndexService } from "@src/services/local-search-index.service";
+import { hasVectorReference } from "@src/search-core/embedding-state";
 import { appendUnorderedIds } from "@src/utils/ordered-ids";
 import { isMetadataFetchableUrl } from "@src/utils/metadata-url";
 import {
@@ -36,10 +47,47 @@ import { MAX_GRID_QUERY_LIMIT, splitLookaheadPage } from "@src/search-core/pagin
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { spaceSessionService } from "@src/services/space-session.service";
 import {
+  createRestoreTabGroup,
+  resolveRestoreSpace,
+  restoreFallbackMessage,
+} from "@src/services/bin-restore-location";
+import {
   queryRankerService,
   RANK_REQUEST_SUPERSEDED,
+  RankWorkerCapacityError,
   SupersededRankRequestError,
 } from "@src/services/query-ranker.service";
+import { normalizeSearchIndexText } from "@src/search-core/search-text";
+import {
+  forEachIdKeysetPage,
+  readIdKeysetPage,
+} from "@src/services/rxdb-keyset-pagination";
+import {
+  streamRankCandidates,
+  shouldStreamRankCandidates,
+  STREAMING_RANK_HYDRATION_BATCH_SIZE,
+} from "@src/services/streaming-query-ranker";
+import {
+  canNarrowExpressionToPositiveMatches,
+  expressionCanMatchWithoutPositiveTerm,
+} from "@src/search-core/expression-analysis";
+import {
+  compareRankedEntries,
+  compareRankField,
+  isRankedEntryAfterCursor,
+} from "@src/search-core/rank-order";
+import { resolveIncludedTagIds } from "@src/search-core/tag-filter";
+import {
+  withBinMutationLock,
+  withEntityMutationLock,
+  withSpaceMutationLocks,
+} from "@src/services/entity-mutation-lock";
+import { nextBinMutationTimestamp } from "@src/common/bin";
+import {
+  requireLiveFolderDestination,
+  requireLiveSpaceDestination,
+  withLiveFolderDestination,
+} from "@src/services/live-destination";
 
 type LocalQuerySortBy = "relevance" | "createdAt" | "updatedAt" | "title" | "source";
 type LocalQuerySortOrder = "asc" | "desc";
@@ -54,8 +102,15 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const LEXICAL_SEARCH_TIMEOUT_MS = 4000;
 const VECTOR_SEARCH_TIMEOUT_MS = 3500;
 const VECTOR_QUERY_MIN_CHARS = 3;
+const SCOPED_CANDIDATE_PAGE_SIZE = 250;
 
 type ItemMediaEntry = NonNullable<ItemDocType["media"]>[number];
+
+type ItemsControllerOptions = {
+  readOpfsFileIdentity?: typeof readOpfsFileIdentity;
+  cloneOpfsMediaEntriesForItem?: typeof cloneOpfsMediaEntriesForItem;
+  deleteUnreferencedOpfsItemDirectories?: typeof deleteUnreferencedOpfsItemDirectories;
+};
 
 const mediaEntryKey = (entry: ItemMediaEntry): string | null => {
   const value = entry.embedUrl || entry.s3Url || entry.opfsPath || entry.originalUrl;
@@ -115,7 +170,28 @@ const mergeFetchedMedia = (
 const hasStoredMedia = (media: ItemDocType["media"]): boolean =>
   (media || []).some((entry) => entry.storageType === "opfs" || entry.storageType === "s3");
 
+const canonicalizeMediaSnapshot = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalizeMediaSnapshot);
+  if (!value || typeof value !== "object") return value;
+  return Object.keys(value as Record<string, unknown>)
+    .sort()
+    .reduce<Record<string, unknown>>((out, key) => {
+      const next = (value as Record<string, unknown>)[key];
+      if (next !== undefined) out[key] = canonicalizeMediaSnapshot(next);
+      return out;
+    }, {});
+};
+
+const mediaSnapshotsEqual = (
+  left: ItemDocType["media"],
+  right: ItemDocType["media"]
+): boolean =>
+  JSON.stringify(canonicalizeMediaSnapshot(left || [])) ===
+  JSON.stringify(canonicalizeMediaSnapshot(right || []));
+
 type LocalQueryPayload = {
+  /** Stable for the lifetime of one Search page. Queries only supersede work in the same client. */
+  searchClientId?: string;
   query?: string;
   text?: {
     groups?: string[][];
@@ -188,6 +264,8 @@ type LocalQueryResponse = {
     queryHash: string;
     candidateCount: number;
     rankInputCount: number;
+    rankRetainedPeakCount?: number;
+    rankHydrationBatchSize?: number;
     usedSimpleSortPath: boolean;
     scoreBudget: number;
     supersededCount: number;
@@ -234,12 +312,166 @@ type VectorScoreResult = {
   score: number;
 };
 
+type SearchRequestContext = {
+  clientId: string;
+  generation: number;
+  queryAbortController: AbortController;
+  lexicalAbortController: AbortController | null;
+  vectorAbortController: AbortController | null;
+};
+
+const DEFAULT_SEARCH_CLIENT_ID = "__legacy_search_client__";
+const MAX_SEARCH_CLIENT_ID_LENGTH = 128;
+
 export class ItemsController {
   [key: string]: any;
+  constructor(private readonly options: ItemsControllerOptions = {}) {}
   private rankTelemetry = {
     supersededCount: 0,
     fallbackCount: 0,
   };
+  private searchGeneration = 0;
+  private searchContextsByClient = new Map<string, SearchRequestContext>();
+  private searchContextsByGeneration = new Map<number, SearchRequestContext>();
+  // Retained as mirrors for legacy tests/callers which exercise the default
+  // lane directly. Real Search pages use their own entries in the maps above.
+  private activeQueryAbortController: AbortController | null = null;
+  private activeLexicalSearchAbortController: AbortController | null = null;
+  private activeVectorSearchAbortController: AbortController | null = null;
+  private vectorStore = vectorStoreService;
+
+  private normalizeSearchClientId(clientId?: string): string {
+    const normalized = typeof clientId === "string" ? clientId.trim() : "";
+    return normalized
+      ? normalized.slice(0, MAX_SEARCH_CLIENT_ID_LENGTH)
+      : DEFAULT_SEARCH_CLIENT_ID;
+  }
+
+  private abortSearchContext(context: SearchRequestContext): void {
+    const reason = new Error(RANK_REQUEST_SUPERSEDED);
+    context.queryAbortController.abort(reason);
+    context.lexicalAbortController?.abort(reason);
+    context.vectorAbortController?.abort(reason);
+  }
+
+  private beginSearchGeneration(clientId?: string): number {
+    const normalizedClientId = this.normalizeSearchClientId(clientId);
+    const previous = this.searchContextsByClient.get(normalizedClientId);
+    if (previous) {
+      this.abortSearchContext(previous);
+      this.searchContextsByGeneration.delete(previous.generation);
+    }
+
+    const generation = ++this.searchGeneration;
+    const context: SearchRequestContext = {
+      clientId: normalizedClientId,
+      generation,
+      queryAbortController: new AbortController(),
+      lexicalAbortController: null,
+      vectorAbortController: null,
+    };
+    this.searchContextsByClient.set(normalizedClientId, context);
+    this.searchContextsByGeneration.set(generation, context);
+
+    if (normalizedClientId === DEFAULT_SEARCH_CLIENT_ID) {
+      this.activeQueryAbortController = context.queryAbortController;
+      this.activeLexicalSearchAbortController = null;
+      this.activeVectorSearchAbortController = null;
+    }
+    return generation;
+  }
+
+  private getSearchContext(generation: number): SearchRequestContext {
+    const context = this.searchContextsByGeneration.get(generation);
+    if (
+      !context ||
+      this.searchContextsByClient.get(context.clientId) !== context ||
+      context.queryAbortController.signal.aborted
+    ) {
+      throw new SupersededRankRequestError();
+    }
+    return context;
+  }
+
+  private assertSearchGeneration(generation: number): void {
+    this.getSearchContext(generation);
+  }
+
+  private getSearchSignal(generation: number): AbortSignal {
+    return this.getSearchContext(generation).queryAbortController.signal;
+  }
+
+  private getSearchClientId(generation: number): string {
+    return this.getSearchContext(generation).clientId;
+  }
+
+  private startLexicalSearchPhase(generation: number): AbortController {
+    const context = this.getSearchContext(generation);
+    context.lexicalAbortController?.abort(new Error(RANK_REQUEST_SUPERSEDED));
+    const controller = new AbortController();
+    context.lexicalAbortController = controller;
+    if (context.clientId === DEFAULT_SEARCH_CLIENT_ID) {
+      this.activeLexicalSearchAbortController = controller;
+    }
+    return controller;
+  }
+
+  private finishLexicalSearchPhase(generation: number, controller: AbortController): void {
+    const context = this.searchContextsByGeneration.get(generation);
+    if (!context || context.lexicalAbortController !== controller) return;
+    context.lexicalAbortController = null;
+    if (
+      context.clientId === DEFAULT_SEARCH_CLIENT_ID &&
+      this.activeLexicalSearchAbortController === controller
+    ) {
+      this.activeLexicalSearchAbortController = null;
+    }
+  }
+
+  private startVectorSearchPhase(generation: number): AbortController {
+    const context = this.getSearchContext(generation);
+
+    // The generation check and assignment are synchronous. Aborting here as
+    // well makes replacement safe even if another current phase was installed
+    // by a future call path.
+    context.vectorAbortController?.abort(new Error(RANK_REQUEST_SUPERSEDED));
+    const controller = new AbortController();
+    context.vectorAbortController = controller;
+    if (context.clientId === DEFAULT_SEARCH_CLIENT_ID) {
+      this.activeVectorSearchAbortController = controller;
+    }
+    return controller;
+  }
+
+  private finishVectorSearchPhase(generation: number, controller: AbortController): void {
+    const context = this.searchContextsByGeneration.get(generation);
+    if (!context || context.vectorAbortController !== controller) return;
+    context.vectorAbortController = null;
+    if (
+      context.clientId === DEFAULT_SEARCH_CLIENT_ID &&
+      this.activeVectorSearchAbortController === controller
+    ) {
+      this.activeVectorSearchAbortController = null;
+    }
+  }
+
+  private finishSearchGeneration(generation: number): void {
+    const context = this.searchContextsByGeneration.get(generation);
+    if (!context || this.searchContextsByClient.get(context.clientId) !== context) return;
+
+    this.searchContextsByGeneration.delete(generation);
+    this.searchContextsByClient.delete(context.clientId);
+    context.lexicalAbortController = null;
+    context.vectorAbortController = null;
+
+    if (context.clientId === DEFAULT_SEARCH_CLIENT_ID) {
+      if (this.activeQueryAbortController === context.queryAbortController) {
+        this.activeQueryAbortController = null;
+      }
+      this.activeLexicalSearchAbortController = null;
+      this.activeVectorSearchAbortController = null;
+    }
+  }
 
   private normalizeUserId(userId: string | null | undefined): string {
     return typeof userId === "string" ? userId : "";
@@ -258,6 +490,12 @@ export class ItemsController {
       if (v !== undefined) copy[k] = v;
     });
     return copy as T;
+  }
+
+  private async removeDeletedItemTombstone(db: any, id: string): Promise<void> {
+    if (!db.deleted_items?.findOne) return;
+    const tombstone = await db.deleted_items.findOne(id).exec();
+    if (tombstone) await tombstone.remove();
   }
 
   markSearchIndexDirty() {
@@ -284,6 +522,23 @@ export class ItemsController {
       .filter(Boolean);
   }
 
+  private resolveVectorQueryText(payload: LocalQueryPayload): string {
+    const query = (payload.query || "").trim();
+    const expressionTerms = payload.text?.expression
+      ? this.collectPositiveExpressionTerms(payload.text.expression)
+      : [];
+    const groupedTerms = (payload.text?.groups || [])
+      .flat()
+      .map((term) => term.trim())
+      .filter(Boolean);
+    const positiveTerms = expressionTerms.length > 0
+      ? expressionTerms
+      : groupedTerms.length > 0
+        ? groupedTerms
+        : this.tokenizeQuery(query);
+    return Array.from(new Set(positiveTerms)).join(" ") || query;
+  }
+
   private normalizeText(input: string): string {
     return input
       .normalize("NFKD")
@@ -303,11 +558,13 @@ export class ItemsController {
   private async withTimeout<T>(
     promise: Promise<T>,
     timeoutMs: number,
-    message: string
+    message: string,
+    onTimeout?: () => void
   ): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timeoutPromise = new Promise<T>((_, reject) => {
       timer = setTimeout(() => {
+        onTimeout?.();
         reject(new Error(message));
       }, timeoutMs);
     });
@@ -406,12 +663,18 @@ export class ItemsController {
       )
     );
     const url = (doc.get("url") as string | undefined) || "";
-    const vectorIndexRaw = doc.get("vector_index");
+    // Compaction can remap vector indexes before the changed item has been
+    // re-embedded. Only rows explicitly marked current may contribute vector
+    // candidates; dirty/unembedded rows would otherwise rank on stale content.
+    const hasCurrentEmbedding = doc.get("isEmbedded") === true && doc.get("isDirty") !== true;
+    const vectorIndexRaw = hasCurrentEmbedding ? doc.get("vector_index") : undefined;
     const vectorIndex =
       typeof vectorIndexRaw === "number" && Number.isInteger(vectorIndexRaw) && vectorIndexRaw >= 0
         ? vectorIndexRaw
         : -1;
-    const vectorIndexes = this.sanitizeVectorIndexes(doc.get("vector_indexes"), vectorIndex);
+    const vectorIndexes = hasCurrentEmbedding
+      ? this.sanitizeVectorIndexes(doc.get("vector_indexes"), vectorIndex)
+      : [];
 
     return {
       id: (doc.get("id") as string) || "",
@@ -476,22 +739,40 @@ export class ItemsController {
     return { matches: false, matchedTermCount: 0 };
   }
 
-  private evaluateTextExpression(itemText: string, node: QueryTextExpression): boolean {
+  private textTermMatches(
+    itemText: string,
+    rawTerm: string,
+    lexicalTermMatched?: (normalizedTerm: string) => boolean
+  ): boolean {
+    const exactValue = this.normalizeText(rawTerm).trim();
+    if (!exactValue) return false;
+    if (itemText.includes(exactValue)) return true;
+    return lexicalTermMatched?.(normalizeSearchIndexText(rawTerm)) === true;
+  }
+
+  private evaluateTextExpression(
+    itemText: string,
+    node: QueryTextExpression,
+    lexicalTermMatched?: (normalizedTerm: string) => boolean
+  ): boolean {
     if (node.type === "TERM") {
-      const value = this.normalizeText(node.value || "").trim();
-      if (!value) return true;
-      return itemText.includes(value);
+      if (!node.value?.trim()) return true;
+      return this.textTermMatches(itemText, node.value, lexicalTermMatched);
     }
 
     if (node.type === "NOT") {
-      return !this.evaluateTextExpression(itemText, node.child);
+      return !this.evaluateTextExpression(itemText, node.child, lexicalTermMatched);
     }
 
     if (node.type === "AND") {
-      return node.children.every((child) => this.evaluateTextExpression(itemText, child));
+      return node.children.every((child) =>
+        this.evaluateTextExpression(itemText, child, lexicalTermMatched)
+      );
     }
 
-    return node.children.some((child) => this.evaluateTextExpression(itemText, child));
+    return node.children.some((child) =>
+      this.evaluateTextExpression(itemText, child, lexicalTermMatched)
+    );
   }
 
   private collectPositiveExpressionTerms(
@@ -514,20 +795,6 @@ export class ItemsController {
       this.collectPositiveExpressionTerms(child, isNegated, result);
     }
     return result;
-  }
-
-  private compareByRelevance(
-    a: RankedLiteEntry,
-    b: RankedLiteEntry,
-    sortOrder: LocalQuerySortOrder
-  ): number {
-    const direction = sortOrder === "asc" ? 1 : -1;
-    if (a.relevance !== b.relevance) {
-      return direction * (a.relevance - b.relevance);
-    }
-    const createdCompare = (b.item.createdAt || 0) - (a.item.createdAt || 0);
-    if (createdCompare !== 0) return createdCompare;
-    return a.item.id.localeCompare(b.item.id);
   }
 
   private toRankCursor(entry: RankedLiteEntry, queryHash: string): RankQueryCursor {
@@ -583,6 +850,8 @@ export class ItemsController {
     queryHash: string;
     afterCursor?: RankQueryCursor | null;
     lexicalScores: Map<string, number>;
+    lexicalMatchTerms?: string[];
+    lexicalMatchMasksById?: Map<string, number[]>;
     vectorScoresByIndex: Map<number, number>;
     includeDebug?: boolean;
   }): {
@@ -596,8 +865,18 @@ export class ItemsController {
   } {
     const RECENCY_TIE_BREAK_WEIGHT = 0.45;
     const hasPositiveTextTerms = args.flatPositiveTerms.length > 0;
+    const allowsPositiveFreeTextMatch =
+      args.hasTextConstraint &&
+      !!args.expression &&
+      expressionCanMatchWithoutPositiveTerm(args.expression);
     const hasLexicalScores = args.lexicalScores.size > 0;
     const needsTextEvaluation = args.hasTextConstraint || (args.useLexical && !hasLexicalScores);
+    const lexicalTermBits = new Map<string, { wordIndex: number; bit: number }>(
+      (args.lexicalMatchTerms || []).map((term, index) => [
+        term,
+        { wordIndex: Math.floor(index / 32), bit: 1 << (index % 32) },
+      ])
+    );
     const itemTextCache = new Map<string, string>();
     const now = Date.now();
     const maxLexicalScore = (() => {
@@ -650,14 +929,24 @@ export class ItemsController {
       if (needsTextEvaluation) {
         itemText = itemTextCache.get(item.id) || this.getItemSearchText(item);
         itemTextCache.set(item.id, itemText);
+        const lexicalMatchWords = args.lexicalMatchMasksById?.get(item.id) || [];
+        const lexicalTermMatched = (normalizedTerm: string) => {
+          const termPosition = lexicalTermBits.get(normalizedTerm);
+          return !!termPosition &&
+            ((lexicalMatchWords[termPosition.wordIndex] || 0) & termPosition.bit) !== 0;
+        };
 
         boolMatch = args.expression
           ? {
-              matches: this.evaluateTextExpression(itemText, args.expression),
+              matches: this.evaluateTextExpression(
+                itemText,
+                args.expression,
+                lexicalTermMatched
+              ),
               matchedTermCount: args.flatPositiveTerms.reduce((count, term) => {
-                const normalizedTerm = this.normalizeText(term).trim();
-                if (!normalizedTerm) return count;
-                return itemText.includes(normalizedTerm) ? count + 1 : count;
+                return this.textTermMatches(itemText, term, lexicalTermMatched)
+                  ? count + 1
+                  : count;
               }, 0),
             }
           : this.matchesBooleanTerms(itemText, args.groups, args.excludedTerms);
@@ -708,43 +997,37 @@ export class ItemsController {
     let filtered = ranked;
     if (args.hasTextConstraint) {
       filtered = ranked.filter((entry) => {
+        if (!entry.boolMatch.matches) return false;
+        if (allowsPositiveFreeTextMatch) return true;
         if (args.useVector && args.useLexical) {
-          if (!entry.boolMatch.matches) return false;
           if (hasPositiveTextTerms) {
             return entry.hasVectorHit || entry.hasLexicalHit;
           }
           return true;
         }
         if (args.useVector && !args.useLexical) {
-          if (!entry.boolMatch.matches) return false;
           return hasPositiveTextTerms ? entry.hasVectorHit : true;
         }
         if (args.useLexical) {
-          return entry.boolMatch.matches && entry.hasLexicalHit;
+          return entry.hasLexicalHit;
         }
-        return entry.boolMatch.matches;
+        return true;
       });
     }
     filtered = filtered.filter((entry) =>
-      shouldKeepHybridRankHit(entry, {
-        useLexical: args.useLexical,
-        useVector: args.useVector,
-        hasPositiveTextTerms,
-      })
+      allowsPositiveFreeTextMatch && entry.boolMatch.matches
+        ? true
+        : shouldKeepHybridRankHit(entry, {
+            useLexical: args.useLexical,
+            useVector: args.useVector,
+            hasPositiveTextTerms,
+          })
     );
 
     const compareEntries = (
       a: { item: RankableItem; relevance: number },
       b: { item: RankableItem; relevance: number }
-    ) => {
-      if (args.sortBy === "relevance") {
-        return this.compareByRelevance(a, b, args.sortOrder);
-      }
-      const fieldSortBy: Exclude<LocalQuerySortBy, "relevance"> = args.sortBy;
-      const byField = this.compareByField(a.item, b.item, fieldSortBy, args.sortOrder);
-      if (byField !== 0) return byField;
-      return this.compareByRelevance(a, b, "desc");
-    };
+    ) => compareRankedEntries(a, b, args.sortBy, args.sortOrder);
 
     filtered.sort(compareEntries);
 
@@ -772,7 +1055,9 @@ export class ItemsController {
             hasLexicalHit: false,
             hasVectorHit: false,
           };
-          return filtered.filter((entry) => compareEntries(entry, cursorComparable) > 0);
+          return filtered.filter((entry) =>
+            isRankedEntryAfterCursor(entry, cursorComparable, compareEntries)
+          );
         })()
       : filtered;
 
@@ -828,23 +1113,7 @@ export class ItemsController {
     sortBy: Exclude<LocalQuerySortBy, "relevance">,
     sortOrder: LocalQuerySortOrder
   ): number {
-    const direction = sortOrder === "asc" ? 1 : -1;
-
-    if (sortBy === "title") {
-      const compare = direction * (a.title || "").localeCompare(b.title || "");
-      if (compare !== 0) return compare;
-      return a.id.localeCompare(b.id);
-    }
-
-    if (sortBy === "source") {
-      const compare = direction * (a.source || "").localeCompare(b.source || "");
-      if (compare !== 0) return compare;
-      return a.id.localeCompare(b.id);
-    }
-
-    const aValue = sortBy === "updatedAt" ? a.updatedAt || 0 : a.createdAt || 0;
-    const bValue = sortBy === "updatedAt" ? b.updatedAt || 0 : b.createdAt || 0;
-    const compare = direction * (aValue - bValue);
+    const compare = compareRankField(a, b, sortBy, sortOrder);
     if (compare !== 0) return compare;
     return a.id.localeCompare(b.id);
   }
@@ -877,6 +1146,7 @@ export class ItemsController {
         const meta = metaMap[fresh.get("url") as string];
         const current = fresh.toMutableJSON() as ItemDocType;
         const forceRefresh = shouldForceRefreshItem(current.url);
+        const wasMetadataPending = current.isMetaFetched !== true;
 
         const patchData: Partial<ItemDocType> = {};
         if (!meta) {
@@ -935,6 +1205,17 @@ export class ItemsController {
           patchData.isMetaFetched = true;
         }
 
+        if (wasMetadataPending && current.isEmbedded) {
+          if (hasVectorReference(current)) {
+            patchData.isDirty = true;
+          } else {
+            patchData.vector_index = -1;
+            patchData.vector_indexes = [];
+            patchData.isEmbedded = false;
+            patchData.isDirty = false;
+          }
+        }
+
         try {
           await fresh.patch(patchData);
           break;
@@ -951,6 +1232,22 @@ export class ItemsController {
     this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
 
     return { updated: itemsToUpdate.length };
+  }
+
+  async getPendingMetadataUrls(payload?: { limit?: number }): Promise<{ urls: string[] }> {
+    const db = await getDb();
+    const limit = Math.max(1, Math.min(1000, Math.floor(Number(payload?.limit) || 500)));
+    const docs = await db.items
+      .find({ selector: { isMetaFetched: false, deletedAt: { $eq: 0 } }, limit })
+      .exec();
+    const urls = Array.from(
+      new Set(
+        docs
+          .map((doc) => (doc.get("url") as string | undefined) || "")
+          .filter((url) => isMetadataFetchableUrl(url))
+      )
+    );
+    return { urls };
   }
 
   private normalizeUrl(input: string): string | null {
@@ -986,7 +1283,9 @@ export class ItemsController {
     const requestedScope = payload.accessContext?.searchScope || "current";
     const privateUnlocked = spaceSessionService.isUnlocked(PRIVATE_SPACE_ID);
 
-    const spaceDocs = await db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec();
+    const spaceDocs = await db.spaces
+      .find({ selector: { isArchived: { $eq: false }, deletedAt: { $eq: 0 } } })
+      .exec();
     const spaces = spaceDocs.map((doc: any) => doc.toMutableJSON() as any);
     const allSpaceIds = spaces.map((space: any) => space.id as string);
     const nonPrivateSpaceIds = spaces
@@ -1015,23 +1314,6 @@ export class ItemsController {
     return [safeActiveSpaceId];
   }
 
-  private async resolveFolderSpaceId(
-    db: any,
-    folderId: string,
-    options?: { allowLockedPrivateWrite?: boolean }
-  ): Promise<string> {
-    const folderDoc = await db.folders.findOne(folderId).exec();
-    if (!folderDoc) {
-      throw new Error("FOLDER_NOT_FOUND");
-    }
-    const folderSpaceId = (folderDoc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID;
-    const bypassLockCheck = options?.allowLockedPrivateWrite === true && folderSpaceId === PRIVATE_SPACE_ID;
-    if (!bypassLockCheck) {
-      this.assertSpaceUnlocked(folderSpaceId);
-    }
-    return folderSpaceId;
-  }
-
   private folderMirrorKey(folder: Pick<FolderDocType, "name" | "type" | "isPinned" | "isLocked" | "isCollapsed">): string {
     return [
       (folder.name || "").trim().toLowerCase(),
@@ -1053,14 +1335,18 @@ export class ItemsController {
       return { updated: 0, createdFolders: 0 };
     }
 
-    const targetSpaceDoc = await db.spaces.findOne(targetSpaceId).exec();
-    if (!targetSpaceDoc) {
-      throw new Error("TARGET_SPACE_NOT_FOUND");
-    }
-    if (targetSpaceDoc.get("isArchived") === true) {
-      throw new Error("TARGET_SPACE_ARCHIVED");
-    }
+    const initialItemDocsById = await db.items.findByIds(itemIds).exec();
+    const initialSourceSpaceIds = itemIds
+      .map((id) => initialItemDocsById.get(id))
+      .filter((doc): doc is any => !!doc)
+      .map((doc) => (doc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID);
 
+    return withSpaceMutationLocks(
+      db,
+      [targetSpaceId, ...initialSourceSpaceIds],
+      async () => {
+    await requireLiveSpaceDestination(db, targetSpaceId);
+    this.assertSpaceUnlocked(targetSpaceId);
     const itemDocsById = await db.items.findByIds(itemIds).exec();
     const sourceItems = itemIds
       .map((id) => itemDocsById.get(id))
@@ -1072,6 +1358,9 @@ export class ItemsController {
     }
 
     for (const item of sourceItems) {
+      if (!initialSourceSpaceIds.includes(item.spaceId || PUBLIC_SPACE_ID)) {
+        throw new Error("SOURCE_ITEM_CHANGED");
+      }
       this.assertSpaceUnlocked(item.spaceId || PUBLIC_SPACE_ID);
     }
 
@@ -1080,6 +1369,11 @@ export class ItemsController {
     const sourceFoldersById = new Map<string, FolderDocType>();
     for (const [folderId, folderDoc] of sourceFolderDocs.entries()) {
       const folder = folderDoc.toMutableJSON() as FolderDocType;
+      await requireLiveFolderDestination(
+        db,
+        folderId,
+        folder.spaceId || PUBLIC_SPACE_ID
+      );
       this.assertSpaceUnlocked(folder.spaceId || PUBLIC_SPACE_ID);
       sourceFoldersById.set(folderId, folder);
     }
@@ -1089,6 +1383,7 @@ export class ItemsController {
     let maxSortOrder = 0;
     for (const doc of targetFolderDocs) {
       const folder = doc.toMutableJSON() as FolderDocType;
+      if (folder.deletedAt !== 0) continue;
       const sortOrder = folder.sortOrder ?? 0;
       if (sortOrder > maxSortOrder) maxSortOrder = sortOrder;
       const key = this.folderMirrorKey(folder);
@@ -1130,6 +1425,8 @@ export class ItemsController {
         isLocked: !!sourceFolder.isLocked,
         isPinned: !!sourceFolder.isPinned,
         isCollapsed: !!sourceFolder.isCollapsed,
+        deletedAt: 0,
+        purgeAt: 0,
         isDirty: false,
         serverVersion: 0,
         createdAt: sourceFolder.createdAt || now,
@@ -1210,8 +1507,19 @@ export class ItemsController {
       maxChunkOrderByFolderId.set(targetFolderId, nextOrder - 1);
     }
 
-    if (itemUpdates.length > 0) {
-      await db.items.bulkUpsert(itemUpdates);
+    let updatedItems = 0;
+    for (const update of itemUpdates) {
+      await withEntityMutationLock(db, "item", update.id, async () => {
+        const freshDoc = await db.items.findOne(update.id).exec();
+        if (!freshDoc || freshDoc.get("deletedAt") !== 0) return;
+        await freshDoc.incrementalPatch({
+          folderId: update.folderId,
+          spaceId: update.spaceId,
+          chunkOrder: update.chunkOrder,
+          updatedAt: update.updatedAt,
+        });
+        updatedItems += 1;
+      });
     }
 
     if (createdFolders > 0) {
@@ -1219,16 +1527,18 @@ export class ItemsController {
         chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
       } catch {}
     }
-    if (itemUpdates.length > 0) {
+    if (updatedItems > 0) {
       try {
         chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
       } catch {}
     }
 
-    return {
-      updated: itemUpdates.length,
-      createdFolders,
-    };
+        return {
+          updated: updatedItems,
+          createdFolders,
+        };
+      }
+    );
   }
 
   async copyToSpace(payload: {
@@ -1242,14 +1552,18 @@ export class ItemsController {
       return { copied: 0, createdFolders: 0 };
     }
 
-    const targetSpaceDoc = await db.spaces.findOne(targetSpaceId).exec();
-    if (!targetSpaceDoc) {
-      throw new Error("TARGET_SPACE_NOT_FOUND");
-    }
-    if (targetSpaceDoc.get("isArchived") === true) {
-      throw new Error("TARGET_SPACE_ARCHIVED");
-    }
+    const initialItemDocsById = await db.items.findByIds(itemIds).exec();
+    const initialSourceSpaceIds = itemIds
+      .map((id) => initialItemDocsById.get(id))
+      .filter((doc): doc is any => !!doc)
+      .map((doc) => (doc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID);
 
+    return withSpaceMutationLocks(
+      db,
+      [targetSpaceId, ...initialSourceSpaceIds],
+      async () => {
+    await requireLiveSpaceDestination(db, targetSpaceId);
+    this.assertSpaceUnlocked(targetSpaceId);
     const itemDocsById = await db.items.findByIds(itemIds).exec();
     const sourceItems = itemIds
       .map((id) => itemDocsById.get(id))
@@ -1261,6 +1575,9 @@ export class ItemsController {
     }
 
     for (const item of sourceItems) {
+      if (!initialSourceSpaceIds.includes(item.spaceId || PUBLIC_SPACE_ID)) {
+        throw new Error("SOURCE_ITEM_CHANGED");
+      }
       this.assertSpaceUnlocked(item.spaceId || PUBLIC_SPACE_ID);
     }
 
@@ -1269,6 +1586,11 @@ export class ItemsController {
     const sourceFoldersById = new Map<string, FolderDocType>();
     for (const [folderId, folderDoc] of sourceFolderDocs.entries()) {
       const folder = folderDoc.toMutableJSON() as FolderDocType;
+      await requireLiveFolderDestination(
+        db,
+        folderId,
+        folder.spaceId || PUBLIC_SPACE_ID
+      );
       this.assertSpaceUnlocked(folder.spaceId || PUBLIC_SPACE_ID);
       sourceFoldersById.set(folderId, folder);
     }
@@ -1278,6 +1600,7 @@ export class ItemsController {
     let maxSortOrder = 0;
     for (const doc of targetFolderDocs) {
       const folder = doc.toMutableJSON() as FolderDocType;
+      if (folder.deletedAt !== 0) continue;
       const sortOrder = folder.sortOrder ?? 0;
       if (sortOrder > maxSortOrder) maxSortOrder = sortOrder;
       const key = this.folderMirrorKey(folder);
@@ -1319,6 +1642,8 @@ export class ItemsController {
         isLocked: !!sourceFolder.isLocked,
         isPinned: !!sourceFolder.isPinned,
         isCollapsed: !!sourceFolder.isCollapsed,
+        deletedAt: 0,
+        purgeAt: 0,
         isDirty: false,
         serverVersion: 0,
         createdAt: sourceFolder.createdAt || now,
@@ -1367,44 +1692,60 @@ export class ItemsController {
     }
 
     const itemClones: ItemDocType[] = [];
-    for (const [sourceFolderId, folderItems] of itemsBySourceFolder.entries()) {
-      const targetFolderId = sourceToTargetFolderId.get(sourceFolderId);
-      if (!targetFolderId) continue;
+    const cloneIds: string[] = [];
+    try {
+      await withOpfsMutationLock(async () => {
+        for (const [sourceFolderId, folderItems] of itemsBySourceFolder.entries()) {
+          const targetFolderId = sourceToTargetFolderId.get(sourceFolderId);
+          if (!targetFolderId) continue;
 
-      const ordered = [...folderItems].sort((a, b) => {
-        const ao = a.chunkOrder ?? Number.MAX_SAFE_INTEGER;
-        const bo = b.chunkOrder ?? Number.MAX_SAFE_INTEGER;
-        if (ao !== bo) return ao - bo;
-        return a.createdAt - b.createdAt;
+          const ordered = [...folderItems].sort((a, b) => {
+            const ao = a.chunkOrder ?? Number.MAX_SAFE_INTEGER;
+            const bo = b.chunkOrder ?? Number.MAX_SAFE_INTEGER;
+            if (ao !== bo) return ao - bo;
+            return a.createdAt - b.createdAt;
+          });
+
+          let nextOrder = (maxChunkOrderByFolderId.get(targetFolderId) ?? -1) + 1;
+          for (const item of ordered) {
+            const cloneId = uuidv4();
+            cloneIds.push(cloneId);
+            const cloneMedia =
+              this.options.cloneOpfsMediaEntriesForItem || cloneOpfsMediaEntriesForItem;
+            const clonedMedia = await cloneMedia(item.media, cloneId);
+            itemClones.push({
+              ...item,
+              id: cloneId,
+              userId: this.normalizeUserId(item.userId),
+              folderId: targetFolderId,
+              spaceId: targetSpaceId,
+              chunkOrder: nextOrder,
+              media: clonedMedia.media,
+              displayImageUrl:
+                clonedMedia.pathMap.get(item.displayImageUrl || "") || item.displayImageUrl,
+              vector_index: -1,
+              vector_indexes: [],
+              isEmbedded: false,
+              isDirty: true,
+              serverVersion: 0,
+              createdAt: now,
+              updatedAt: now,
+            });
+            nextOrder += 1;
+          }
+          maxChunkOrderByFolderId.set(targetFolderId, nextOrder - 1);
+        }
+
+        if (itemClones.length > 0) {
+          const insertResult = await db.items.bulkInsert(itemClones);
+          if (insertResult.error.length > 0) {
+            throw new Error(`Failed to copy ${insertResult.error.length} items.`);
+          }
+        }
       });
-
-      let nextOrder = (maxChunkOrderByFolderId.get(targetFolderId) ?? -1) + 1;
-      for (const item of ordered) {
-        itemClones.push({
-          ...item,
-          id: uuidv4(),
-          userId: this.normalizeUserId(item.userId),
-          folderId: targetFolderId,
-          spaceId: targetSpaceId,
-          chunkOrder: nextOrder,
-          vector_index: -1,
-          vector_indexes: [],
-          isEmbedded: false,
-          isDirty: true,
-          serverVersion: 0,
-          createdAt: now,
-          updatedAt: now,
-        });
-        nextOrder += 1;
-      }
-      maxChunkOrderByFolderId.set(targetFolderId, nextOrder - 1);
-    }
-
-    if (itemClones.length > 0) {
-      const insertResult = await db.items.bulkInsert(itemClones);
-      if (insertResult.error.length > 0) {
-        throw new Error(`Failed to copy ${insertResult.error.length} items.`);
-      }
+    } catch (error) {
+      await deleteUnreferencedOpfsItemDirectories(db, cloneIds).catch(() => {});
+      throw error;
     }
 
     if (createdFolders > 0) {
@@ -1418,13 +1759,55 @@ export class ItemsController {
       } catch {}
     }
 
-    return {
-      copied: itemClones.length,
-      createdFolders,
-    };
+        return {
+          copied: itemClones.length,
+          createdFolders,
+        };
+      }
+    );
   }
 
   async queryLocal(payload: LocalQueryPayload): Promise<LocalQueryResponse> {
+    // Search requests race while the user types. Stop an older cooperative
+    // lexical/vector scan immediately instead of letting it retain index pages,
+    // vectors, and CPU in the offscreen document until completion.
+    const searchGeneration = this.beginSearchGeneration(payload.searchClientId);
+    const searchSignal = this.getSearchSignal(searchGeneration);
+
+    let vectorQueryLease: VectorQueryLease | null = null;
+    try {
+      const requestedChannels = resolveEffectiveQueryChannels({
+        requested: {
+          keyword: payload.useKeyword !== false,
+          fuzzy: payload.useFuzzy === true,
+          vector: payload.useVector === true,
+        },
+        query: this.resolveVectorQueryText(payload),
+        vectorMinChars: VECTOR_QUERY_MIN_CHARS,
+      });
+      if (requestedChannels.vector) {
+        vectorQueryLease = await this.vectorStore.acquireQueryLease(searchSignal);
+        this.assertSearchGeneration(searchGeneration);
+      }
+      return await this.queryLocalWithVectorLease(
+        payload,
+        searchGeneration,
+        searchSignal,
+        vectorQueryLease
+      );
+    } finally {
+      vectorQueryLease?.release();
+      this.finishSearchGeneration(searchGeneration);
+    }
+  }
+
+  private async queryLocalWithVectorLease(
+    payload: LocalQueryPayload,
+    searchGeneration: number,
+    searchSignal: AbortSignal,
+    vectorQueryLease: VectorQueryLease | null
+  ): Promise<LocalQueryResponse> {
+
     const now = () =>
       typeof performance !== "undefined" && typeof performance.now === "function"
         ? performance.now()
@@ -1455,15 +1838,23 @@ export class ItemsController {
       ? Array.from(new Set(this.collectPositiveExpressionTerms(expression)))
       : [];
     const flatPositiveTerms = Array.from(
-      new Set(expressionPositiveTerms.length > 0 ? expressionPositiveTerms : normalizedGroups.flat())
+      new Set(expression ? expressionPositiveTerms : normalizedGroups.flat())
     );
-    const useKeyword = payload.useKeyword !== false;
-    const useFuzzy = payload.useFuzzy === true;
-    const useLexical = useKeyword || useFuzzy;
-    const useVectorRequested = payload.useVector === true;
     const includeDebug = payload.debug === true;
-    const vectorQuery = flatPositiveTerms.length > 0 ? flatPositiveTerms.join(" ") : query;
-    const useVector = useVectorRequested && vectorQuery.trim().length >= VECTOR_QUERY_MIN_CHARS;
+    const vectorQuery = this.resolveVectorQueryText(payload);
+    const effectiveChannels = resolveEffectiveQueryChannels({
+      requested: {
+        keyword: payload.useKeyword !== false,
+        fuzzy: payload.useFuzzy === true,
+        vector: payload.useVector === true,
+      },
+      query: vectorQuery,
+      vectorMinChars: VECTOR_QUERY_MIN_CHARS,
+    });
+    const useKeyword = effectiveChannels.keyword;
+    const useFuzzy = effectiveChannels.fuzzy;
+    const useLexical = useKeyword || useFuzzy;
+    const useVector = effectiveChannels.vector;
     const filters = payload.filters || {};
     const baseAllowedSpaceIds = await this.resolveAllowedSpaceIds(db, payload);
     const includeSpaceFilters = Array.from(new Set((filters.spaceIds || []).filter(Boolean)));
@@ -1475,6 +1866,7 @@ export class ItemsController {
       allowedSpaceIds = allowedSpaceIds.filter((spaceId) => !excludeSpaceFilters.has(spaceId));
     }
     allowedSpaceIds = Array.from(new Set(allowedSpaceIds));
+    this.assertSearchGeneration(searchGeneration);
 
     const sortBy: LocalQuerySortBy =
       payload.sort?.by || (flatPositiveTerms.length > 0 || query.length > 0 ? "relevance" : "createdAt");
@@ -1510,6 +1902,7 @@ export class ItemsController {
       rawAfterCursor && rawAfterCursor.queryHash === queryHash ? rawAfterCursor : null;
 
     if (allowedSpaceIds.length === 0) {
+      this.assertSearchGeneration(searchGeneration);
       return {
         items: [],
         total: 0,
@@ -1597,29 +1990,111 @@ export class ItemsController {
     const lexicalQueries = flatPositiveTerms.length > 0 ? flatPositiveTerms : [lexicalQuery];
 
     let lexicalScores = new Map<string, number>();
+    let lexicalMatchTerms: string[] = [];
+    let lexicalMatchMasksById = new Map<string, number[]>();
+    let preloadedScopedCandidates: CandidateLite[] | null = null;
+    let preloadedScopedCandidatesComplete = false;
     if (useLexical && lexicalQuery) {
       const lexicalStartedAt = now();
+      const lexicalAbortController = this.startLexicalSearchPhase(searchGeneration);
       try {
-        lexicalScores = await this.withTimeout(
-          localSearchIndexService.search({
-            query: lexicalQuery,
-            queries: lexicalQueries,
-            limit: lexicalScoreLimit,
-            keyword: useKeyword,
-            fuzzy: useFuzzy,
-          }),
+        const searchRequest = {
+          query: lexicalQuery,
+          queries: lexicalQueries,
+          limit: lexicalScoreLimit,
+          keyword: useKeyword,
+          fuzzy: useFuzzy,
+          trackTermMatches: !!expression,
+          signal: lexicalAbortController.signal,
+        };
+        const initialTimeoutMessage =
+          `Lexical search timed out after ${LEXICAL_SEARCH_TIMEOUT_MS}ms.`;
+        const initialSearch = await this.withTimeout(
+          localSearchIndexService.searchWithStatus(searchRequest),
           LEXICAL_SEARCH_TIMEOUT_MS,
-          `Lexical search timed out after ${LEXICAL_SEARCH_TIMEOUT_MS}ms.`
+          initialTimeoutMessage,
+          () => lexicalAbortController.abort(new Error(initialTimeoutMessage))
         );
+        lexicalScores = initialSearch.scores;
+        lexicalMatchTerms = initialSearch.terms;
+        lexicalMatchMasksById = initialSearch.termMatchMasksById;
+
+        if (initialSearch.saturated) {
+          // FlexSearch's limit is global. When it fills, valid hits from a
+          // selected space/folder can sit beyond the cut and must not be
+          // discarded before the database scope is applied. Project the
+          // scoped rows once, then page the index until that bounded ID set is
+          // complete enough for ranking.
+          // Release the capped global maps before materializing the scoped ID
+          // set and its replacement score map; large result sets must not
+          // overlap at peak memory.
+          initialSearch.scores.clear();
+          initialSearch.termMatchMasksById.clear();
+          lexicalScores = new Map();
+          lexicalMatchTerms = [];
+          lexicalMatchMasksById = new Map();
+          const scopeStartedAt = now();
+          preloadedScopedCandidates = [];
+          const allowedIds = new Set<string>();
+          const scopeTimeoutMessage =
+            `Scoped candidate loading timed out after ${LEXICAL_SEARCH_TIMEOUT_MS}ms.`;
+          try {
+            await this.withTimeout(
+              forEachIdKeysetPage({
+                collection: db.items as any,
+                selector,
+                pageSize: SCOPED_CANDIDATE_PAGE_SIZE,
+                signal: lexicalAbortController.signal,
+                onPage: (scopedDocs: any[]) => {
+                  for (const doc of scopedDocs) {
+                    const candidate = this.toCandidateLite(doc);
+                    if (!candidate.id) continue;
+                    preloadedScopedCandidates?.push(candidate);
+                    allowedIds.add(candidate.id);
+                  }
+                },
+              }),
+              LEXICAL_SEARCH_TIMEOUT_MS,
+              scopeTimeoutMessage,
+              () => lexicalAbortController.abort(new Error(scopeTimeoutMessage))
+            );
+            preloadedScopedCandidatesComplete = true;
+          } finally {
+            selectorMs += now() - scopeStartedAt;
+          }
+
+          const scopedTimeoutMessage =
+            `Scoped lexical search timed out after ${LEXICAL_SEARCH_TIMEOUT_MS}ms.`;
+          const scopedSearch = await this.withTimeout(
+            localSearchIndexService.searchWithStatus({ ...searchRequest, allowedIds }),
+            LEXICAL_SEARCH_TIMEOUT_MS,
+            scopedTimeoutMessage,
+            () => lexicalAbortController.abort(new Error(scopedTimeoutMessage))
+          );
+          lexicalScores = scopedSearch.scores;
+          lexicalMatchTerms = scopedSearch.terms;
+          lexicalMatchMasksById = scopedSearch.termMatchMasksById;
+        }
       } catch (error) {
+        if (!preloadedScopedCandidatesComplete) {
+          preloadedScopedCandidates = null;
+        }
+        if (error instanceof Error && error.message === RANK_REQUEST_SUPERSEDED) {
+          throw new SupersededRankRequestError();
+        }
         console.error("FlexSearch query failed in queryLocal:", error);
       } finally {
+        this.finishLexicalSearchPhase(searchGeneration, lexicalAbortController);
         lexicalMs = now() - lexicalStartedAt;
       }
     }
 
     const useLexicalFirstSelector =
-      useLexical && !useVector && lexicalQuery.length > 0 && lexicalScores.size > 0;
+      useLexical &&
+      !useVector &&
+      lexicalQuery.length > 0 &&
+      lexicalScores.size > 0 &&
+      canNarrowExpressionToPositiveMatches(expression);
     if (useLexicalFirstSelector) {
       selector.id = { $in: Array.from(lexicalScores.keys()) };
     }
@@ -1665,6 +2140,7 @@ export class ItemsController {
       const items = pageDocs.map((doc) => doc.toMutableJSON() as ItemDocType);
       hydrateMs = now() - hydrateStartedAt;
       const lastItem = items[items.length - 1];
+      this.assertSearchGeneration(searchGeneration);
       return {
         items,
         total: pageResult.total,
@@ -1712,26 +2188,39 @@ export class ItemsController {
 
     const selectorStartedAt = now();
     let candidates: CandidateLite[] = [];
-    {
+    if (preloadedScopedCandidates) {
+      candidates = useLexicalFirstSelector
+        ? preloadedScopedCandidates.filter((candidate) => lexicalScores.has(candidate.id))
+        : preloadedScopedCandidates;
+    } else {
       // Project in-scope items to lightweight candidates and release the heavy
       // RxDocuments immediately. Retaining every in-scope document (with its
       // full text) for the whole query is what made large libraries memory-heavy;
       // the ranker only needs the lite projection, plus the text of the bounded
       // ranking set for text queries (fetched on demand below).
-      const docs = await db.items.find({ selector }).exec();
-      for (const doc of docs) {
-        const candidate = this.toCandidateLite(doc);
-        if (!candidate.id) continue;
-        candidates.push(candidate);
-      }
+      await forEachIdKeysetPage({
+        collection: db.items as any,
+        selector,
+        pageSize: SCOPED_CANDIDATE_PAGE_SIZE,
+        signal: searchSignal,
+        onPage: (docs: any[]) => {
+          for (const doc of docs) {
+            const candidate = this.toCandidateLite(doc);
+            if (!candidate.id) continue;
+            candidates.push(candidate);
+          }
+        },
+      });
     }
-    selectorMs = now() - selectorStartedAt;
+    selectorMs += now() - selectorStartedAt;
 
     const hydrateFromDocMap = async (itemIds: string[]): Promise<ItemDocType[]> => {
       if (itemIds.length === 0) return [];
+      this.assertSearchGeneration(searchGeneration);
       // Hydrate only the requested ids (the final page or a sort page) instead
       // of reading from a retained full-document map.
       const byId = await db.items.findByIds(itemIds).exec();
+      this.assertSearchGeneration(searchGeneration);
       const itemById = new Map<string, ItemDocType>();
       for (const id of itemIds) {
         const doc = byId.get(id);
@@ -1807,6 +2296,7 @@ export class ItemsController {
       .filter(Boolean);
 
     let tagIds = requestedTagIds;
+    let hasUnresolvedIncludedTag = false;
     const needsTagNameLookup = requestedTagNames.length > 0 || excludedTagNames.length > 0;
     let allTags: any[] = [];
     if (needsTagNameLookup) {
@@ -1814,11 +2304,16 @@ export class ItemsController {
     }
 
     if (requestedTagNames.length > 0) {
-      const requestedSet = new Set(requestedTagNames);
-      const idsByName = allTags
-        .filter((tag) => requestedSet.has((tag.get("name") as string).toLowerCase()))
-        .map((tag) => tag.get("id") as string);
-      tagIds = Array.from(new Set([...tagIds, ...idsByName]));
+      const resolution = resolveIncludedTagIds({
+        requestedIds: tagIds,
+        requestedNames: requestedTagNames,
+        tags: allTags.map((tag) => ({
+          id: (tag.get("id") as string | undefined) || "",
+          name: (tag.get("name") as string | undefined) || "",
+        })),
+      });
+      tagIds = resolution.tagIds;
+      hasUnresolvedIncludedTag = resolution.hasUnresolvedName;
     }
 
     let excludedTagIds: string[] = [];
@@ -1829,7 +2324,9 @@ export class ItemsController {
         .map((tag) => tag.get("id") as string);
     }
 
-    if (tagIds.length > 0) {
+    if (hasUnresolvedIncludedTag) {
+      candidates = [];
+    } else if (tagIds.length > 0) {
       const uniqueTagIds = Array.from(new Set(tagIds));
       const joins = await db.item_tags.find({ selector: { tagId: { $in: uniqueTagIds } } }).exec();
       const tagsByItemId = new Map<string, Set<string>>();
@@ -1860,6 +2357,7 @@ export class ItemsController {
     filterMs = now() - filterStartedAt;
 
     if (candidates.length === 0) {
+      this.assertSearchGeneration(searchGeneration);
       return {
         items: [],
         total: 0,
@@ -1898,12 +2396,16 @@ export class ItemsController {
 
     if (lexicalScores.size > 0) {
       const filteredLexicalScores = new Map<string, number>();
+      const filteredLexicalMatchMasks = new Map<string, number[]>();
       for (const [id, score] of lexicalScores.entries()) {
         if (candidateIdSet.has(id)) {
           filteredLexicalScores.set(id, score);
+          const matchMask = lexicalMatchMasksById.get(id);
+          if (matchMask) filteredLexicalMatchMasks.set(id, matchMask);
         }
       }
       lexicalScores = filteredLexicalScores;
+      lexicalMatchMasksById = filteredLexicalMatchMasks;
     }
 
     const effectiveHasTextConstraint =
@@ -1925,6 +2427,8 @@ export class ItemsController {
       const candidateIndices = allCandidateIndices;
 
       if (candidateIndices.length > 0) {
+        const vectorAbortController = this.startVectorSearchPhase(searchGeneration);
+        const timeoutMessage = `Vector search timed out after ${VECTOR_SEARCH_TIMEOUT_MS}ms.`;
         try {
           const requestedTopK = Math.max(
             1,
@@ -1934,13 +2438,15 @@ export class ItemsController {
             )
           );
           const vectorSearch = await this.withTimeout(
-            vectorStoreService.search({
+            vectorQueryLease!.search({
               query: vectorQuery,
               topK: requestedTopK,
               candidateIndices,
+              signal: vectorAbortController.signal,
             }),
             VECTOR_SEARCH_TIMEOUT_MS,
-            `Vector search timed out after ${VECTOR_SEARCH_TIMEOUT_MS}ms.`
+            timeoutMessage,
+            () => vectorAbortController.abort(new Error(timeoutMessage))
           );
           vectorEmbedMs = vectorSearch.timings.embeddingMs;
           vectorScanMs = vectorSearch.timings.scanMs;
@@ -1970,12 +2476,21 @@ export class ItemsController {
             });
           }
         } catch (error) {
+          if (error instanceof Error && error.message === RANK_REQUEST_SUPERSEDED) {
+            throw new SupersededRankRequestError();
+          }
           vectorError = error instanceof Error ? error.message : "Vector search failed";
           console.error("Vector search failed in queryLocal:", error);
+        } finally {
+          this.finishVectorSearchPhase(searchGeneration, vectorAbortController);
         }
       }
       vectorMs = now() - vectorStartedAt;
     }
+    // Candidate rows and their vector indexes are now paired with the vector
+    // file read from the same maintenance generation. Ranking no longer needs
+    // to delay compaction.
+    vectorQueryLease?.release();
 
     const canUseSimpleFieldSortPath =
       !effectiveHasTextConstraint && !useVector && sortBy !== "relevance";
@@ -2023,6 +2538,7 @@ export class ItemsController {
               source: pagedSlice[pagedSlice.length - 1].source,
             } as RankQueryCursor)
           : null;
+      this.assertSearchGeneration(searchGeneration);
       return {
         items,
         total,
@@ -2088,26 +2604,7 @@ export class ItemsController {
 
     const needsTextForRanking =
       effectiveHasTextConstraint || (useLexical && lexicalScores.size === 0);
-    // Text is only used for boolean/expression evaluation and the lexical
-    // fallback. Fetch it for the bounded ranking set on demand rather than
-    // holding every in-scope document in memory for the whole query.
-    const rankingTextById = new Map<string, { textContent: string; ocrText: string }>();
-    if (needsTextForRanking && itemsForRanking.length > 0) {
-      const textDocs = await db.items.findByIds(itemsForRanking.map((item) => item.id)).exec();
-      for (const [id, doc] of textDocs) {
-        rankingTextById.set(id, {
-          textContent: (doc.get("textContent") as string | undefined) || "",
-          ocrText: (doc.get("ocrText") as string | undefined) || "",
-        });
-      }
-    }
-    const rankableItems = itemsForRanking.map((item) => {
-      const text = rankingTextById.get(item.id);
-      const textContent = needsTextForRanking ? text?.textContent || "" : "";
-      const ocrText = needsTextForRanking ? text?.ocrText || "" : "";
-      return this.toRankableItem(item, textContent, ocrText);
-    });
-    rankInputCount = rankableItems.length;
+    rankInputCount = itemsForRanking.length;
 
     let rankedItemIds: string[] = [];
     let rankTotal = 0;
@@ -2116,82 +2613,196 @@ export class ItemsController {
     let rankHasMore = false;
     let rankNextCursor: RankQueryCursor | null = null;
     let rankDebugScores: QueryDebugPayload["perItem"] | undefined;
+    let rankRetainedPeakCount = 0;
+    let rankHydrationBatchSize = 0;
 
-    const rankStartedAt = now();
-    try {
-      const rankResult = await queryRankerService.rank({
-        items: rankableItems,
-        expression,
-        groups: normalizedGroups,
-        excludedTerms,
-        flatPositiveTerms,
-        hasTextConstraint: effectiveHasTextConstraint,
-        useLexical,
-        useVector,
-        sortBy,
-        sortOrder,
-        page,
-        limit,
-        queryHash,
-        afterCursor,
-        lexicalScores: Array.from(lexicalScores.entries()),
-        vectorScoresByIndex: Array.from(vectorScoresByIndex.entries()),
-        includeDebug,
-      });
+    const acceptRankResult = (result: {
+      itemIds: string[];
+      total: number;
+      vectorHits: number;
+      lexicalHits: number;
+      hasMore: boolean;
+      nextCursor?: RankQueryCursor | null;
+      debugScores?: QueryDebugPayload["perItem"];
+    }) => {
+      rankedItemIds = result.itemIds;
+      rankTotal = result.total;
+      rankVectorHits = result.vectorHits;
+      rankLexicalHits = result.lexicalHits;
+      rankHasMore = result.hasMore;
+      rankNextCursor = result.nextCursor || null;
+      rankDebugScores = result.debugScores;
+    };
 
-      rankedItemIds = rankResult.itemIds;
-      rankTotal = rankResult.total;
-      rankVectorHits = rankResult.vectorHits;
-      rankLexicalHits = rankResult.lexicalHits;
-      rankHasMore = rankResult.hasMore;
-      rankNextCursor = rankResult.nextCursor || null;
-      rankDebugScores = rankResult.debugScores;
-    } catch (error) {
-      if (
-        error instanceof SupersededRankRequestError ||
-        error instanceof Error &&
-        (error.message === RANK_REQUEST_SUPERSEDED || error.name === RANK_REQUEST_SUPERSEDED)
-      ) {
-        this.rankTelemetry.supersededCount += 1;
+    if (shouldStreamRankCandidates(itemsForRanking.length)) {
+      // Negative-only/AST searches cannot be safely pruned to lexical hits: a
+      // query such as `NOT foo` may need to inspect the entire library. Hydrate
+      // those rows in small batches and retain only the requested rank window.
+      const rankStartedAt = now();
+      try {
+        const streamed = await streamRankCandidates({
+          candidates: itemsForRanking,
+          batchSize: STREAMING_RANK_HYDRATION_BATCH_SIZE,
+          assertActive: () => this.assertSearchGeneration(searchGeneration),
+          rank: {
+            expression,
+            groups: normalizedGroups,
+            excludedTerms,
+            flatPositiveTerms,
+            hasTextConstraint: effectiveHasTextConstraint,
+            useLexical,
+            useVector,
+            sortBy,
+            sortOrder,
+            page,
+            limit,
+            queryHash,
+            afterCursor,
+            lexicalScores,
+            lexicalMatchTerms,
+            lexicalMatchMasksById,
+            vectorScoresByIndex,
+            includeDebug,
+          },
+          hydrateBatch: async (batch) => {
+            let textDocs: Map<string, any> | null = null;
+            if (needsTextForRanking && batch.length > 0) {
+              const textHydrateStartedAt = now();
+              this.assertSearchGeneration(searchGeneration);
+              textDocs = await db.items.findByIds(batch.map((item) => item.id)).exec();
+              this.assertSearchGeneration(searchGeneration);
+              hydrateMs += now() - textHydrateStartedAt;
+            }
+            return batch.map((item) => {
+              const doc = textDocs?.get(item.id);
+              return this.toRankableItem(
+                item,
+                needsTextForRanking
+                  ? (doc?.get("textContent") as string | undefined) || ""
+                  : "",
+                needsTextForRanking
+                  ? (doc?.get("ocrText") as string | undefined) || ""
+                  : ""
+              );
+            });
+          },
+        });
+        acceptRankResult(streamed);
+        rankRetainedPeakCount = streamed.stats.peakResidentRankItemCount;
+        rankHydrationBatchSize = streamed.stats.peakBatchInputCount;
+      } catch (error) {
+        if (
+          error instanceof SupersededRankRequestError ||
+          error instanceof Error &&
+          (error.message === RANK_REQUEST_SUPERSEDED || error.name === RANK_REQUEST_SUPERSEDED)
+        ) {
+          this.rankTelemetry.supersededCount += 1;
+        }
         throw error;
+      } finally {
+        rankMs = now() - rankStartedAt;
       }
-      console.warn("[ItemsController] Query rank worker failed, using local fallback.", error);
-      this.rankTelemetry.fallbackCount += 1;
-      const fallback = this.rankLocally({
-        items: rankableItems,
-        expression,
-        groups: normalizedGroups,
-        excludedTerms,
-        flatPositiveTerms,
-        hasTextConstraint: effectiveHasTextConstraint,
-        useLexical,
-        useVector,
-        sortBy,
-        sortOrder,
-        page,
-        limit,
-        queryHash,
-        afterCursor,
-        lexicalScores,
-        vectorScoresByIndex,
-        includeDebug,
+    } else {
+      // Keep the worker path for small result sets. It isolates ranking CPU and
+      // its structured-clone cost is bounded by shouldStreamRankCandidates().
+      const rankingTextById = new Map<string, { textContent: string; ocrText: string }>();
+      if (needsTextForRanking && itemsForRanking.length > 0) {
+        const textHydrateStartedAt = now();
+        this.assertSearchGeneration(searchGeneration);
+        const textDocs = await db.items.findByIds(itemsForRanking.map((item) => item.id)).exec();
+        this.assertSearchGeneration(searchGeneration);
+        for (const [id, doc] of textDocs) {
+          rankingTextById.set(id, {
+            textContent: (doc.get("textContent") as string | undefined) || "",
+            ocrText: (doc.get("ocrText") as string | undefined) || "",
+          });
+        }
+        hydrateMs += now() - textHydrateStartedAt;
+      }
+      const rankableItems = itemsForRanking.map((item) => {
+        const text = rankingTextById.get(item.id);
+        return this.toRankableItem(
+          item,
+          needsTextForRanking ? text?.textContent || "" : "",
+          needsTextForRanking ? text?.ocrText || "" : ""
+        );
       });
+      rankRetainedPeakCount = rankableItems.length;
+      rankHydrationBatchSize = rankableItems.length;
 
-      rankedItemIds = fallback.itemIds;
-      rankTotal = fallback.total;
-      rankVectorHits = fallback.vectorHits;
-      rankLexicalHits = fallback.lexicalHits;
-      rankHasMore = fallback.hasMore;
-      rankNextCursor = fallback.nextCursor || null;
-      rankDebugScores = fallback.debugScores;
-    } finally {
-      rankMs = now() - rankStartedAt;
+      const rankStartedAt = now();
+      try {
+        this.assertSearchGeneration(searchGeneration);
+        const rankResult = await queryRankerService.rank({
+          items: rankableItems,
+          expression,
+          groups: normalizedGroups,
+          excludedTerms,
+          flatPositiveTerms,
+          hasTextConstraint: effectiveHasTextConstraint,
+          useLexical,
+          useVector,
+          sortBy,
+          sortOrder,
+          page,
+          limit,
+          queryHash,
+          afterCursor,
+          lexicalScores: Array.from(lexicalScores.entries()),
+          lexicalMatchTerms,
+          lexicalMatchMasksById: Array.from(lexicalMatchMasksById.entries()),
+          vectorScoresByIndex: Array.from(vectorScoresByIndex.entries()),
+          includeDebug,
+        }, this.getSearchClientId(searchGeneration), searchSignal);
+        acceptRankResult(rankResult);
+      } catch (error) {
+        if (
+          error instanceof SupersededRankRequestError ||
+          error instanceof Error &&
+          (error.message === RANK_REQUEST_SUPERSEDED || error.name === RANK_REQUEST_SUPERSEDED)
+        ) {
+          this.rankTelemetry.supersededCount += 1;
+          throw error;
+        }
+        // Overload is intentionally not converted into main-thread ranking:
+        // doing so would bypass the worker/queue caps precisely when many tabs
+        // are already competing for memory and CPU.
+        if (error instanceof RankWorkerCapacityError) {
+          throw error;
+        }
+        console.warn("[ItemsController] Query rank worker failed, using local fallback.", error);
+        this.rankTelemetry.fallbackCount += 1;
+        acceptRankResult(this.rankLocally({
+          items: rankableItems,
+          expression,
+          groups: normalizedGroups,
+          excludedTerms,
+          flatPositiveTerms,
+          hasTextConstraint: effectiveHasTextConstraint,
+          useLexical,
+          useVector,
+          sortBy,
+          sortOrder,
+          page,
+          limit,
+          queryHash,
+          afterCursor,
+          lexicalScores,
+          lexicalMatchTerms,
+          lexicalMatchMasksById,
+          vectorScoresByIndex,
+          includeDebug,
+        }));
+      } finally {
+        rankMs = now() - rankStartedAt;
+      }
     }
 
     const hydrateStartedAt = now();
     const rankedItems = await hydrateFromDocMap(rankedItemIds);
-    hydrateMs = now() - hydrateStartedAt;
+    hydrateMs += now() - hydrateStartedAt;
 
+    this.assertSearchGeneration(searchGeneration);
     return {
       items: rankedItems,
       total: rankTotal,
@@ -2209,6 +2820,8 @@ export class ItemsController {
         queryHash,
         candidateCount: candidates.length,
         rankInputCount,
+        rankRetainedPeakCount,
+        rankHydrationBatchSize,
         usedSimpleSortPath,
         scoreBudget,
         supersededCount: this.rankTelemetry.supersededCount,
@@ -2310,13 +2923,14 @@ export class ItemsController {
     const now = Date.now();
     const createdAt = payload.createdAt ?? now;
     const updatedAt = payload.updatedAt ?? createdAt;
-    const folderSpaceId = await this.resolveFolderSpaceId(db, payload.folderId, {
-      allowLockedPrivateWrite: payload.allowLockedPrivateWrite === true,
-    });
     const normalizedUrl = this.normalizeUrl(payload.url);
     if (!normalizedUrl) {
       throw new Error("INVALID_URL");
     }
+    return withLiveFolderDestination(db, payload.folderId, async ({ spaceId: folderSpaceId }) => {
+      const bypassLockCheck =
+        payload.allowLockedPrivateWrite === true && folderSpaceId === PRIVATE_SPACE_ID;
+      if (!bypassLockCheck) this.assertSpaceUnlocked(folderSpaceId);
 
     // Cap a single tab group at 500 tabs so groups stay performant. Pagination
     // handles display; this prevents unbounded manual growth.
@@ -2400,7 +3014,8 @@ export class ItemsController {
         } catch {}
       }
     }
-    return item as ItemDocType;
+      return item as ItemDocType;
+    });
   }
 
   async addMany(payload: { items: ItemDocType[] }): Promise<{ inserted: number }> {
@@ -2419,9 +3034,17 @@ export class ItemsController {
         (folderDoc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID
       );
     }
+    if (folderSpaceById.size !== folderIds.length) {
+      throw new Error("DESTINATION_FOLDER_NOT_FOUND");
+    }
+    return withSpaceMutationLocks(db, folderSpaceById.values(), async () => {
+      for (const [folderId, spaceId] of folderSpaceById) {
+        await requireLiveFolderDestination(db, folderId, spaceId);
+      }
 
     const toInsert = payload.items.map((item) => {
-      const targetSpaceId = folderSpaceById.get(item.folderId) || item.spaceId || PUBLIC_SPACE_ID;
+      const targetSpaceId = folderSpaceById.get(item.folderId);
+      if (!targetSpaceId) throw new Error("DESTINATION_FOLDER_NOT_FOUND");
       this.assertSpaceUnlocked(targetSpaceId);
       return {
         ...item,
@@ -2457,7 +3080,8 @@ export class ItemsController {
     // Trigger embedding immediately for new items
     this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
 
-    return { inserted: toInsert.length };
+      return { inserted: toInsert.length };
+    });
   }
 
   async refetchMetadata(itemIds: string[]): Promise<void> {
@@ -2494,6 +3118,17 @@ export class ItemsController {
       throw new Error("TARGET_FOLDER_NOT_FOUND");
     }
     const targetSpaceId = (targetFolderDoc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID;
+    const initialItemDocs = await db.items.findByIds(itemIds).exec();
+    const initialSourceSpaceIds = itemIds
+      .map((id) => initialItemDocs.get(id))
+      .filter((doc): doc is any => !!doc)
+      .map((doc) => (doc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID);
+
+    return withSpaceMutationLocks(
+      db,
+      [targetSpaceId, ...initialSourceSpaceIds],
+      async () => {
+    await requireLiveFolderDestination(db, targetFolderId, targetSpaceId);
     this.assertSpaceUnlocked(targetSpaceId);
 
     const targetDocs = await db.items
@@ -2508,6 +3143,7 @@ export class ItemsController {
     let nextTargetOrder = maxTargetOrder + 1;
     let updated = 0;
     const affectedSourceFolders = new Set<string>();
+    const validatedSourceFolders = new Set<string>([targetFolderId]);
 
     for (const id of itemIds) {
       const doc = await db.items.findOne(id).exec();
@@ -2515,7 +3151,18 @@ export class ItemsController {
 
       const current = doc.toMutableJSON() as ItemDocType;
       if (current.deletedAt !== 0) continue;
+      if (!initialSourceSpaceIds.includes(current.spaceId || PUBLIC_SPACE_ID)) {
+        throw new Error("SOURCE_ITEM_CHANGED");
+      }
       this.assertSpaceUnlocked(current.spaceId || PUBLIC_SPACE_ID);
+      if (!validatedSourceFolders.has(current.folderId)) {
+        await requireLiveFolderDestination(
+          db,
+          current.folderId,
+          current.spaceId || PUBLIC_SPACE_ID
+        );
+        validatedSourceFolders.add(current.folderId);
+      }
       if (current.folderId !== targetFolderId) {
         affectedSourceFolders.add(current.folderId);
       }
@@ -2570,49 +3217,71 @@ export class ItemsController {
       } catch {}
     }
 
-    return { updated };
+        return { updated };
+      }
+    );
   }
 
   async reorder(payload: {
     folders: { folderId: string; orderedIds: string[] }[];
   }): Promise<{ updated: number }> {
     const db = await getDb();
-    let updated = 0;
+    const entries = (payload.folders || []).filter((entry) => entry.folderId);
+    if (entries.length === 0) return { updated: 0 };
+    const initialFolders = await Promise.all(
+      entries.map((entry) => db.folders.findOne(entry.folderId).exec())
+    );
+    const folderSpaceById = new Map<string, string>();
+    for (let index = 0; index < entries.length; index += 1) {
+      const folderDoc = initialFolders[index];
+      if (!folderDoc) throw new Error("DESTINATION_FOLDER_NOT_FOUND");
+      folderSpaceById.set(
+        entries[index].folderId,
+        (folderDoc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID
+      );
+    }
 
-    for (const entry of payload.folders || []) {
-      const { folderId, orderedIds } = entry;
-      if (!folderId) continue;
-      const folderDoc = await db.folders.findOne(folderId).exec();
-      if (!folderDoc) continue;
-      const folderSpaceId = (folderDoc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID;
-      this.assertSpaceUnlocked(folderSpaceId);
-      const docs = await db.items
-        .find({ selector: { folderId: { $eq: folderId }, deletedAt: { $eq: 0 } } })
-        .exec();
-      const allIds = docs.map((d) => d.primary);
-      const finalOrder = appendUnorderedIds(orderedIds, allIds);
+    return withSpaceMutationLocks(db, folderSpaceById.values(), async () => {
+      let updated = 0;
+      for (const { folderId, orderedIds } of entries) {
+        const folderSpaceId = folderSpaceById.get(folderId);
+        if (!folderSpaceId) throw new Error("DESTINATION_FOLDER_NOT_FOUND");
+        await requireLiveFolderDestination(db, folderId, folderSpaceId);
+        this.assertSpaceUnlocked(folderSpaceId);
+        const docs = await db.items
+          .find({ selector: { folderId: { $eq: folderId }, deletedAt: { $eq: 0 } } })
+          .exec();
+        const allIds = docs.map((doc) => doc.primary);
+        const allIdSet = new Set(allIds);
+        const providedIds = orderedIds.filter((id) => allIdSet.has(id));
+        const finalOrder = appendUnorderedIds(providedIds, allIds);
 
-      for (let i = 0; i < finalOrder.length; i++) {
-        const id = finalOrder[i];
-        const doc = await db.items.findOne(id).exec();
-        if (!doc) continue;
-        const current = doc.toMutableJSON() as ItemDocType;
-        const needsPatch =
-          current.folderId !== folderId || current.chunkOrder !== i || current.spaceId !== folderSpaceId;
-        if (needsPatch) {
-          await doc.patch({ folderId, spaceId: folderSpaceId, chunkOrder: i, updatedAt: Date.now() });
-          updated++;
+        for (let index = 0; index < finalOrder.length; index += 1) {
+          const doc = await db.items.findOne(finalOrder[index]).exec();
+          if (!doc) continue;
+          const current = doc.toMutableJSON() as ItemDocType;
+          const needsPatch =
+            current.folderId !== folderId ||
+            current.chunkOrder !== index ||
+            current.spaceId !== folderSpaceId;
+          if (!needsPatch) continue;
+          await doc.patch({
+            folderId,
+            spaceId: folderSpaceId,
+            chunkOrder: index,
+            updatedAt: Date.now(),
+          });
+          updated += 1;
         }
       }
-    }
 
-    if (updated > 0) {
-      try {
-        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-      } catch {}
-    }
-
-    return { updated };
+      if (updated > 0) {
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+        } catch {}
+      }
+      return { updated };
+    });
   }
 
   async delete(payload: {
@@ -2653,17 +3322,122 @@ export class ItemsController {
     return { success: true };
   }
 
+  async restoreFromBin(payload: {
+    id: string;
+  }): Promise<{ success: boolean; error?: string; relocated?: boolean; message?: string }> {
+    const db = await getDb();
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+    return withBinMutationLock(db, () =>
+      withEntityMutationLock(db, "item", id, async () => {
+        const doc = await db.items.findOne(id).exec();
+        if (!doc) return { success: false, error: "NOT_FOUND" };
+
+        const item = doc.toMutableJSON() as ItemDocType;
+        this.assertSpaceUnlocked((item.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+        if ((item.deletedAt || 0) === 0) return { success: true };
+
+        const restoreSpace = await resolveRestoreSpace(db, item.spaceId || PUBLIC_SPACE_ID);
+        let targetFolderId = item.folderId;
+        let relocated = restoreSpace.relocated || !item.folderId;
+        if (!relocated && item.folderId && db.folders?.findOne) {
+          const folderDoc = await db.folders.findOne(item.folderId).exec();
+          const folderDeletedAt = (folderDoc?.get("deletedAt") as number | undefined) || 0;
+          relocated = !folderDoc || folderDeletedAt > 0;
+        }
+
+        if (relocated) {
+          const fallbackFolder = await createRestoreTabGroup(db, {
+            spaceId: restoreSpace.space.id,
+            userId: item.userId,
+          });
+          targetFolderId = fallbackFolder.id;
+        }
+
+        const updatedAt = nextBinMutationTimestamp(
+          Date.now(),
+          item.updatedAt,
+          item.deletedAt
+        );
+        await doc.patch({
+          folderId: targetFolderId,
+          spaceId: restoreSpace.space.id,
+          deletedAt: 0,
+          updatedAt,
+          isDirty: true,
+        });
+        await this.removeDeletedItemTombstone(db, id);
+
+        if (restoreSpace.created) {
+          try {
+            chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+          } catch {}
+        }
+        if (relocated) {
+          try {
+            chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+          } catch {}
+        }
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+        } catch {}
+
+        return {
+          success: true,
+          relocated,
+          message: relocated ? restoreFallbackMessage(restoreSpace.space.name) : undefined,
+        };
+      })
+    );
+  }
+
+  async deleteForever(payload: {
+    id: string;
+    expectedDeletedAt: number;
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+    return withBinMutationLock(db, () =>
+      withEntityMutationLock(db, "item", id, async () => {
+        const doc = await db.items.findOne(id).exec();
+        if (!doc) return { success: false, error: "NOT_FOUND" };
+        const item = doc.toMutableJSON() as ItemDocType;
+        this.assertSpaceUnlocked((item.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+        if (!(item.deletedAt > 0)) throw new Error("ITEM_NOT_IN_BIN");
+        if (item.deletedAt !== payload.expectedDeletedAt) {
+          throw new Error("ITEM_BIN_ENTRY_CHANGED");
+        }
+
+        await doc.remove();
+        await this.removeDeletedItemTombstone(db, id);
+        const deleteDirectories =
+          this.options.deleteUnreferencedOpfsItemDirectories ||
+          deleteUnreferencedOpfsItemDirectories;
+        await deleteDirectories(db, [id]);
+
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+        } catch {}
+
+        return { success: true };
+      })
+    );
+  }
+
   async updateMedia(payload: {
     id: string;
     media: ItemDocType["media"];
+    /** The media state the editor based this full-array replacement on. */
+    expectedMedia?: ItemDocType["media"];
     preserveOcr?: boolean;
   }): Promise<{ success: boolean; error?: string }> {
     const db = await getDb();
-    const doc = await db.items.findOne(payload.id).exec();
-    if (!doc) return { success: false, error: "NOT_FOUND" };
-
-    const current = doc.toMutableJSON() as ItemDocType;
-    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+    if (payload.expectedMedia === undefined) {
+      return { success: false, error: "EXPECTED_MEDIA_REQUIRED" };
+    }
 
     const incomingMedia = payload.media || [];
     const hasImageMedia = incomingMedia.some((m) => m?.type === "image");
@@ -2697,16 +3471,29 @@ export class ItemsController {
     if (counts.video > MEDIA_LIMITS.video)
       return { success: false, error: `Too many videos (max ${MEDIA_LIMITS.video})` };
 
-    const MAX_TRIES = 5;
-    let attempt = 0;
-    while (attempt < MAX_TRIES) {
-      attempt += 1;
-      const fresh = await db.items.findOne(payload.id).exec();
-      if (!fresh) break;
-      try {
+    let removedOpfsPaths: string[] = [];
+    const result = await withEntityMutationLock(db, "item", id, async () => {
+      const MAX_TRIES = 5;
+      for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+        const fresh = await db.items.findOne(id).exec();
+        if (!fresh) return { success: false, error: "NOT_FOUND" };
+
+        const current = fresh.toMutableJSON() as ItemDocType;
+        this.assertSpaceUnlocked(
+          (current.spaceId as string | undefined) || PUBLIC_SPACE_ID
+        );
+        if (current.deletedAt > 0) return { success: false, error: "ITEM_NOT_LIVE" };
+        if (!mediaSnapshotsEqual(current.media, payload.expectedMedia)) {
+          return { success: false, error: "MEDIA_CHANGED" };
+        }
+
         const patchData: Record<string, any> = {
           media: nextMedia,
-          updatedAt: Date.now(),
+          updatedAt: nextBinMutationTimestamp(
+            Date.now(),
+            current.updatedAt,
+            current.deletedAt
+          ),
           isDirty: true,
         };
         if (shouldResetOcr) {
@@ -2723,14 +3510,46 @@ export class ItemsController {
           nextMedia.find((m) => m.type === "image")?.s3Url ||
           nextMedia.find((m) => m.type === "image")?.originalUrl;
         if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
-        await fresh.patch(patchData);
-        break;
-      } catch (e: any) {
-        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
-        if (status !== 409) throw e;
-        continue;
+
+        try {
+          await fresh.patch(patchData);
+          const retainedPaths = new Set(
+            nextMedia.flatMap((entry) =>
+              typeof entry?.opfsPath === "string" && entry.opfsPath
+                ? [entry.opfsPath]
+                : []
+            )
+          );
+          removedOpfsPaths = Array.from(
+            new Set(
+              (current.media || []).flatMap((entry) =>
+                typeof entry?.opfsPath === "string" &&
+                entry.opfsPath &&
+                !retainedPaths.has(entry.opfsPath)
+                  ? [entry.opfsPath]
+                  : []
+              )
+            )
+          );
+          return { success: true };
+        } catch (error: any) {
+          const status =
+            error?.status ??
+            error?.rxdb?.status ??
+            error?.parameters?.writeError?.status;
+          if (status !== 409) throw error;
+        }
       }
-    }
+
+      return { success: false, error: "CONFLICT" };
+    });
+
+    if (!result.success) return result;
+
+    await deleteUnreferencedOpfsFiles(
+      db,
+      removedOpfsPaths.map((opfsPath) => ({ opfsPath }))
+    ).catch(() => {});
 
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
@@ -2756,47 +3575,71 @@ export class ItemsController {
     index: number;
   }): Promise<{ success: boolean; error?: string }> {
     const db = await getDb();
-    const doc = await db.items.findOne(payload.id).exec();
-    if (!doc) return { success: false, error: "NOT_FOUND" };
-
-    const current = doc.toMutableJSON() as ItemDocType;
-    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
-
-    const media = current.media || [];
-    if (payload.index < 0 || payload.index >= media.length) {
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+    if (!Number.isInteger(payload.index) || payload.index < 0) {
       return { success: false, error: "INVALID_INDEX" };
     }
 
-    const removed = media[payload.index];
-    if (removed?.opfsPath) {
-      deleteMediaFromOpfs(removed.opfsPath).catch(() => {});
-    }
+    let removedOpfsPath = "";
+    const result = await withEntityMutationLock(db, "item", id, async () => {
+      const MAX_TRIES = 5;
+      for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+        const fresh = await db.items.findOne(id).exec();
+        if (!fresh) return { success: false, error: "NOT_FOUND" };
 
-    const nextMedia = media.filter((_, i) => i !== payload.index);
-    const nextDisplayImageUrl =
-      nextMedia.find((m) => m.type === "image")?.s3Url ||
-      nextMedia.find((m) => m.type === "image")?.originalUrl;
+        const current = fresh.toMutableJSON() as ItemDocType;
+        this.assertSpaceUnlocked(
+          (current.spaceId as string | undefined) || PUBLIC_SPACE_ID
+        );
+        if (current.deletedAt > 0) return { success: false, error: "ITEM_NOT_LIVE" };
 
-    const MAX_TRIES = 5;
-    let attempt = 0;
-    while (attempt < MAX_TRIES) {
-      attempt += 1;
-      const fresh = await db.items.findOne(payload.id).exec();
-      if (!fresh) break;
-      try {
+        const media = current.media || [];
+        if (payload.index >= media.length) {
+          return { success: false, error: "INVALID_INDEX" };
+        }
+        const removed = media[payload.index];
+        const nextMedia = media.filter((_, index) => index !== payload.index);
+        const nextDisplayImageUrl =
+          nextMedia.find((entry) => entry.type === "image")?.s3Url ||
+          nextMedia.find((entry) => entry.type === "image")?.originalUrl;
         const patchData: Record<string, any> = {
           media: nextMedia,
-          updatedAt: Date.now(),
+          updatedAt: nextBinMutationTimestamp(
+            Date.now(),
+            current.updatedAt,
+            current.deletedAt
+          ),
           isDirty: true,
         };
         if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
-        await fresh.patch(patchData);
-        break;
-      } catch (e: any) {
-        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
-        if (status !== 409) throw e;
-        continue;
+
+        try {
+          await fresh.patch(patchData);
+          removedOpfsPath =
+            typeof removed?.opfsPath === "string" &&
+            removed.opfsPath &&
+            !nextMedia.some((entry) => entry.opfsPath === removed.opfsPath)
+              ? removed.opfsPath
+              : "";
+          return { success: true };
+        } catch (error: any) {
+          const status =
+            error?.status ??
+            error?.rxdb?.status ??
+            error?.parameters?.writeError?.status;
+          if (status !== 409) throw error;
+        }
       }
+
+      return { success: false, error: "CONFLICT" };
+    });
+
+    if (!result.success) return result;
+    if (removedOpfsPath) {
+      await deleteUnreferencedOpfsFiles(db, [{ opfsPath: removedOpfsPath }]).catch(
+        () => {}
+      );
     }
 
     try {
@@ -2813,11 +3656,8 @@ export class ItemsController {
     altText?: string;
   }): Promise<{ success: boolean; error?: string }> {
     const db = await getDb();
-    const doc = await db.items.findOne(payload.id).exec();
-    if (!doc) return { success: false, error: "NOT_FOUND" };
-
-    const current = doc.toMutableJSON() as ItemDocType;
-    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
 
     const trimmedUrl = payload.url.trim();
     if (!trimmedUrl) return { success: false, error: "URL_REQUIRED" };
@@ -2825,51 +3665,72 @@ export class ItemsController {
     const type = payload.type || inferMediaType(trimmedUrl);
     const category: MediaCategory = type === "video" ? "video" : isGifUrl(trimmedUrl) ? "gif" : "image";
 
-    const existingMedia = current.media || [];
-    if (!canAddMedia(
-      existingMedia.map((m) => ({ type: m.type, originalUrl: m.originalUrl })),
-      category
-    )) {
-      return {
-        success: false,
-        error: `Limit reached for ${category}s (max ${MEDIA_LIMITS[category]})`,
-      };
-    }
+    const result = await withEntityMutationLock(db, "item", id, async () => {
+      const MAX_TRIES = 5;
+      for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+        const fresh = await db.items.findOne(id).exec();
+        if (!fresh) return { success: false, error: "NOT_FOUND" };
 
-    const newEntry: NonNullable<ItemDocType["media"]>[number] = {
-      type,
-      originalUrl: trimmedUrl,
-      storageType: "hotlink",
-      altText: payload.altText,
-    };
+        const current = fresh.toMutableJSON() as ItemDocType;
+        this.assertSpaceUnlocked(
+          (current.spaceId as string | undefined) || PUBLIC_SPACE_ID
+        );
+        if (current.deletedAt > 0) return { success: false, error: "ITEM_NOT_LIVE" };
 
-    const nextMedia = [...existingMedia, newEntry];
-    const nextDisplayImageUrl =
-      nextMedia.find((m) => m.type === "image")?.s3Url ||
-      nextMedia.find((m) => m.type === "image")?.originalUrl ||
-      current.displayImageUrl;
+        const existingMedia = current.media || [];
+        if (
+          !canAddMedia(
+            existingMedia.map((entry) => ({
+              type: entry.type,
+              originalUrl: entry.originalUrl,
+            })),
+            category
+          )
+        ) {
+          return {
+            success: false,
+            error: `Limit reached for ${category}s (max ${MEDIA_LIMITS[category]})`,
+          };
+        }
 
-    const MAX_TRIES = 5;
-    let attempt = 0;
-    while (attempt < MAX_TRIES) {
-      attempt += 1;
-      const fresh = await db.items.findOne(payload.id).exec();
-      if (!fresh) break;
-      try {
+        const newEntry: NonNullable<ItemDocType["media"]>[number] = {
+          type,
+          originalUrl: trimmedUrl,
+          storageType: "hotlink",
+          altText: payload.altText,
+        };
+        const nextMedia = [...existingMedia, newEntry];
+        const nextDisplayImageUrl =
+          nextMedia.find((entry) => entry.type === "image")?.s3Url ||
+          nextMedia.find((entry) => entry.type === "image")?.originalUrl ||
+          current.displayImageUrl;
         const patchData: Record<string, any> = {
           media: nextMedia,
-          updatedAt: Date.now(),
+          updatedAt: nextBinMutationTimestamp(
+            Date.now(),
+            current.updatedAt,
+            current.deletedAt
+          ),
           isDirty: true,
         };
         if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
-        await fresh.patch(patchData);
-        break;
-      } catch (e: any) {
-        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
-        if (status !== 409) throw e;
-        continue;
+
+        try {
+          await fresh.patch(patchData);
+          return { success: true };
+        } catch (error: any) {
+          const status =
+            error?.status ??
+            error?.rxdb?.status ??
+            error?.parameters?.writeError?.status;
+          if (status !== 409) throw error;
+        }
       }
-    }
+
+      return { success: false, error: "CONFLICT" };
+    });
+
+    if (!result.success) return result;
 
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
@@ -2885,58 +3746,83 @@ export class ItemsController {
     type?: "image" | "video";
   }): Promise<{ success: boolean; error?: string }> {
     const db = await getDb();
-    const doc = await db.items.findOne(payload.id).exec();
-    if (!doc) return { success: false, error: "NOT_FOUND" };
-
-    const current = doc.toMutableJSON() as ItemDocType;
-    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
-
-    const media = current.media || [];
-    if (payload.index < 0 || payload.index >= media.length) {
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+    if (!Number.isInteger(payload.index) || payload.index < 0) {
       return { success: false, error: "INVALID_INDEX" };
     }
 
     const trimmedUrl = payload.url.trim();
     if (!trimmedUrl) return { success: false, error: "URL_REQUIRED" };
 
-    const old = media[payload.index];
-    if (old?.opfsPath) {
-      deleteMediaFromOpfs(old.opfsPath).catch(() => {});
-    }
-
     const type = payload.type || inferMediaType(trimmedUrl);
-    const newEntry: NonNullable<ItemDocType["media"]>[number] = {
-      type,
-      originalUrl: trimmedUrl,
-      storageType: "hotlink",
-      altText: old?.altText,
-    };
+    let removedOpfsPath = "";
+    const result = await withEntityMutationLock(db, "item", id, async () => {
+      const MAX_TRIES = 5;
+      for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+        const fresh = await db.items.findOne(id).exec();
+        if (!fresh) return { success: false, error: "NOT_FOUND" };
 
-    const nextMedia = media.map((m, i) => (i === payload.index ? newEntry : m));
-    const nextDisplayImageUrl =
-      nextMedia.find((m) => m.type === "image")?.s3Url ||
-      nextMedia.find((m) => m.type === "image")?.originalUrl;
+        const current = fresh.toMutableJSON() as ItemDocType;
+        this.assertSpaceUnlocked(
+          (current.spaceId as string | undefined) || PUBLIC_SPACE_ID
+        );
+        if (current.deletedAt > 0) return { success: false, error: "ITEM_NOT_LIVE" };
 
-    const MAX_TRIES = 5;
-    let attempt = 0;
-    while (attempt < MAX_TRIES) {
-      attempt += 1;
-      const fresh = await db.items.findOne(payload.id).exec();
-      if (!fresh) break;
-      try {
+        const media = current.media || [];
+        if (payload.index >= media.length) {
+          return { success: false, error: "INVALID_INDEX" };
+        }
+        const old = media[payload.index];
+        const newEntry: NonNullable<ItemDocType["media"]>[number] = {
+          type,
+          originalUrl: trimmedUrl,
+          storageType: "hotlink",
+          altText: old?.altText,
+        };
+        const nextMedia = media.map((entry, index) =>
+          index === payload.index ? newEntry : entry
+        );
+        const nextDisplayImageUrl =
+          nextMedia.find((entry) => entry.type === "image")?.s3Url ||
+          nextMedia.find((entry) => entry.type === "image")?.originalUrl;
         const patchData: Record<string, any> = {
           media: nextMedia,
-          updatedAt: Date.now(),
+          updatedAt: nextBinMutationTimestamp(
+            Date.now(),
+            current.updatedAt,
+            current.deletedAt
+          ),
           isDirty: true,
         };
         if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
-        await fresh.patch(patchData);
-        break;
-      } catch (e: any) {
-        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
-        if (status !== 409) throw e;
-        continue;
+
+        try {
+          await fresh.patch(patchData);
+          removedOpfsPath =
+            typeof old?.opfsPath === "string" &&
+            old.opfsPath &&
+            !nextMedia.some((entry) => entry.opfsPath === old.opfsPath)
+              ? old.opfsPath
+              : "";
+          return { success: true };
+        } catch (error: any) {
+          const status =
+            error?.status ??
+            error?.rxdb?.status ??
+            error?.parameters?.writeError?.status;
+          if (status !== 409) throw error;
+        }
       }
+
+      return { success: false, error: "CONFLICT" };
+    });
+
+    if (!result.success) return result;
+    if (removedOpfsPath) {
+      await deleteUnreferencedOpfsFiles(db, [{ opfsPath: removedOpfsPath }]).catch(
+        () => {}
+      );
     }
 
     try {
@@ -2946,16 +3832,29 @@ export class ItemsController {
     return { success: true };
   }
 
-  async listItemsWithOpfsMedia(): Promise<
-    { id: string; media: NonNullable<ItemDocType["media"]> }[]
-  > {
+  async listItemsWithOpfsMedia(payload?: {
+    afterId?: string;
+    limit?: number;
+  }): Promise<{
+    items: { id: string; media: NonNullable<ItemDocType["media"]> }[];
+    nextCursor: string | null;
+    hasMore: boolean;
+    scannedCount: number;
+  }> {
     const db = await getDb();
-    const docs = await db.items
-      .find({ selector: { deletedAt: { $eq: 0 } } })
-      .exec();
+    const requestedLimit = payload?.limit;
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(100, Math.floor(requestedLimit as number)))
+      : 50;
+    const page = await readIdKeysetPage({
+      collection: db.items as any,
+      selector: { deletedAt: { $eq: 0 } },
+      pageSize: limit,
+      afterId: (payload?.afterId || "").trim(),
+    });
 
     const out: { id: string; media: NonNullable<ItemDocType["media"]> }[] = [];
-    for (const doc of docs) {
+    for (const doc of page.documents as any[]) {
       const media = (doc.get("media") as ItemDocType["media"] | undefined) || [];
       if (media.some((m) => typeof m?.opfsPath === "string" && m.opfsPath.length > 0)) {
         const spaceId = (doc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID;
@@ -2965,7 +3864,168 @@ export class ItemsController {
         out.push({ id: doc.primary, media });
       }
     }
-    return out;
+    return {
+      items: out,
+      nextCursor: page.nextCursor,
+      hasMore: page.hasMore,
+      scannedCount: page.documents.length,
+    };
+  }
+
+  /**
+   * Commit completed OPFS uploads without replacing the caller's stale media
+   * snapshot. Each promotion is applied only while the latest item still owns
+   * the path and the bounded file identity still matches the uploaded bytes.
+   */
+  async applyOpfsMediaPromotions(payload: {
+    id: string;
+    promotions: {
+      opfsPath: string;
+      s3Url: string;
+      sourceIdentity: OpfsFileIdentity;
+    }[];
+  }): Promise<{ success: boolean; promotedOpfsPaths: string[]; error?: string }> {
+    const db = await getDb();
+    const id = (payload?.id || "").trim();
+    if (!id) return { success: false, promotedOpfsPaths: [], error: "NOT_FOUND" };
+
+    const promotions = new Map<
+      string,
+      { s3Url: string; sourceIdentity: OpfsFileIdentity }
+    >();
+    for (const promotion of payload?.promotions || []) {
+      const opfsPath =
+        typeof promotion?.opfsPath === "string" ? promotion.opfsPath : "";
+      const s3Url = typeof promotion?.s3Url === "string" ? promotion.s3Url.trim() : "";
+      const sourceIdentity = promotion?.sourceIdentity;
+      if (
+        opfsPath &&
+        s3Url &&
+        Number.isFinite(sourceIdentity?.size) &&
+        Number.isFinite(sourceIdentity?.lastModified) &&
+        typeof sourceIdentity?.sampleSha256 === "string" &&
+        sourceIdentity.sampleSha256.length > 0
+      ) {
+        promotions.set(opfsPath, { s3Url, sourceIdentity });
+      }
+    }
+    if (promotions.size === 0) {
+      return { success: true, promotedOpfsPaths: [] };
+    }
+
+    return withEntityMutationLock(db, "item", id, () => withOpfsMutationLock(async () => {
+      const MAX_TRIES = 5;
+      for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+        const fresh = await db.items.findOne(id).exec();
+        if (!fresh) {
+          return { success: false, promotedOpfsPaths: [], error: "NOT_FOUND" };
+        }
+
+        const current = fresh.toMutableJSON() as ItemDocType;
+        this.assertSpaceUnlocked(
+          (current.spaceId as string | undefined) || PUBLIC_SPACE_ID
+        );
+        if (current.deletedAt > 0) {
+          return { success: false, promotedOpfsPaths: [], error: "ITEM_NOT_LIVE" };
+        }
+
+        const verifiedPromotions = new Map<string, string>();
+        const currentPaths = new Set(
+          (current.media || []).flatMap((entry) =>
+            typeof entry?.opfsPath === "string" && entry.opfsPath
+              ? [entry.opfsPath]
+              : []
+          )
+        );
+        for (const opfsPath of currentPaths) {
+          const promotion = promotions.get(opfsPath);
+          if (!promotion) continue;
+          const readIdentity =
+            this.options.readOpfsFileIdentity || readOpfsFileIdentity;
+          const currentIdentity = await readIdentity(opfsPath);
+          if (opfsFileIdentitiesEqual(currentIdentity, promotion.sourceIdentity)) {
+            verifiedPromotions.set(opfsPath, promotion.s3Url);
+          }
+        }
+
+        const appliedPaths = new Set<string>();
+        const nextMedia = (current.media || []).map((entry) => {
+          const opfsPath = typeof entry?.opfsPath === "string" ? entry.opfsPath : "";
+          const s3Url = verifiedPromotions.get(opfsPath);
+          if (!s3Url) return entry;
+
+          appliedPaths.add(opfsPath);
+          const { opfsPath: _localPath, ...rest } = entry;
+          return {
+            ...rest,
+            s3Url,
+            storageType: "s3" as const,
+          };
+        });
+
+        if (appliedPaths.size === 0) {
+          return { success: true, promotedOpfsPaths: [] };
+        }
+
+        const nextDisplayImageUrl =
+          nextMedia.find((entry) => entry.type === "image")?.s3Url ||
+          nextMedia.find((entry) => entry.type === "image")?.originalUrl;
+        const patchData: Partial<ItemDocType> = {
+          media: nextMedia,
+          updatedAt: nextBinMutationTimestamp(
+            Date.now(),
+            current.updatedAt,
+            current.deletedAt
+          ),
+          isDirty: true,
+        };
+        if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
+
+        try {
+          await fresh.patch(patchData);
+          const promotedOpfsPaths = Array.from(appliedPaths);
+          try {
+            chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+          } catch {}
+          return { success: true, promotedOpfsPaths };
+        } catch (error: any) {
+          const status =
+            error?.status ??
+            error?.rxdb?.status ??
+            error?.parameters?.writeError?.status;
+          if (status !== 409) throw error;
+        }
+      }
+
+      return {
+        success: false,
+        promotedOpfsPaths: [],
+        error: "CONFLICT",
+      };
+    }));
+  }
+
+  async deleteUnreferencedOpfsMedia(payload: {
+    files: { opfsPath: string; sourceIdentity: OpfsFileIdentity }[];
+  }): Promise<{ deletedOpfsPaths: string[] }> {
+    const db = await getDb();
+    const files = (payload?.files || []).filter(
+      (file) =>
+        typeof file?.opfsPath === "string" &&
+        file.opfsPath.length > 0 &&
+        Number.isFinite(file.sourceIdentity?.size) &&
+        Number.isFinite(file.sourceIdentity?.lastModified) &&
+        typeof file.sourceIdentity?.sampleSha256 === "string" &&
+        file.sourceIdentity.sampleSha256.length > 0
+    );
+    const deletedOpfsPaths = await deleteUnreferencedOpfsFiles(
+      db,
+      files.map((file) => ({
+        opfsPath: file.opfsPath,
+        expectedIdentity: file.sourceIdentity,
+      }))
+    );
+    return { deletedOpfsPaths };
   }
 
   async update(payload: {

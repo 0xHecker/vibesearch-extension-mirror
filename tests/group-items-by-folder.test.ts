@@ -41,4 +41,21 @@ describe("groupItemsByFolder", () => {
       "ranked-first",
     ]);
   });
+
+  test("keeps an older reveal target inside the first mounted folder page", () => {
+    const items = Array.from({ length: 101 }, (_, index) =>
+      item(index === 100 ? "reveal-target" : `recent-${index}`, "folder-a", index, 101 - index)
+    );
+
+    const grouped = groupItemsByFolder(
+      [{ id: "folder-a" }] as any,
+      items,
+      false,
+      "reveal-target"
+    );
+
+    expect(grouped.get("folder-a")?.slice(0, 100).map((entry) => entry.id)).toContain(
+      "reveal-target"
+    );
+  });
 });
