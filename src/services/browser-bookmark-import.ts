@@ -6,6 +6,10 @@ import type { SpaceDocType } from "@src/schemas/space_schema";
 import type { SpaceGroupDocType } from "@src/schemas/space_group_schema";
 import { inferSource } from "@src/utils/infer-source";
 import { cloudSyncService, type CloudSyncDocBatch } from "@src/services/cloud-sync";
+import { nextBinMutationTimestamp } from "@src/common/bin";
+import { withSpaceMutationLocks } from "@src/services/entity-mutation-lock";
+import { findImportItemIdsByIds } from "@src/services/import-item-lookup";
+import { checkedRxBulkWrite } from "@src/services/rxdb-bulk-write";
 
 export const BROWSER_BOOKMARKS_SPACE_GROUP_ID = "space_group_browser_bookmarks";
 export const BROWSER_BOOKMARKS_SPACE_GROUP_NAME = "Browser Bookmarks";
@@ -13,6 +17,9 @@ export const MAX_BOOKMARKS_PER_SPACE = 500;
 
 const IMPORT_BATCH_SIZE = 200;
 const ROOT_BOOKMARKS_SOURCE_ID = "__root_bookmarks__";
+const BROWSER_SPACE_ID_PREFIX = "browser-space-";
+const BROWSER_FOLDER_ID_PREFIX = "browser-folder-";
+const BROWSER_BOOKMARK_ID_PREFIX = "browser-bookmark-";
 
 export type BrowserBookmarkNode = {
   id?: string;
@@ -114,6 +121,15 @@ const stableHash = (value: string): string => {
 
 const stableId = (kind: "space" | "folder" | "bookmark", sourceId: string): string =>
   `browser-${kind}-${stableHash(sourceId)}`;
+
+const isManagedBrowserSpaceId = (id: unknown): id is string =>
+  typeof id === "string" && id.startsWith(BROWSER_SPACE_ID_PREFIX);
+const isManagedBrowserBookmarkId = (id: unknown): id is string =>
+  typeof id === "string" && id.startsWith(BROWSER_BOOKMARK_ID_PREFIX);
+const isManagedBrowserItemLocation = (item: ItemDocType): boolean =>
+  isManagedBrowserSpaceId(item.spaceId) &&
+  typeof item.folderId === "string" &&
+  item.folderId.startsWith(BROWSER_FOLDER_ID_PREFIX);
 
 const spaceSlug = (name: string, fallback: string): string => {
   const slug = name
@@ -367,7 +383,8 @@ const folderMatches = (existing: FolderDocType, candidate: FolderDocType): boole
   existing.spaceId === candidate.spaceId &&
   existing.parentId === candidate.parentId &&
   existing.sortOrder === candidate.sortOrder &&
-  existing.type === candidate.type;
+  existing.type === candidate.type &&
+  existing.deletedAt === 0;
 
 const spaceMatches = (existing: SpaceDocType, candidate: SpaceDocType): boolean =>
   existing.name === candidate.name &&
@@ -375,7 +392,8 @@ const spaceMatches = (existing: SpaceDocType, candidate: SpaceDocType): boolean 
   existing.spaceGroupId === candidate.spaceGroupId &&
   existing.isPrivate === false &&
   existing.isArchived === false &&
-  existing.sortOrder === candidate.sortOrder;
+  existing.sortOrder === candidate.sortOrder &&
+  existing.deletedAt === 0;
 
 const updateFolder = (existing: FolderDocType | undefined, candidate: FolderDocType, now: number) => {
   if (!existing) return candidate;
@@ -449,12 +467,24 @@ export class BrowserBookmarkImportService {
   }
 
   async importTree(payload: { tree?: BrowserBookmarkNode[] }): Promise<BrowserBookmarkImportResult> {
+    if (!Array.isArray(payload?.tree) || payload.tree.length === 0) {
+      throw new Error("BOOKMARK_TREE_INVALID");
+    }
     const db = await (this.options.getDb ?? getDb)();
     const now = this.options.now?.() ?? Date.now();
     const sync = this.options.cloudSync ?? cloudSyncService;
     const yieldNow = this.options.yieldToEventLoop ?? yieldToEventLoop;
     const publishDbChange = this.options.notifyDbChange ?? notifyDbChange;
     const plan = buildBrowserBookmarkImportPlan(payload, { now });
+    const initialExistingSpaces = await db.spaces
+      .find({ selector: { spaceGroupId: { $eq: BROWSER_BOOKMARKS_SPACE_GROUP_ID } } })
+      .exec();
+    const lockedSpaceIds = [
+      ...plan.spaces.map((space) => space.id),
+      ...initialExistingSpaces.map((doc) => doc.get("id") as string),
+    ];
+
+    return withSpaceMutationLocks(db, lockedSpaceIds, async () => {
 
     const existingGroup = await db.space_groups.findOne(BROWSER_BOOKMARKS_SPACE_GROUP_ID).exec();
     const currentGroup = existingGroup?.toMutableJSON() as SpaceGroupDocType | undefined;
@@ -467,7 +497,13 @@ export class BrowserBookmarkImportService {
             name: BROWSER_BOOKMARKS_SPACE_GROUP_NAME,
             updatedAt: now,
           };
-    if (groupUpdate) await db.space_groups.bulkUpsert([groupUpdate]);
+    if (groupUpdate) {
+      await checkedRxBulkWrite(
+        "browser-bookmarks.space-groups",
+        [groupUpdate],
+        (rows) => db.space_groups.bulkUpsert(rows)
+      );
+    }
 
     const existingSpaces = await db.spaces
       .find({ selector: { spaceGroupId: { $eq: BROWSER_BOOKMARKS_SPACE_GROUP_ID } } })
@@ -476,6 +512,14 @@ export class BrowserBookmarkImportService {
       existingSpaces.map((doc) => [doc.get("id") as string, doc.toMutableJSON() as SpaceDocType])
     );
     const plannedSpaceIds = new Set(plan.spaces.map((space) => space.id));
+    for (const existing of existingSpacesById.values()) {
+      if (
+        plannedSpaceIds.has(existing.id) &&
+        (existing.deletedAt !== 0 || existing.isArchived !== false)
+      ) {
+        throw new Error("DESTINATION_SPACE_NOT_LIVE");
+      }
+    }
     const spaceUpdates = plan.spaces
       .map((space) => {
         const existing = existingSpacesById.get(space.id);
@@ -493,17 +537,18 @@ export class BrowserBookmarkImportService {
         } satisfies SpaceDocType;
       })
       .filter((space): space is SpaceDocType => space !== null);
-    const archivedSpaces = Array.from(existingSpacesById.values())
-      .filter((space) => !plannedSpaceIds.has(space.id) && !space.isArchived)
-      .map((space) => ({ ...space, isArchived: true, updatedAt: now }));
-    const changedSpaces = [...spaceUpdates, ...archivedSpaces];
-    for (const batch of chunk(changedSpaces, IMPORT_BATCH_SIZE)) {
-      await db.spaces.bulkUpsert(batch);
-      await yieldNow();
-    }
-
     const relevantSpaceIds = Array.from(
-      new Set([...existingSpacesById.keys(), ...plan.spaces.map((space) => space.id)])
+      new Set([
+        ...Array.from(existingSpacesById.values())
+          .filter(
+            (space) =>
+              isManagedBrowserSpaceId(space.id) &&
+              space.deletedAt === 0 &&
+              space.isArchived === false
+          )
+          .map((space) => space.id),
+        ...plan.spaces.map((space) => space.id),
+      ])
     );
     const [existingFolderDocs, existingItemDocs] = relevantSpaceIds.length
       ? await Promise.all([
@@ -514,9 +559,38 @@ export class BrowserBookmarkImportService {
     const existingFolders = new Map(
       existingFolderDocs.map((doc) => [doc.get("id") as string, doc.toMutableJSON() as FolderDocType])
     );
+    for (const folder of plan.folders) {
+      const existing = existingFolders.get(folder.id);
+      if (existing && (existing.deletedAt !== 0 || existing.spaceId !== folder.spaceId)) {
+        throw new Error("DESTINATION_FOLDER_NOT_LIVE");
+      }
+    }
     const existingItems = new Map(
       existingItemDocs.map((doc) => [doc.get("id") as string, doc.toMutableJSON() as ItemDocType])
     );
+    const relocatedItemIds = new Set(
+      Array.from(existingItems.values())
+        .filter((item) => !isManagedBrowserItemLocation(item))
+        .map((item) => item.id)
+    );
+    const unresolvedPlannedItemIds = plan.bookmarks
+      .map((bookmark) => bookmark.id)
+      .filter((id) => !existingItems.has(id));
+    const relocatedPlannedItemIds = await findImportItemIdsByIds(
+      db.items as Parameters<typeof findImportItemIdsByIds>[0],
+      unresolvedPlannedItemIds,
+      IMPORT_BATCH_SIZE
+    );
+    for (const id of relocatedPlannedItemIds) relocatedItemIds.add(id);
+    const changedSpaces = [...spaceUpdates];
+    for (const batch of chunk(spaceUpdates, IMPORT_BATCH_SIZE)) {
+      await checkedRxBulkWrite(
+        "browser-bookmarks.spaces",
+        batch,
+        (rows) => db.spaces.bulkUpsert(rows)
+      );
+      await yieldNow();
+    }
 
     const changedFolders: FolderDocType[] = [];
     for (const folderBatch of chunk(plan.folders, IMPORT_BATCH_SIZE)) {
@@ -524,7 +598,11 @@ export class BrowserBookmarkImportService {
         .map((folder) => updateFolder(existingFolders.get(folder.id), folder, now))
         .filter((folder): folder is FolderDocType => folder !== null);
       if (updates.length > 0) {
-        await db.folders.bulkUpsert(updates);
+        await checkedRxBulkWrite(
+          "browser-bookmarks.folders",
+          updates,
+          (rows) => db.folders.bulkUpsert(rows)
+        );
         changedFolders.push(...updates);
       }
       await yieldNow();
@@ -536,6 +614,7 @@ export class BrowserBookmarkImportService {
       const updates = bookmarkBatch
         .map((bookmark) => {
           const existing = existingItems.get(bookmark.id);
+          if (relocatedItemIds.has(bookmark.id)) return null;
           const update = updateBookmark(existing, bookmark, now);
           if (!existing || existing.url !== bookmark.url) {
             metadataUrls.add(bookmark.url);
@@ -544,38 +623,47 @@ export class BrowserBookmarkImportService {
         })
         .filter((bookmark): bookmark is ItemDocType => bookmark !== null);
       if (updates.length > 0) {
-        await db.items.bulkUpsert(updates);
+        await checkedRxBulkWrite(
+          "browser-bookmarks.items",
+          updates,
+          (rows) => db.items.bulkUpsert(rows)
+        );
         changedBookmarks.push(...updates);
       }
       await yieldNow();
     }
 
-    const plannedFolderIds = new Set(plan.folders.map((folder) => folder.id));
-    const staleFolderIds = Array.from(existingFolders.values())
-      .filter((folder) => !plannedFolderIds.has(folder.id))
-      .map((folder) => folder.id);
-    for (const batch of chunk(staleFolderIds, IMPORT_BATCH_SIZE)) {
-      await db.folders.bulkRemove(batch);
-      await yieldNow();
-    }
-
     const plannedBookmarkIds = new Set(plan.bookmarks.map((bookmark) => bookmark.id));
     const staleBookmarkUpdates = Array.from(existingItems.values())
+      .filter((item) => isManagedBrowserBookmarkId(item.id))
+      .filter(isManagedBrowserItemLocation)
       .filter((item) => !plannedBookmarkIds.has(item.id) && item.deletedAt === 0)
-      .map((item) => ({ ...item, deletedAt: now, updatedAt: now, isDirty: false }));
+      .map((item) => {
+        const deletedAt = nextBinMutationTimestamp(now, item.updatedAt, item.deletedAt);
+        return { ...item, deletedAt, updatedAt: deletedAt, isDirty: false };
+      });
     if (staleBookmarkUpdates.length > 0) {
       for (const batch of chunk(staleBookmarkUpdates, IMPORT_BATCH_SIZE)) {
-        await db.items.bulkUpsert(batch);
+        await checkedRxBulkWrite(
+          "browser-bookmarks.items",
+          batch,
+          (rows) => db.items.bulkUpsert(rows)
+        );
         await yieldNow();
       }
     }
+
+    // Never hard-remove folders or archive spaces during automatic source
+    // reconciliation. A normal save can commit between any async check and a
+    // destructive write; retaining empty importer structure is safer than
+    // orphaning that newly saved user record.
 
     const cloudChanges: CloudSyncDocBatch = {
       spaceGroups: groupUpdate ? [groupUpdate] : [],
       spaces: changedSpaces,
       folders: changedFolders,
       items: [...changedBookmarks, ...staleBookmarkUpdates],
-      deletes: staleFolderIds.map((id) => ({ collection: "folders", id, updatedAt: now, deletedAt: now })),
+      deletes: [],
     };
     const changedCount =
       cloudChanges.spaceGroups!.length +
@@ -591,20 +679,21 @@ export class BrowserBookmarkImportService {
 
     if (groupUpdate) publishDbChange("space_groups");
     if (changedSpaces.length > 0) publishDbChange("spaces");
-    if (changedFolders.length > 0 || staleFolderIds.length > 0) publishDbChange("folders");
+    if (changedFolders.length > 0) publishDbChange("folders");
     if (changedBookmarks.length > 0 || staleBookmarkUpdates.length > 0) publishDbChange("items");
 
-    return {
-      spaceGroupId: BROWSER_BOOKMARKS_SPACE_GROUP_ID,
-      spaceIds: plan.spaces.map((space) => space.id),
-      primarySpaceId: plan.spaces[0]?.id || null,
-      folderCount: plan.folders.length,
-      bookmarkCount: plan.bookmarks.length,
-      updatedFolderCount: changedFolders.length,
-      updatedBookmarkCount: changedBookmarks.length,
-      removedBookmarkCount: staleBookmarkUpdates.length,
-      metadataUrls: Array.from(metadataUrls),
-    };
+      return {
+        spaceGroupId: BROWSER_BOOKMARKS_SPACE_GROUP_ID,
+        spaceIds: plan.spaces.map((space) => space.id),
+        primarySpaceId: plan.spaces[0]?.id || null,
+        folderCount: plan.folders.length,
+        bookmarkCount: plan.bookmarks.length,
+        updatedFolderCount: changedFolders.length,
+        updatedBookmarkCount: changedBookmarks.length,
+        removedBookmarkCount: staleBookmarkUpdates.length,
+        metadataUrls: Array.from(metadataUrls),
+      };
+    });
   }
 }
 

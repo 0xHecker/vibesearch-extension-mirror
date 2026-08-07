@@ -2,20 +2,5 @@
   "background": {
     "service_worker": "src/workers/background.ts",
     "type": "module"
-  },
-  "host_permissions": [
-    "https://huggingface.co/*",
-    "https://metadata-worker.watermelons.workers.dev/*",
-    "https://meta.vibesearch.app/*",
-    "https://share-worker.watermelons.workers.dev/*",
-    "https://share.watermelons.workers.dev/*",
-    "https://share.vibesearch.app/*",
-    "https://vibesearch-api.watermelons.workers.dev/*",
-    "https://bucket.vibesearch.app/*",
-    "https://preview-bucket.vibesearch.app/*",
-    "https://accounts.google.com/*",
-    "https://www.googleapis.com/*",
-    "https://sheets.googleapis.com/*",
-    "https://api.github.com/*"
-  ]
+  }
 }

@@ -5,21 +5,28 @@ import { resolve } from "path";
 import baseConfig from "./vite.config.base";
 import baseManifest from "./manifest.base.json";
 import chromeManifest from "./manifest.chrome.json";
+import hostPermissions from "./manifest.host-permissions.json";
 import pkg from "./package.json";
+import { createChromeManifest } from "./extension-manifest-config";
 
 const isDev = process.env.NODE_ENV !== "production";
 
-const manifest: ManifestV3Export = {
-  ...baseManifest,
-  ...chromeManifest,
-  version: pkg.version,
-};
+const manifestConfig = createChromeManifest(
+  baseManifest,
+  chromeManifest,
+  hostPermissions,
+  pkg.version
+);
 
 if (isDev) {
-  manifest.name = "Vibesearch (Dev)";
-} else {
-  delete (manifest as any).key;
+  manifestConfig.name = "Vibesearch (Dev)";
 }
+
+const manifest = manifestConfig as ManifestV3Export;
+
+// Keep the public manifest key in every build. It pins the extension ID so an
+// unpacked/side-loaded update reopens the same extension origin and IndexedDB
+// instead of making the user's existing library appear to have disappeared.
 
 const chromeConfig = defineConfig({
   build: {

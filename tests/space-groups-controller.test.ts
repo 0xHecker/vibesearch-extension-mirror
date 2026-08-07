@@ -122,16 +122,18 @@ describe("space group deletion", () => {
       expect(result).toEqual({ success: true, affectedSpaces: 2 });
       expect(groups.map((group) => group.id)).toEqual(["other"]);
       expect(spaces.map((space) => space.id)).toEqual(["space-a", "space-b", "space-c"]);
-      expect(spaces.find((space) => space.id === "space-a")).toMatchObject({
-        deletedAt: now,
-        purgeAt: now + BIN_RETENTION_MS,
+      const spaceA = spaces.find((space) => space.id === "space-a");
+      const spaceB = spaces.find((space) => space.id === "space-b");
+      expect(spaceA).toMatchObject({
         spaceGroupId: UNGROUPED_SPACE_GROUP_ID,
       });
-      expect(spaces.find((space) => space.id === "space-b")).toMatchObject({
-        deletedAt: now,
-        purgeAt: now + BIN_RETENTION_MS,
+      expect(spaceB).toMatchObject({
         spaceGroupId: UNGROUPED_SPACE_GROUP_ID,
       });
+      expect(spaceA?.deletedAt).toBeGreaterThan(now);
+      expect(spaceA?.purgeAt).toBe((spaceA?.deletedAt || 0) + BIN_RETENTION_MS);
+      expect(spaceB?.deletedAt).toBeGreaterThan(now);
+      expect(spaceB?.purgeAt).toBe((spaceB?.deletedAt || 0) + BIN_RETENTION_MS);
       expect(spaces.find((space) => space.id === "space-c")).toMatchObject({
         deletedAt: SPACE_NOT_BINNED,
         purgeAt: 0,

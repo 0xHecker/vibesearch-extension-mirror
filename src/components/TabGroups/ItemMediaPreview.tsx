@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { cn } from "@src/lib/utils";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { resolveOpfsMedia, revokeObjectUrl } from "@src/services/media-storage";
-import { getExternalEmbedSandbox, normalizeIframeEmbedUrl } from "@src/utils/media-embed";
+import { normalizeIframeEmbedUrl } from "@src/utils/media-embed";
 
 type ResolvedMedia = {
   type: "image" | "video" | "audio";
@@ -69,16 +69,46 @@ const resolveMedia = async (item: ItemDocType): Promise<ResolvedMedia | null> =>
     if (candidate.opfsPath) {
       const blobUrl = await resolveOpfsMedia(candidate.opfsPath);
       if (blobUrl) {
-        if (candidate.type === "video") return { type: "video", src: blobUrl, isVertical, totalCount };
+        if (candidate.type === "video") {
+          return {
+            type: "video",
+            src: blobUrl,
+            width: candidate.width,
+            height: candidate.height,
+            isVertical,
+            totalCount,
+          };
+        }
         if (candidate.type === "audio") return { type: "audio", src: blobUrl, totalCount };
-        return { type: "image", src: blobUrl, totalCount };
+        return {
+          type: "image",
+          src: blobUrl,
+          width: candidate.width,
+          height: candidate.height,
+          totalCount,
+        };
       }
     }
     const src = candidate.s3Url || candidate.originalUrl;
     if (src) {
-      if (candidate.type === "video") return { type: "video", src, isVertical, totalCount };
+      if (candidate.type === "video") {
+        return {
+          type: "video",
+          src,
+          width: candidate.width,
+          height: candidate.height,
+          isVertical,
+          totalCount,
+        };
+      }
       if (candidate.type === "audio") return { type: "audio", src, totalCount };
-      return { type: "image", src, totalCount };
+      return {
+        type: "image",
+        src,
+        width: candidate.width,
+        height: candidate.height,
+        totalCount,
+      };
     }
   }
 
@@ -99,6 +129,7 @@ export const ItemMediaPreview = ({
   const [media, setMedia] = useState<ResolvedMedia | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [isVisible, setIsVisible] = useState(false);
+  const [isMediaActive, setIsMediaActive] = useState(false);
   const [isErrored, setIsErrored] = useState(false);
   const hasMedia = Boolean(
     item.displayImageUrl ||
@@ -110,13 +141,18 @@ export const ItemMediaPreview = ({
   useEffect(() => {
     setIsVisible(false);
     setMedia(null);
+    setIsMediaActive(false);
     setIsErrored(false);
   }, [item.id]);
 
   useEffect(() => {
-    if (!isVisible) return;
+    if (!isVisible) {
+      setIsMediaActive(false);
+      return;
+    }
     let cancelled = false;
     let objectUrl: string | null = null;
+    setIsMediaActive(false);
     (async () => {
       const resolved = await resolveMedia(item);
       if (resolved?.src.startsWith("blob:")) objectUrl = resolved.src;
@@ -125,6 +161,7 @@ export const ItemMediaPreview = ({
         return;
       }
       setMedia(resolved);
+      setIsMediaActive(true);
     })();
     return () => {
       cancelled = true;
@@ -133,35 +170,38 @@ export const ItemMediaPreview = ({
   }, [isVisible, item]);
 
   useEffect(() => {
-    if (!hasMedia || isVisible) return;
+    if (!hasMedia) return;
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
-          if (entry.isIntersecting) {
-            setIsVisible(true);
-            observer.disconnect();
-            break;
-          }
+          setIsVisible(entry.isIntersecting);
         }
       },
-      { root: null, rootMargin: "320px 0px", threshold: 0.01 }
+      { root: null, rootMargin: "480px 0px", threshold: 0.01 }
     );
     if (hostRef.current) observer.observe(hostRef.current);
     return () => observer.disconnect();
-  }, [hasMedia, isVisible]);
+  }, [hasMedia]);
 
   if (!hasMedia) return null;
   const extraCount = Math.max(0, (media?.totalCount ?? 1) - 1);
 
   const fallback = (
-    <div className="rounded-sm-semi border border-border-neutral-faded bg-background-page-secondary px-2 py-1 text-[11px] uppercase tracking-[0.08em] text-foreground-tertiary">
+    <div
+      className="grid min-h-12 place-items-center rounded-sm-semi border border-border-neutral-faded bg-background-page-secondary px-2 py-1 text-[11px] uppercase tracking-[0.08em] text-foreground-tertiary"
+      style={
+        media?.width && media?.height
+          ? { aspectRatio: `${media.width} / ${media.height}` }
+          : undefined
+      }
+    >
       {media?.type ?? "media"}
     </div>
   );
 
   return (
     <div ref={hostRef} className={cn("w-full", className)}>
-      {!media || !isVisible || isErrored ? (
+      {!media || !isVisible || !isMediaActive || isErrored ? (
         fallback
       ) : media.type === "image" ? (
         <div className="relative">
@@ -185,16 +225,9 @@ export const ItemMediaPreview = ({
       ) : media.type === "video" ? (
         <div className="relative">
           {media.embedType === "iframe" ? (
-            <iframe
-              src={media.src}
-              title={item.title ? `Embedded preview for ${item.title}` : "Embedded media preview"}
-              loading="lazy"
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-              allowFullScreen
-              referrerPolicy="strict-origin-when-cross-origin"
-              sandbox={getExternalEmbedSandbox(media.src, { allowPresentation: true, allowPopups: true })}
+            <div
               className={cn(
-                "w-full rounded-sm-semi border border-border-neutral-faded bg-background-page-secondary",
+                "relative grid w-full place-items-center overflow-hidden rounded-sm-semi border border-border-neutral-faded bg-background-page-secondary",
                 media.isVertical && "mx-auto max-w-[420px]"
               )}
               style={{
@@ -205,13 +238,23 @@ export const ItemMediaPreview = ({
                       ? "9 / 16"
                       : "16 / 9",
               }}
-              onError={() => {
-                setIsErrored(true);
-              }}
-              // Prevent clicks on the embed from bubbling to the lightbox trigger.
-              onClick={(e) => e.stopPropagation()}
-              onPointerDown={(e) => e.stopPropagation()}
-            />
+            >
+              {media.thumbnailSrc ? (
+                <img
+                  src={media.thumbnailSrc}
+                  alt={item.title || "Video thumbnail"}
+                  loading="lazy"
+                  decoding="async"
+                  className="h-full w-full object-cover"
+                  onError={() => setIsErrored(true)}
+                />
+              ) : (
+                <span className="text-xs font-medium text-foreground-tertiary">Video preview</span>
+              )}
+              <span className="pointer-events-none absolute grid size-11 place-items-center rounded-full bg-background-neutral/85 text-foreground-neutral shadow-sm backdrop-blur-sm">
+                <span className="ml-0.5 block h-0 w-0 border-y-[7px] border-l-[11px] border-y-transparent border-l-current" />
+              </span>
+            </div>
           ) : (
             <video
               controls

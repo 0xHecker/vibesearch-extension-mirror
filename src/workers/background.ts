@@ -12,6 +12,14 @@ import {
   normalizeImportSettings,
   type ImportSettings,
 } from "@src/common/import-settings";
+import {
+  reconcileLiveImportLruFolders,
+  resolveLiveImportFolderTarget,
+  selectQuickSaveFolderTarget,
+  type ImportLruFolderEntry,
+  type LiveImportFolderTarget,
+  type LiveImportSpaceSnapshot,
+} from "@src/common/import-lru";
 import type { ImportTargetSpace } from "@src/services/db-manager";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { ItemDocType } from "@src/schemas/item_schema";
@@ -24,7 +32,9 @@ import {
   saveMediaToOpfs,
   uploadOpfsFileToR2,
   uploadRemoteMediaToR2,
-  deleteMediaFromOpfs,
+  mapWithConcurrencyStable,
+  BoundedOpfsCleanupBatch,
+  type OpfsFileIdentity,
 } from "@src/services/media-storage";
 import { OCR_MODEL_VERSION } from "@src/services/ocr-model-config";
 import {
@@ -43,6 +53,7 @@ import {
   BROWSER_BOOKMARK_RESYNC_ALARM_NAME,
   BrowserBookmarkResyncScheduler,
 } from "@src/services/browser-bookmark-resync";
+import { registerBrowserBookmarkEvents } from "@src/services/browser-bookmark-events";
 import {
   CLOUD_SYNC_CONTINUATION_DELAY_MS,
   shouldScheduleCloudSyncContinuation,
@@ -74,7 +85,8 @@ const CLOUD_SYNC_CONTINUATION_ALARM_NAME = "cloud-sync-continuation";
 const ARCHIVE_OUTBOX_RETRY_ALARM_NAME = "archive-outbox-retry";
 const EMBEDDING_ALARM_NAME = "embedding-alarm";
 const METADATA_RETRY_ALARM_NAME = "metadata-retry-alarm";
-const FORCE_DEV_OFFSCREEN_RESET = (import.meta as any)?.env?.VITE_FORCE_DEV_OFFSCREEN_RESET === "1";
+const FORCE_DEV_OFFSCREEN_RESET =
+  import.meta.env.VITE_FORCE_DEV_OFFSCREEN_RESET === "1";
 const SEARCH_PAGE_PATH = "/src/pages/search/index.html";
 const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
   "items:getByIds",
@@ -542,13 +554,7 @@ const saveDrafts = async (drafts: ImportDraft[]) => {
   );
 };
 
-type LruFolderEntry = {
-  folderId: string;
-  spaceId: string;
-  folderName: string;
-  spaceName: string;
-  usedAt: number;
-};
+type LruFolderEntry = ImportLruFolderEntry;
 
 const getLruFolders = async (): Promise<LruFolderEntry[]> => {
   const raw = await getStorageValue<unknown[]>(IMPORT_LRU_FOLDERS_KEY, []);
@@ -568,29 +574,62 @@ const recordLruFolder = async (entry: LruFolderEntry): Promise<void> => {
   await setStorageValue(IMPORT_LRU_FOLDERS_KEY, filtered.slice(0, IMPORT_LRU_MAX));
 };
 
+const loadLiveImportSpaces = async (): Promise<LiveImportSpaceSnapshot[]> => {
+  const spaces = await sendForwardedToOffscreen<Array<{ id: string; name?: string }>>({
+    service: "spaces",
+    type: "listSpaces",
+    payload: {},
+  });
+  return Array.isArray(spaces) ? spaces.filter((space) => !!space?.id) : [];
+};
+
+const loadImportFolder = (folderId: string): Promise<FolderDocType | null> =>
+  sendForwardedToOffscreen<FolderDocType | null>({
+    service: "folders",
+    type: "getById",
+    payload: { id: folderId, skipLockCheck: true },
+  });
+
+const resolveFreshLiveImportFolder = async (
+  folderId: string
+): Promise<LiveImportFolderTarget | null> => {
+  try {
+    const [folder, liveSpaces] = await Promise.all([
+      loadImportFolder(folderId),
+      loadLiveImportSpaces(),
+    ]);
+    return resolveLiveImportFolderTarget(folder, liveSpaces);
+  } catch {
+    return null;
+  }
+};
+
+const sameLruEntry = (left: LruFolderEntry, right: LruFolderEntry): boolean =>
+  left.folderId === right.folderId &&
+  left.spaceId === right.spaceId &&
+  left.folderName === right.folderName &&
+  left.spaceName === right.spaceName &&
+  left.usedAt === right.usedAt;
+
 const pruneLruFolders = async (): Promise<LruFolderEntry[]> => {
   const lru = await getLruFolders();
   if (lru.length === 0) return [];
-  const verified = await Promise.all(
-    lru.map(async (entry) => {
-      try {
-        const folder = await sendForwardedToOffscreen<FolderDocType | null>({
-          service: "folders",
-          type: "getById",
-          payload: { id: entry.folderId, skipLockCheck: true },
-        });
-        if (!folder?.id) return null;
-        if (folder.name !== entry.folderName) {
-          return { ...entry, folderName: folder.name };
-        }
-        return entry;
-      } catch {
-        return null;
-      }
-    })
+  let liveSpaces: LiveImportSpaceSnapshot[];
+  try {
+    liveSpaces = await loadLiveImportSpaces();
+  } catch {
+    // A transient offscreen failure must not permanently erase recent targets.
+    // Returning no target makes quick-save use its safe new-folder fallback.
+    return [];
+  }
+  const folders = await Promise.all(
+    lru.map((entry) => loadImportFolder(entry.folderId).catch(() => null))
   );
-  const alive = verified.filter((entry): entry is LruFolderEntry => entry !== null);
-  if (alive.length !== lru.length) {
+  const alive = reconcileLiveImportLruFolders(lru, folders, liveSpaces).slice(0, IMPORT_LRU_MAX);
+  if (
+    alive.length !== lru.length ||
+    alive.some((entry, index) => !sameLruEntry(entry, lru[index]))
+  ) {
     await setStorageValue(IMPORT_LRU_FOLDERS_KEY, alive);
   }
   return alive;
@@ -2894,17 +2933,31 @@ const resolveQuickSaveTarget = async (
   context: ImportClickContext,
   mode: ImportMode
 ): Promise<{ folderId: string; spaceId: string }> => {
-  if (target.folderId) {
-    return { folderId: target.folderId, spaceId: target.spaceId || PUBLIC_SPACE_ID };
+  const requestedFolder = target.folderId
+    ? await resolveFreshLiveImportFolder(target.folderId)
+    : null;
+  const lru = requestedFolder ? [] : await pruneLruFolders();
+  const selectedFolder = selectQuickSaveFolderTarget(requestedFolder, lru);
+  if (selectedFolder) {
+    return { folderId: selectedFolder.folderId, spaceId: selectedFolder.spaceId };
   }
-  const lru = await resolveQuickSaveFolder();
-  if (lru) return { folderId: lru.folderId, spaceId: lru.spaceId };
+
+  const requestedSpaceId = target.spaceId || PUBLIC_SPACE_ID;
+  let fallbackSpaceId = PUBLIC_SPACE_ID;
+  try {
+    const liveSpaces = await loadLiveImportSpaces();
+    if (liveSpaces.some((space) => space.id === requestedSpaceId)) {
+      fallbackSpaceId = requestedSpaceId;
+    }
+  } catch {
+    // Public is created during database initialization and is the safest retry.
+  }
   const folderId = await resolveTargetFolder(
-    { spaceId: target.spaceId || PUBLIC_SPACE_ID, folderId: undefined, newFolderName: autoFolderName(context, mode) },
+    { spaceId: fallbackSpaceId, folderId: undefined, newFolderName: autoFolderName(context, mode) },
     context,
     mode
   );
-  return { folderId, spaceId: target.spaceId || PUBLIC_SPACE_ID };
+  return { folderId, spaceId: fallbackSpaceId };
 };
 
 let menuRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4024,16 +4077,14 @@ const onBrowserBookmarkMutation = () => {
   requestBrowserBookmarkResync();
 };
 
-chrome.bookmarks.onCreated.addListener(onBrowserBookmarkMutation);
-chrome.bookmarks.onChanged.addListener(onBrowserBookmarkMutation);
-chrome.bookmarks.onMoved.addListener(onBrowserBookmarkMutation);
-chrome.bookmarks.onRemoved.addListener(onBrowserBookmarkMutation);
-chrome.bookmarks.onChildrenReordered.addListener(onBrowserBookmarkMutation);
-chrome.bookmarks.onImportBegan.addListener(() => {
-  void browserBookmarkResyncScheduler.onImportBegan();
-});
-chrome.bookmarks.onImportEnded.addListener(() => {
-  void browserBookmarkResyncScheduler.onImportEnded();
+registerBrowserBookmarkEvents({
+  onMutation: onBrowserBookmarkMutation,
+  onImportBegan: () => {
+    void browserBookmarkResyncScheduler.onImportBegan();
+  },
+  onImportEnded: () => {
+    void browserBookmarkResyncScheduler.onImportEnded();
+  },
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -4114,65 +4165,133 @@ const triggerCloudSync = (): Promise<void> => {
   return run;
 };
 
+const OPFS_PROMOTION_SCAN_PAGE_SIZE = 50;
+const OPFS_PROMOTION_CLEANUP_FILES_PER_RUN = 700;
+
+type OpfsMediaPromotionPage = {
+  items: { id: string; media: NonNullable<ItemDocType["media"]> }[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  scannedCount: number;
+};
+
 const promoteOpfsMediaToR2 = async (): Promise<void> => {
   if (!isOnline()) return;
-  let items: { id: string; media: NonNullable<ItemDocType["media"]> }[];
+  let afterId = "";
+  const cleanupBatch = new BoundedOpfsCleanupBatch(
+    OPFS_PROMOTION_CLEANUP_FILES_PER_RUN
+  );
+
   try {
-    items = await sendForwardedToOffscreen<{
-      id: string;
-      media: NonNullable<ItemDocType["media"]>;
-    }[]>({
-      service: "items",
-      type: "listItemsWithOpfsMedia",
-    });
-  } catch (e) {
-    console.error("[promoteOpfsMedia] list failed", e);
-    return;
-  }
-  if (!items || items.length === 0) return;
+    while (isOnline()) {
+      let page: OpfsMediaPromotionPage;
+      try {
+        page = await sendForwardedToOffscreen<OpfsMediaPromotionPage>({
+          service: "items",
+          type: "listItemsWithOpfsMedia",
+          payload: {
+            afterId,
+            limit: OPFS_PROMOTION_SCAN_PAGE_SIZE,
+          },
+        });
+      } catch (e) {
+        console.error("[promoteOpfsMedia] list failed", e);
+        return;
+      }
+      if (!page) return;
 
-  for (const { id, media } of items) {
-    if (!isOnline()) break;
-    let changed = false;
-    const promotedOpfsPaths: string[] = [];
-    const nextMedia = await Promise.all(
-      (media || []).map(async (entry) => {
-        if (typeof entry?.opfsPath !== "string" || !entry.opfsPath) return entry;
+      for (const { id, media } of page.items || []) {
+        if (!isOnline()) return;
+        const promotions = (
+          await mapWithConcurrencyStable(media || [], 2, async (entry) => {
+            if (typeof entry?.opfsPath !== "string" || !entry.opfsPath) return null;
+            try {
+              const uploaded = await uploadOpfsFileToR2(
+                entry.opfsPath,
+                entry.originalUrl
+              );
+              if (!uploaded) return null;
+              return {
+                opfsPath: entry.opfsPath,
+                s3Url: uploaded.r2Url,
+                sourceIdentity: uploaded.sourceIdentity,
+              };
+            } catch (e) {
+              console.error("[promoteOpfsMedia] upload failed for", entry.opfsPath, e);
+              return null;
+            }
+          })
+        ).filter(
+          (promotion): promotion is {
+            opfsPath: string;
+            s3Url: string;
+            sourceIdentity: OpfsFileIdentity;
+          } => promotion !== null
+        );
+
+        if (promotions.length === 0) continue;
+
         try {
-          const uploaded = await uploadOpfsFileToR2(entry.opfsPath, entry.originalUrl);
-          if (!uploaded) return entry;
-          promotedOpfsPaths.push(entry.opfsPath);
-          changed = true;
-          return {
-            ...entry,
-            s3Url: uploaded.r2Url,
-            storageType: "s3" as const,
-            opfsPath: undefined,
-          };
+          const result = await sendForwardedToOffscreen<{
+            success: boolean;
+            promotedOpfsPaths: string[];
+            error?: string;
+          }>({
+            service: "items",
+            type: "applyOpfsMediaPromotions",
+            payload: { id, promotions },
+          });
+          if (!result?.success) {
+            console.error(
+              "[promoteOpfsMedia] conditional commit failed for",
+              id,
+              result?.error || "UNKNOWN_ERROR"
+            );
+            continue;
+          }
+          const promotionByPath = new Map(
+            promotions.map((promotion) => [promotion.opfsPath, promotion] as const)
+          );
+          for (const opfsPath of result.promotedOpfsPaths || []) {
+            const promotion = promotionByPath.get(opfsPath);
+            if (promotion) {
+              cleanupBatch.add({
+                opfsPath,
+                sourceIdentity: promotion.sourceIdentity,
+              });
+            }
+          }
         } catch (e) {
-          console.error("[promoteOpfsMedia] upload failed for", entry.opfsPath, e);
-          return entry;
+          console.error("[promoteOpfsMedia] conditional commit failed for", id, e);
         }
-      })
-    );
+      }
 
-    if (!changed) continue;
-
-    // Clean undefined keys before persisting
-    const cleaned = nextMedia.map((m) => {
-      const { opfsPath, ...rest } = m as any;
-      return rest;
-    });
-
+      if (!page.hasMore) return;
+      const nextCursor = (page.nextCursor || "").trim();
+      if (!nextCursor || nextCursor <= afterId) {
+        console.error("[promoteOpfsMedia] item scan cursor did not advance");
+        return;
+      }
+      afterId = nextCursor;
+    }
+  } finally {
     try {
-      await sendForwardedToOffscreen({
-        service: "items",
-        type: "updateMedia",
-        payload: { id, media: cleaned, preserveOcr: true },
+      await cleanupBatch.flush(async (files) => {
+        await sendForwardedToOffscreen({
+          service: "items",
+          type: "deleteUnreferencedOpfsMedia",
+          payload: { files },
+        });
       });
-      await Promise.all(promotedOpfsPaths.map((opfsPath) => deleteMediaFromOpfs(opfsPath).catch(() => {})));
+      if (cleanupBatch.overflowed) {
+        console.warn(
+          "[promoteOpfsMedia] deferred excess OPFS cleanup to keep the run bounded"
+        );
+      }
     } catch (e) {
-      console.error("[promoteOpfsMedia] updateMedia failed for", id, e);
+      // Promotion is durable already. Leave local files in place rather than
+      // failing the run or deleting without a complete reference scan.
+      console.warn("[promoteOpfsMedia] cleanup deferred", e);
     }
   }
 };
@@ -4647,9 +4766,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   void (async () => {
     try {
-      if ((import.meta as any)?.env?.MODE === "development" && FORCE_DEV_OFFSCREEN_RESET) {
+      if (import.meta.env.MODE === "development" && FORCE_DEV_OFFSCREEN_RESET) {
         try {
-          await (chrome.offscreen as any).closeDocument?.();
+          const offscreenApi = (chrome as any)["offscreen"];
+          await offscreenApi?.["closeDocument"]?.();
         } catch {}
       }
 

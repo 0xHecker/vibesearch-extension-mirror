@@ -22,7 +22,7 @@ export type FolderDocType = {
 
 export const folderSchema: RxJsonSchema<FolderDocType> = {
   title: "folder schema",
-  version: 2,
+  version: 7,
   description: "Describes a folder for organizing items or a group of tabs",
   primaryKey: "id",
   type: "object",
@@ -113,4 +113,34 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
     "deletedAt",
     "purgeAt",
   ],
+};
+
+const keepLegacyFolder = (oldDoc: FolderDocType): FolderDocType => oldDoc;
+
+const normalizeLegacyFolder = (oldDoc: FolderDocType): FolderDocType => {
+  const row = oldDoc as FolderDocType & Record<string, unknown>;
+  row.userId = typeof row.userId === "string" ? row.userId : "";
+  row.spaceId = typeof row.spaceId === "string" && row.spaceId ? row.spaceId : "space_public_default";
+  row.parentId = typeof row.parentId === "string" ? row.parentId : null;
+  row.type = row.type === "tab_group" ? "tab_group" : "folder";
+  row.sortOrder = Number.isSafeInteger(row.sortOrder) && row.sortOrder >= 0 ? row.sortOrder : 0;
+  row.isPinned = row.isPinned === true;
+  row.isCollapsed = row.isCollapsed === true;
+  row.deletedAt = Number.isSafeInteger(row.deletedAt) && row.deletedAt >= 0 ? row.deletedAt : 0;
+  row.purgeAt = Number.isSafeInteger(row.purgeAt) && row.purgeAt >= 0 ? row.purgeAt : 0;
+  row.isDirty = row.isDirty === true;
+  row.serverVersion = Number.isFinite(row.serverVersion) ? row.serverVersion : 0;
+  row.createdAt = Number.isSafeInteger(row.createdAt) && row.createdAt >= 0 ? row.createdAt : 0;
+  row.updatedAt = Number.isSafeInteger(row.updatedAt) && row.updatedAt >= 0 ? row.updatedAt : row.createdAt;
+  return row;
+};
+
+export const folderMigrationStrategies = {
+  1: keepLegacyFolder,
+  2: keepLegacyFolder,
+  3: keepLegacyFolder,
+  4: keepLegacyFolder,
+  5: keepLegacyFolder,
+  6: keepLegacyFolder,
+  7: normalizeLegacyFolder,
 };

@@ -7,8 +7,9 @@ class EmbeddingService {
   public generateEmbeddings = async (payload: {
     sentences: string[];
     priority?: EmbeddingRequestPriority;
+    signal?: AbortSignal;
   }): Promise<Float32Array> => {
-    return this.worker.embed(payload.sentences, payload.priority || "background");
+    return this.worker.embed(payload.sentences, payload.priority || "background", payload.signal);
   };
 }
 

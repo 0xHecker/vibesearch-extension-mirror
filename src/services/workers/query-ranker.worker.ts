@@ -2,8 +2,6 @@
 import type {
   QueryRankDebugScore,
   RankableItem,
-  QuerySortBy,
-  QuerySortOrder,
   QueryTextExpression,
   RankQueryCursor,
   RankQueryWorkerRequest,
@@ -15,6 +13,12 @@ import {
   shouldKeepHybridRankHit,
   VECTOR_HIT_FLOOR,
 } from "@src/search-core/hybrid-ranking";
+import { normalizeSearchIndexText } from "@src/search-core/search-text";
+import { expressionCanMatchWithoutPositiveTerm } from "@src/search-core/expression-analysis";
+import {
+  compareRankedEntries,
+  isRankedEntryAfterCursor,
+} from "@src/search-core/rank-order";
 
 const normalizeText = (input: string): string =>
   input
@@ -41,43 +45,40 @@ const getItemSearchText = (item: RankableItem): string => {
   );
 };
 
-const compareByField = (
-  a: RankableItem,
-  b: RankableItem,
-  sortBy: Exclude<QuerySortBy, "relevance">,
-  sortOrder: QuerySortOrder
-): number => {
-  const direction = sortOrder === "asc" ? 1 : -1;
-
-  if (sortBy === "title") {
-    return direction * (a.title || "").localeCompare(b.title || "");
-  }
-
-  if (sortBy === "source") {
-    return direction * (a.source || "").localeCompare(b.source || "");
-  }
-
-  const aValue = sortBy === "updatedAt" ? a.updatedAt || 0 : a.createdAt || 0;
-  const bValue = sortBy === "updatedAt" ? b.updatedAt || 0 : b.createdAt || 0;
-  return direction * (aValue - bValue);
+const textTermMatches = (
+  itemText: string,
+  rawTerm: string,
+  lexicalTermMatched?: (normalizedTerm: string) => boolean
+): boolean => {
+  const exactValue = normalizeText(rawTerm).trim();
+  if (!exactValue) return false;
+  if (itemText.includes(exactValue)) return true;
+  return lexicalTermMatched?.(normalizeSearchIndexText(rawTerm)) === true;
 };
 
-const evaluateTextExpression = (itemText: string, node: QueryTextExpression): boolean => {
+const evaluateTextExpression = (
+  itemText: string,
+  node: QueryTextExpression,
+  lexicalTermMatched?: (normalizedTerm: string) => boolean
+): boolean => {
   if (node.type === "TERM") {
-    const value = normalizeText(node.value || "").trim();
-    if (!value) return true;
-    return itemText.includes(value);
+    if (!node.value?.trim()) return true;
+    return textTermMatches(itemText, node.value, lexicalTermMatched);
   }
 
   if (node.type === "NOT") {
-    return !evaluateTextExpression(itemText, node.child);
+    return !evaluateTextExpression(itemText, node.child, lexicalTermMatched);
   }
 
   if (node.type === "AND") {
-    return node.children.every((child) => evaluateTextExpression(itemText, child));
+    return node.children.every((child) =>
+      evaluateTextExpression(itemText, child, lexicalTermMatched)
+    );
   }
 
-  return node.children.some((child) => evaluateTextExpression(itemText, child));
+  return node.children.some((child) =>
+    evaluateTextExpression(itemText, child, lexicalTermMatched)
+  );
 };
 
 const matchesBooleanTerms = (
@@ -121,35 +122,6 @@ type RankedEntry = {
   vectorScore: number;
   lexicalRank?: number;
   vectorRank?: number;
-};
-
-const compareByRelevance = (
-  a: RankedEntry,
-  b: RankedEntry,
-  sortOrder: QuerySortOrder
-): number => {
-  const direction = sortOrder === "asc" ? 1 : -1;
-  if (a.relevance !== b.relevance) {
-    return direction * (a.relevance - b.relevance);
-  }
-  const createdCompare = (b.item.createdAt || 0) - (a.item.createdAt || 0);
-  if (createdCompare !== 0) return createdCompare;
-  return a.item.id.localeCompare(b.item.id);
-};
-
-const compareRankedEntry = (
-  a: RankedEntry,
-  b: RankedEntry,
-  sortBy: QuerySortBy,
-  sortOrder: QuerySortOrder
-): number => {
-  if (sortBy === "relevance") {
-    return compareByRelevance(a, b, sortOrder);
-  }
-
-  const compare = compareByField(a.item, b.item, sortBy as Exclude<QuerySortBy, "relevance">, sortOrder);
-  if (compare !== 0) return compare;
-  return compareByRelevance(a, b, "desc");
 };
 
 const selectTopWindow = (
@@ -252,6 +224,13 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
   const RECENCY_TIE_BREAK_WEIGHT = 0.45;
   const { payload } = request;
   const lexicalScores = new Map(payload.lexicalScores);
+  const lexicalMatchMasksById = new Map(payload.lexicalMatchMasksById || []);
+  const lexicalTermBits = new Map<string, { wordIndex: number; bit: number }>(
+    (payload.lexicalMatchTerms || []).map((term, index) => [
+      term,
+      { wordIndex: Math.floor(index / 32), bit: 1 << (index % 32) },
+    ])
+  );
   const vectorScoresByIndex = new Map(payload.vectorScoresByIndex);
   const now = Date.now();
 
@@ -262,6 +241,10 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
   }
 
   const hasPositiveTextTerms = payload.flatPositiveTerms.length > 0;
+  const allowsPositiveFreeTextMatch =
+    payload.hasTextConstraint &&
+    !!payload.expression &&
+    expressionCanMatchWithoutPositiveTerm(payload.expression);
   const hasLexicalScores = lexicalScores.size > 0;
   const needsTextEvaluation = payload.hasTextConstraint || (payload.useLexical && !hasLexicalScores);
   // Ranks are only used to populate the debug payload. Computing them sorts the
@@ -318,14 +301,24 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
     if (needsTextEvaluation) {
       itemText = itemTextCache.get(item.id) || getItemSearchText(item);
       itemTextCache.set(item.id, itemText);
+      const lexicalMatchWords = lexicalMatchMasksById.get(item.id) || [];
+      const lexicalTermMatched = (normalizedTerm: string) => {
+        const termPosition = lexicalTermBits.get(normalizedTerm);
+        return !!termPosition &&
+          ((lexicalMatchWords[termPosition.wordIndex] || 0) & termPosition.bit) !== 0;
+      };
 
       boolMatch = payload.expression
         ? {
-            matches: evaluateTextExpression(itemText, payload.expression),
+            matches: evaluateTextExpression(
+              itemText,
+              payload.expression,
+              lexicalTermMatched
+            ),
             matchedTermCount: payload.flatPositiveTerms.reduce((count, term) => {
-              const normalizedTerm = normalizeText(term).trim();
-              if (!normalizedTerm) return count;
-              return itemText.includes(normalizedTerm) ? count + 1 : count;
+              return textTermMatches(itemText, term, lexicalTermMatched)
+                ? count + 1
+                : count;
             }, 0),
           }
         : matchesBooleanTerms(itemText, payload.groups, payload.excludedTerms);
@@ -375,29 +368,31 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
   let filtered = ranked;
   if (payload.hasTextConstraint) {
     filtered = ranked.filter((entry) => {
+      if (!entry.boolMatch.matches) return false;
+      if (allowsPositiveFreeTextMatch) return true;
       if (payload.useVector && payload.useLexical) {
-        if (!entry.boolMatch.matches) return false;
         if (hasPositiveTextTerms) {
           return entry.hasVectorHit || entry.hasLexicalHit;
         }
         return true;
       }
       if (payload.useVector && !payload.useLexical) {
-        if (!entry.boolMatch.matches) return false;
         return hasPositiveTextTerms ? entry.hasVectorHit : true;
       }
       if (payload.useLexical) {
-        return entry.boolMatch.matches && entry.hasLexicalHit;
+        return entry.hasLexicalHit;
       }
-      return entry.boolMatch.matches;
+      return true;
     });
   }
   filtered = filtered.filter((entry) =>
-    shouldKeepHybridRankHit(entry, {
-      useLexical: payload.useLexical,
-      useVector: payload.useVector,
-      hasPositiveTextTerms,
-    })
+    allowsPositiveFreeTextMatch && entry.boolMatch.matches
+      ? true
+      : shouldKeepHybridRankHit(entry, {
+          useLexical: payload.useLexical,
+          useVector: payload.useVector,
+          hasPositiveTextTerms,
+        })
   );
 
   let vectorHits = 0;
@@ -409,13 +404,15 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
 
   const total = filtered.length;
   const compare = (a: RankedEntry, b: RankedEntry) =>
-    compareRankedEntry(a, b, payload.sortBy, payload.sortOrder);
+    compareRankedEntries(a, b, payload.sortBy, payload.sortOrder);
 
   const hasAfterCursor = !!payload.afterCursor && payload.afterCursor?.queryHash === payload.queryHash;
   const pageBase = hasAfterCursor
     ? (() => {
         const cursorEntry = fromCursor(payload.afterCursor as RankQueryCursor);
-        return filtered.filter((entry) => compare(entry, cursorEntry) > 0);
+        return filtered.filter((entry) =>
+          isRankedEntryAfterCursor(entry, cursorEntry, compare)
+        );
       })()
     : filtered;
   const pageBaseTotal = pageBase.length;

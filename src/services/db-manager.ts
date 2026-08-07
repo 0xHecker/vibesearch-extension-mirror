@@ -1,11 +1,16 @@
 import { getDb } from "@src/services/DatabaseService";
 import { ItemDocType, MediaOcrMetadata } from "@src/schemas/item_schema";
 import { FolderDocType } from "@src/schemas/folder_schema";
-import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
+import {
+  LIVE_SPACE_SELECTOR,
+  PRIVATE_SPACE_ID,
+  PUBLIC_SPACE_ID,
+} from "@src/common/spaces";
+import { nextBinMutationTimestamp } from "@src/common/bin";
 import { spaceSessionService } from "@src/services/space-session.service";
 import {
+  getVectorIndexes,
   hasEmbeddableText,
-  hasVectorReference,
   isMetadataReadyForEmbedding,
 } from "@src/search-core/embedding-state";
 import {
@@ -34,11 +39,24 @@ import {
   mergeBackupSnapshot,
   type MergeBackupSnapshotResult,
 } from "@src/services/share-snapshot";
+import {
+  withEntityMutationLock,
+  withSpaceMutationLocks,
+} from "@src/services/entity-mutation-lock";
+import {
+  requireLiveFolderDestination,
+  withLiveFolderDestination,
+  withLiveSpaceDestination,
+} from "@src/services/live-destination";
 
 type SearchScope = "current" | "global" | "private" | "public";
 type AccessContext = {
   activeSpaceId?: string;
   searchScope?: SearchScope;
+};
+type BulkItemUpdate = Partial<ItemDocType> & {
+  expectedRevision?: string;
+  expectedUpdatedAt?: number;
 };
 type MediaEntry = NonNullable<ItemDocType["media"]>[number];
 type SavedMediaOcrResult = {
@@ -73,6 +91,72 @@ export type ImportTargetItemPreview = {
   title: string;
   updatedAt: number;
 };
+
+export type ActiveVectorInventoryItem = Pick<
+  ItemDocType,
+  | "id"
+  | "vector_index"
+  | "vector_indexes"
+  | "isEmbedded"
+  | "isMetaFetched"
+  | "isDirty"
+> & { revision: string };
+
+export type ActiveVectorEmbeddingSnapshot = {
+  item: ItemDocType;
+  revision: string;
+};
+
+export type CompactedVectorIndexCommit = {
+  id: string;
+  vector_index: number;
+  vector_indexes: number[];
+  expectedRevision: string;
+  isEmbeddedOnMatch: boolean;
+  isDirtyOnMatch: boolean;
+};
+
+/**
+ * A compaction result is current only when it was built from this exact RxDB
+ * revision. The vector index must still be remapped after the file swap, but a
+ * concurrently edited item stays dirty so its stale vector is never searched.
+ */
+export const applyCompactedVectorIndexCommit = <T extends ItemDocType>(
+  current: T,
+  currentRevision: string,
+  update: CompactedVectorIndexCommit
+): T =>
+  ({
+    ...current,
+    vector_index: update.vector_index,
+    vector_indexes: [...update.vector_indexes],
+    isEmbedded:
+      currentRevision === update.expectedRevision ? update.isEmbeddedOnMatch : false,
+    isDirty: currentRevision === update.expectedRevision ? update.isDirtyOnMatch : true,
+  }) as T;
+
+/** Change only vector state on the latest RxDB revision during recovery. */
+export const applyVectorInvalidation = <T extends ItemDocType>(
+  current: T,
+  options?: { touchUpdatedAt?: boolean; now?: number }
+): T =>
+  ({
+    ...current,
+    vector_index: -1,
+    vector_indexes: [],
+    isEmbedded: false,
+    isDirty: true,
+    updatedAt: options?.touchUpdatedAt ? options.now ?? Date.now() : current.updatedAt,
+  }) as T;
+
+export const isEmbeddingStateCommitCurrent = (
+  current: Pick<ItemDocType, "deletedAt" | "updatedAt">,
+  currentRevision: string,
+  expected: { expectedRevision?: string; expectedUpdatedAt?: number }
+): boolean =>
+  (current.deletedAt || 0) === 0 &&
+  (expected.expectedRevision === undefined || currentRevision === expected.expectedRevision) &&
+  (expected.expectedUpdatedAt === undefined || current.updatedAt === expected.expectedUpdatedAt);
 
 export type ImportTargetFolder = {
   id: string;
@@ -273,7 +357,9 @@ class DatabaseManager {
     const requestedScope = accessContext?.searchScope || "current";
     const privateUnlocked = spaceSessionService.isUnlocked(PRIVATE_SPACE_ID);
 
-    const spaceDocs = await db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec();
+    const spaceDocs = await db.spaces
+      .find({ selector: { isArchived: { $eq: false }, deletedAt: { $eq: 0 } } })
+      .exec();
     const spaces = spaceDocs.map((doc: any) => doc.toMutableJSON() as any);
     const allSpaceIds = spaces.map((space: any) => space.id as string);
     const nonPrivateSpaceIds = spaces
@@ -336,7 +422,7 @@ class DatabaseManager {
     const maxFoldersPerSpace = Math.max(1, Math.min(40, payload?.maxFoldersPerSpace ?? 14));
     const maxItemsPerFolder = Math.max(1, Math.min(6, payload?.maxItemsPerFolder ?? 3));
 
-    const spaceDocs = await db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec();
+    const spaceDocs = await db.spaces.find({ selector: { ...LIVE_SPACE_SELECTOR } }).exec();
     const sortedSpaces = spaceDocs
       .map((doc) => doc.toMutableJSON() as any)
       .sort((a, b) => {
@@ -369,7 +455,14 @@ class DatabaseManager {
         continue;
       }
 
-      const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: spaceId } } }).exec();
+      const folderDocs = await db.folders
+        .find({
+          selector: {
+            spaceId: { $eq: spaceId },
+            deletedAt: { $eq: 0 },
+          },
+        })
+        .exec();
       const sortedFolders = folderDocs
         .map((doc) => doc.toMutableJSON() as FolderDocType)
         .sort((a, b) => {
@@ -513,14 +606,19 @@ class DatabaseManager {
    * Retrieves all items that have not yet been embedded.
    * This is used to process new items that need to be added to the vector store.
    */
-  async getItemsToEmbed(payload?: { limit?: number }): Promise<ItemDocType[]> {
+  async getItemsToEmbed(
+    payload?: { limit?: number }
+  ): Promise<(ItemDocType & { expectedRevision: string })[]> {
     const db = await getDb();
     const limit = Math.max(1, Math.min(100, Math.floor(payload?.limit || 100)));
     const itemsToEmbed = await db.items
       .find({ selector: { isEmbedded: false, isMetaFetched: true, deletedAt: { $eq: 0 } }, limit })
       .exec();
     return itemsToEmbed
-      .map((item) => item.toMutableJSON())
+      .map((item) => ({
+        ...(item.toMutableJSON() as ItemDocType),
+        expectedRevision: item.revision,
+      }))
       .filter(isMetadataReadyForEmbedding);
   }
 
@@ -529,7 +627,7 @@ class DatabaseManager {
    * despite having no usable vector reference. It is safe to run once because
    * blank records stay skipped instead of entering an endless queue.
    */
-  async repairItemsMissingVectors(): Promise<number> {
+  async repairItemsMissingVectors(vectorCount = Number.MAX_SAFE_INTEGER): Promise<number> {
     const db = await getDb();
     let afterId = "";
     let repairedCount = 0;
@@ -547,13 +645,17 @@ class DatabaseManager {
 
       const updates = docs
         .map((doc) => doc.toMutableJSON() as ItemDocType)
-        .filter((item) => hasEmbeddableText(item) && !hasVectorReference(item))
+        .filter((item) => {
+          if (!hasEmbeddableText(item)) return false;
+          const indexes = getVectorIndexes(item);
+          return indexes.length === 0 || indexes.some((index) => index >= vectorCount);
+        })
         .map((item) => ({
           ...item,
           vector_index: -1,
           vector_indexes: [],
           isEmbedded: false,
-          isDirty: false,
+          isDirty: true,
         }));
       if (updates.length > 0) {
         await db.items.bulkUpsert(updates);
@@ -567,28 +669,111 @@ class DatabaseManager {
     return repairedCount;
   }
 
-  /**
-   * Retrieves all items that have not been soft-deleted.
-   * This is the source of truth for the periodic `rebuildAndCompact` sync process.
-   */
-  async getAllActiveItems(): Promise<ItemDocType[]> {
+  /** Build the compaction plan without retaining every item's text/media body. */
+  async getActiveVectorInventory(): Promise<ActiveVectorInventoryItem[]> {
     const db = await getDb();
-    const activeItems = await db.items.find({ selector: { deletedAt: { $eq: 0 } } }).exec();
-    return activeItems.map((item) => item.toMutableJSON());
+    const inventory: ActiveVectorInventoryItem[] = [];
+    let afterId = "";
+
+    while (true) {
+      const selector: Record<string, unknown> = { deletedAt: { $eq: 0 } };
+      if (afterId) selector.id = { $gt: afterId };
+      const docs = await db.items
+        .find({ selector, sort: [{ id: "asc" }], limit: BULK_ITEM_UPDATE_BATCH_SIZE } as any)
+        .exec();
+      if (docs.length === 0) break;
+
+      for (const doc of docs) {
+        const vectorIndexes = doc.get("vector_indexes") as number[] | undefined;
+        inventory.push({
+          id: doc.primary,
+          vector_index: doc.get("vector_index") as number | undefined,
+          vector_indexes: Array.isArray(vectorIndexes) ? [...vectorIndexes] : [],
+          isEmbedded: doc.get("isEmbedded") === true,
+          isMetaFetched: doc.get("isMetaFetched") === true,
+          isDirty: doc.get("isDirty") === true,
+          revision: doc.revision,
+        });
+      }
+
+      afterId = docs[docs.length - 1].primary;
+      await yieldToEventLoop();
+    }
+
+    return inventory;
+  }
+
+  /** Load only the small dirty batch currently being re-embedded. */
+  async getActiveItemsByIds(itemIds: string[]): Promise<ActiveVectorEmbeddingSnapshot[]> {
+    const db = await getDb();
+    const ids = Array.from(new Set(itemIds.filter(Boolean)));
+    const items: ActiveVectorEmbeddingSnapshot[] = [];
+
+    for (let start = 0; start < ids.length; start += BULK_ITEM_UPDATE_BATCH_SIZE) {
+      const batchIds = ids.slice(start, start + BULK_ITEM_UPDATE_BATCH_SIZE);
+      const docsById = await db.items.findByIds(batchIds).exec();
+      for (const itemId of batchIds) {
+        const doc = docsById.get(itemId);
+        if (!doc || ((doc.get("deletedAt") as number | undefined) || 0) !== 0) continue;
+        items.push({
+          item: doc.toMutableJSON() as ItemDocType,
+          revision: doc.revision,
+        });
+      }
+      if (start + batchIds.length < ids.length) await yieldToEventLoop();
+    }
+
+    return items;
+  }
+
+  /**
+   * Atomically re-check the source revision while committing compacted vector
+   * indexes. RxDB retries the modifier with the latest stored document after a
+   * conflict, so an edit that lands during this commit is also detected.
+   */
+  async commitCompactedVectorIndexes(updates: CompactedVectorIndexCommit[]): Promise<void> {
+    const db = await getDb();
+    const updateMap = new Map<string, CompactedVectorIndexCommit>();
+    for (const update of updates) {
+      if (!update.id) continue;
+      updateMap.set(update.id, update);
+    }
+    const ids = Array.from(updateMap.keys());
+
+    for (let start = 0; start < ids.length; start += BULK_ITEM_UPDATE_BATCH_SIZE) {
+      const batchIds = ids.slice(start, start + BULK_ITEM_UPDATE_BATCH_SIZE);
+      const docsMap = await db.items.findByIds(batchIds).exec();
+      await Promise.all(
+        batchIds.map(async (itemId) => {
+          const doc = docsMap.get(itemId);
+          const update = updateMap.get(itemId);
+          if (!doc || !update) return;
+          await db.items.incrementalWriteQueue.addWrite(doc._data, (current) =>
+            applyCompactedVectorIndexCommit(current, current._rev, update)
+          );
+        })
+      );
+      if (start + batchIds.length < ids.length) await yieldToEventLoop();
+    }
   }
 
   /**
    * Retrieves all active items that have been marked as dirty (i.e., their content has changed).
    * These items need to be re-embedded.
    */
-  async getDirtyItems(payload?: { limit?: number }): Promise<ItemDocType[]> {
+  async getDirtyItems(
+    payload?: { limit?: number }
+  ): Promise<(ItemDocType & { expectedRevision: string })[]> {
     const db = await getDb();
     const limit = Math.max(1, Math.min(100, Math.floor(payload?.limit || 100)));
     const dirtyItems = await db.items
       .find({ selector: { isDirty: true, isMetaFetched: true, deletedAt: { $eq: 0 } }, limit })
       .exec();
     return dirtyItems
-      .map((item) => item.toMutableJSON())
+      .map((item) => ({
+        ...(item.toMutableJSON() as ItemDocType),
+        expectedRevision: item.revision,
+      }))
       .filter(isMetadataReadyForEmbedding);
   }
 
@@ -758,20 +943,14 @@ class DatabaseManager {
         .exec();
       if (batch.length === 0) break;
 
-      const updates = batch.map((doc) => {
-        const current = doc.toMutableJSON() as ItemDocType;
-        return {
-          ...current,
-          userId: this.normalizeUserId(doc.get("userId") as string | null | undefined),
-          vector_index: -1,
-          vector_indexes: [],
-          isEmbedded: false,
-          isDirty: true,
-          updatedAt: touchUpdatedAt ? now : current.updatedAt,
-        };
-      });
-      await db.items.bulkUpsert(updates);
-      updatedCount += updates.length;
+      await Promise.all(
+        batch.map((doc) =>
+          db.items.incrementalWriteQueue.addWrite(doc._data, (current) =>
+            applyVectorInvalidation(current, { touchUpdatedAt, now })
+          )
+        )
+      );
+      updatedCount += batch.length;
       afterId = batch[batch.length - 1].primary;
       await yieldToEventLoop();
     }
@@ -786,10 +965,15 @@ class DatabaseManager {
    */
   async deleteItem(payload: { id: string }): Promise<void> {
     const db = await getDb();
-    const item = await db.items.findOne(payload.id).exec();
-    if (item) {
-      const now = Date.now();
-      await item.patch({ deletedAt: now });
+    await withEntityMutationLock(db, "item", payload.id, async () => {
+      const item = await db.items.findOne(payload.id).exec();
+      if (!item) return;
+      const now = nextBinMutationTimestamp(
+        Date.now(),
+        item.get("updatedAt") as number | undefined,
+        item.get("deletedAt") as number | undefined
+      );
+      await item.patch({ deletedAt: now, updatedAt: now });
       if (item.vector_index !== undefined && item.vector_index > -1) {
         await db.deleted_items.upsert({
           id: item.primary,
@@ -797,7 +981,7 @@ class DatabaseManager {
           deletedAt: now,
         });
       }
-    }
+    });
   }
 
   /**
@@ -815,9 +999,9 @@ class DatabaseManager {
    * This is used to efficiently update multiple items at once, for example,
    * when updating vector indexes after an embedding or sync operation.
    */
-  async bulkUpdateItems(updates: Partial<ItemDocType>[]): Promise<void> {
+  async bulkUpdateItems(updates: BulkItemUpdate[]): Promise<void> {
     const db = await getDb();
-    const updateMap = new Map<string, Partial<ItemDocType>>();
+    const updateMap = new Map<string, BulkItemUpdate>();
     for (const update of updates) {
       if (!update.id) continue;
       updateMap.set(update.id, update);
@@ -825,22 +1009,34 @@ class DatabaseManager {
     const ids = Array.from(updateMap.keys());
     for (let start = 0; start < ids.length; start += BULK_ITEM_UPDATE_BATCH_SIZE) {
       const batchIds = ids.slice(start, start + BULK_ITEM_UPDATE_BATCH_SIZE);
-      const docsMap = await db.items.findByIds(batchIds).exec();
-      const docsToUpdate = [];
-
-      for (const doc of docsMap.values()) {
-        const update = updateMap.get(doc.primary);
+      for (const id of batchIds) {
+        const update = updateMap.get(id);
         if (!update) continue;
-        const mutableDoc = doc.toMutableJSON();
-        docsToUpdate.push({
-          ...mutableDoc,
-          ...update,
-          userId: this.normalizeUserId((update.userId as string | null | undefined) ?? mutableDoc.userId),
-        });
-      }
+        await withEntityMutationLock(db, "item", id, async () => {
+          const doc = await db.items.findOne(id).exec();
+          if (!doc) return;
+          if (!isEmbeddingStateCommitCurrent(
+            {
+              deletedAt: (doc.get("deletedAt") as number | undefined) || 0,
+              updatedAt: (doc.get("updatedAt") as number | undefined) || 0,
+            },
+            doc.revision,
+            update
+          )) return;
 
-      if (docsToUpdate.length > 0) {
-        await db.items.bulkUpsert(docsToUpdate);
+          const {
+            id: _id,
+            deletedAt: _deletedAt,
+            expectedRevision: _expectedRevision,
+            expectedUpdatedAt: _expectedUpdatedAt,
+            ...patch
+          } = update;
+          if (patch.userId !== undefined) {
+            patch.userId = this.normalizeUserId(patch.userId);
+          }
+          if (Object.keys(patch).length === 0) return;
+          await doc.incrementalPatch(patch);
+        });
       }
       if (start + batchIds.length < ids.length) await yieldToEventLoop();
     }
@@ -873,20 +1069,32 @@ class DatabaseManager {
       for (const folder of folderDocs) {
         folderSpaceById.set(folder.get("id") as string, (folder.get("spaceId") as string) || PUBLIC_SPACE_ID);
       }
-
-      const normalized = payload.items.map((item) => ({
-        ...item,
-        userId: this.normalizeUserId(item.userId),
-        spaceId: folderSpaceById.get(item.folderId) || item.spaceId || PUBLIC_SPACE_ID,
-      }));
-      const result = await db.items.bulkInsert(normalized);
-      if (result.error.length > 0) {
-        console.error("DB: Failed to insert items:", result.error);
-        throw new Error(`Failed to insert ${result.error.length} items.`);
+      if (folderSpaceById.size !== folderIds.length) {
+        throw new Error("DESTINATION_FOLDER_NOT_FOUND");
       }
-      try {
-        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-      } catch {}
+
+      await withSpaceMutationLocks(db, folderSpaceById.values(), async () => {
+        for (const [folderId, spaceId] of folderSpaceById) {
+          await requireLiveFolderDestination(db, folderId, spaceId);
+        }
+        const normalized = payload.items.map((item) => {
+          const spaceId = folderSpaceById.get(item.folderId);
+          if (!spaceId) throw new Error("DESTINATION_FOLDER_NOT_FOUND");
+          return {
+            ...item,
+            userId: this.normalizeUserId(item.userId),
+            spaceId,
+          };
+        });
+        const result = await db.items.bulkInsert(normalized);
+        if (result.error.length > 0) {
+          console.error("DB: Failed to insert items:", result.error);
+          throw new Error(`Failed to insert ${result.error.length} items.`);
+        }
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+        } catch {}
+      });
     }
   }
 
@@ -900,55 +1108,53 @@ class DatabaseManager {
     };
   }): Promise<ItemDocType> {
     const db = await getDb();
-    const now = Date.now();
-    const folder = await db.folders.findOne(payload.item.folderId).exec();
-    const folderSpaceId =
-      ((folder?.get("spaceId") as string | undefined) || payload.item.spaceId || PUBLIC_SPACE_ID).trim() ||
-      PUBLIC_SPACE_ID;
-    const isMetaFetched = isMetadataFetchableUrl(payload.item.url)
-      ? payload.item.isMetaFetched ?? false
-      : true;
-    const item: ItemDocType = {
-      id: payload.item.id ?? crypto.randomUUID?.() ?? `${now}`,
-      userId: this.normalizeUserId(payload.item.userId),
-      title: payload.item.title ?? "Untitled",
-      textContent: payload.item.textContent ?? "",
-      url: payload.item.url,
-      source: payload.item.source,
-      folderId: payload.item.folderId,
-      spaceId: folderSpaceId,
-      isFavorite: payload.item.isFavorite ?? false,
-      authorUsername: payload.item.authorUsername,
-      likes: payload.item.likes,
-      upvotes: payload.item.upvotes,
-      media: payload.item.media,
-      iconUrl: (payload.item as any).iconUrl,
-      displayImageUrl: (payload.item as any).displayImageUrl,
-      ocrText: payload.item.ocrText,
-      ocrError: payload.item.ocrError,
-      parentId: payload.item.parentId ?? null,
-      chunkOrder: payload.item.chunkOrder,
-      vector_index: -1,
-      vector_indexes: [],
-      ocrStatus: payload.item.ocrStatus ?? "pending",
-      ocrModelVersion: payload.item.ocrModelVersion ?? "",
-      ocrSourceHash: payload.item.ocrSourceHash,
-      ocrUpdatedAt: payload.item.ocrUpdatedAt ?? 0,
-      ocrConfidence: payload.item.ocrConfidence,
-      ocrLineCount: payload.item.ocrLineCount,
-      isEmbedded: false,
-      isMetaFetched,
-      isDirty: payload.item.isDirty ?? true,
-      serverVersion: 0,
-      createdAt: now,
-      updatedAt: now,
-      deletedAt: 0,
-    };
-    await db.items.insert(item);
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
-    return item;
+    return withLiveFolderDestination(db, payload.item.folderId, async ({ spaceId }) => {
+      const now = Date.now();
+      const isMetaFetched = isMetadataFetchableUrl(payload.item.url)
+        ? payload.item.isMetaFetched ?? false
+        : true;
+      const item: ItemDocType = {
+        id: payload.item.id ?? crypto.randomUUID?.() ?? `${now}`,
+        userId: this.normalizeUserId(payload.item.userId),
+        title: payload.item.title ?? "Untitled",
+        textContent: payload.item.textContent ?? "",
+        url: payload.item.url,
+        source: payload.item.source,
+        folderId: payload.item.folderId,
+        spaceId,
+        isFavorite: payload.item.isFavorite ?? false,
+        authorUsername: payload.item.authorUsername,
+        likes: payload.item.likes,
+        upvotes: payload.item.upvotes,
+        media: payload.item.media,
+        iconUrl: (payload.item as any).iconUrl,
+        displayImageUrl: (payload.item as any).displayImageUrl,
+        ocrText: payload.item.ocrText,
+        ocrError: payload.item.ocrError,
+        parentId: payload.item.parentId ?? null,
+        chunkOrder: payload.item.chunkOrder,
+        vector_index: -1,
+        vector_indexes: [],
+        ocrStatus: payload.item.ocrStatus ?? "pending",
+        ocrModelVersion: payload.item.ocrModelVersion ?? "",
+        ocrSourceHash: payload.item.ocrSourceHash,
+        ocrUpdatedAt: payload.item.ocrUpdatedAt ?? 0,
+        ocrConfidence: payload.item.ocrConfidence,
+        ocrLineCount: payload.item.ocrLineCount,
+        isEmbedded: false,
+        isMetaFetched,
+        isDirty: payload.item.isDirty ?? true,
+        serverVersion: 0,
+        createdAt: now,
+        updatedAt: now,
+        deletedAt: 0,
+      };
+      await db.items.insert(item);
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
+      return item;
+    });
   }
 
   /**
@@ -965,31 +1171,37 @@ class DatabaseManager {
     spaceId?: string;
   }): Promise<FolderDocType> {
     const db = await getDb();
-    const now = Date.now();
-    const folder: FolderDocType = {
-      id: payload.id,
-      name: payload.name,
-      userId: this.normalizeUserId(payload.userId),
-      spaceId: payload.spaceId || PUBLIC_SPACE_ID,
-      parentId: payload.parentId ?? null,
-      type: payload.type ?? "folder",
-      sortOrder: now,
-      isLocked: payload.isLocked ?? false,
-      isPinned: payload.isPinned ?? false,
-      isCollapsed: false,
-      deletedAt: 0,
-      purgeAt: 0,
-      isDirty: false,
-      serverVersion: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
+    const requestedSpaceId = (payload.spaceId || PUBLIC_SPACE_ID).trim() || PUBLIC_SPACE_ID;
+    return withLiveSpaceDestination(db, requestedSpaceId, async (_spaceDoc, spaceId) => {
+      if (payload.parentId) {
+        await requireLiveFolderDestination(db, payload.parentId, spaceId);
+      }
+      const now = Date.now();
+      const folder: FolderDocType = {
+        id: payload.id,
+        name: payload.name,
+        userId: this.normalizeUserId(payload.userId),
+        spaceId,
+        parentId: payload.parentId ?? null,
+        type: payload.type ?? "folder",
+        sortOrder: now,
+        isLocked: payload.isLocked ?? false,
+        isPinned: payload.isPinned ?? false,
+        isCollapsed: false,
+        deletedAt: 0,
+        purgeAt: 0,
+        isDirty: false,
+        serverVersion: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
 
-    await db.folders.insert(folder);
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    return folder;
+      await db.folders.insert(folder);
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+      return folder;
+    });
   }
 
   async toggleFolderPinned(payload: { id: string; value?: boolean }): Promise<void> {

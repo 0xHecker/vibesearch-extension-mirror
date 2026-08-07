@@ -6,6 +6,7 @@ import { RxDBLocalDocumentsPlugin } from "rxdb/plugins/local-documents";
 import { RxDBQueryBuilderPlugin } from "rxdb/plugins/query-builder";
 import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
 import { withDexieRequiredIndexes } from "@src/services/rxdb-dexie-required-indexes";
+import { migrateAllHistoricalCollectionVersions } from "@src/services/rxdb-migration-recovery";
 
 if (import.meta.env.MODE === "development") {
   addRxPlugin(RxDBDevModePlugin);
@@ -16,8 +17,8 @@ addRxPlugin(RxDBMigrationSchemaPlugin);
 
 // Import schemas
 import { itemMigrationStrategies, itemSchema, ItemDocType } from "@src/schemas/item_schema";
-import { folderSchema, FolderDocType } from "@src/schemas/folder_schema";
-import { spaceSchema, SpaceDocType } from "@src/schemas/space_schema";
+import { folderMigrationStrategies, folderSchema, FolderDocType } from "@src/schemas/folder_schema";
+import { spaceMigrationStrategies, spaceSchema, SpaceDocType } from "@src/schemas/space_schema";
 import { spaceGroupSchema, SpaceGroupDocType } from "@src/schemas/space_group_schema";
 import { tagSchema, TagDocType } from "@src/schemas/tag_schema";
 import { itemTagSchema, ItemTagDocType } from "@src/schemas/item_tag_schema";
@@ -53,12 +54,6 @@ export type MyDatabase = RxDatabase<MyDatabaseCollections>;
 
 let dbPromise: Promise<MyDatabase> | null = null;
 
-const ensureFolderBinFields = (oldDoc: any) => {
-  oldDoc.deletedAt = oldDoc.deletedAt || 0;
-  oldDoc.purgeAt = oldDoc.purgeAt || 0;
-  return oldDoc;
-};
-
 const createDatabase = async () => {
   let storage: RxStorage<any, any> = withDexieRequiredIndexes(getRxStorageDexie());
   if (import.meta.env.MODE === "development") {
@@ -81,20 +76,17 @@ const createDatabase = async () => {
     items: {
       schema: itemSchema,
       migrationStrategies: itemMigrationStrategies,
+      autoMigrate: false,
     },
     folders: {
       schema: folderSchema,
-      // v0 -> v1: tab groups/folders gain a soft-delete state so they can
-      // move to Bin before purge instead of disappearing immediately.
-      migrationStrategies: {
-        1: ensureFolderBinFields,
-        // v1 -> v2: recover from dev builds that created a v1 folder schema
-        // with Dexie-normalized required indexes before the source schema settled.
-        2: ensureFolderBinFields,
-      },
+      migrationStrategies: folderMigrationStrategies,
+      autoMigrate: false,
     },
     spaces: {
       schema: spaceSchema,
+      migrationStrategies: spaceMigrationStrategies,
+      autoMigrate: false,
     },
     space_groups: {
       schema: spaceGroupSchema,
@@ -131,6 +123,12 @@ const createDatabase = async () => {
       schema: deletedItemSchema,
     },
   });
+
+  // One released build reset these schema versions. Migrate every stranded
+  // store ourselves because RxDB's automatic path handles only one old store.
+  await migrateAllHistoricalCollectionVersions(db.items);
+  await migrateAllHistoricalCollectionVersions(db.folders);
+  await migrateAllHistoricalCollectionVersions(db.spaces);
 
   return db;
 };

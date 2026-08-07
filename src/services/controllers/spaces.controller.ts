@@ -8,6 +8,7 @@ import {
   PUBLIC_SPACE_NAME,
   SPACE_NOT_BINNED,
   computeBinPurgeAt,
+  hasValidSpacePurgeDeadline,
   isSpacePurgeable,
   normalizeSpaceName,
   slugifySpaceName,
@@ -23,6 +24,14 @@ import {
 } from "@src/services/password-hash.service";
 import { spaceSessionService } from "@src/services/space-session.service";
 import { appendUnorderedIds } from "@src/utils/ordered-ids";
+import { nextBinMutationTimestamp } from "@src/common/bin";
+import {
+  withBinMutationLock,
+  withSpaceMutationLock,
+} from "@src/services/entity-mutation-lock";
+import { forEachIdKeysetPage } from "@src/services/rxdb-keyset-pagination";
+import { deleteAllMediaForItem } from "@src/services/media-storage";
+import { deleteUnreferencedOpfsItemDirectories } from "@src/services/opfs-media-lifecycle";
 
 type SpaceAccessView = {
   isUnlocked: boolean;
@@ -49,6 +58,7 @@ const AUTH_ATTEMPT_WINDOW_MS = 5 * 60 * 1000;
 const AUTH_ATTEMPT_MAX_FAILURES = 5;
 const AUTH_ATTEMPT_BLOCK_MS = 2 * 60 * 1000;
 const SPACE_ASSIGNMENT_REPAIR_VERSION = 1;
+export const SPACE_ASSIGNMENT_REPAIR_PAGE_SIZE = 200;
 
 export type SpaceListItem = {
   id: string;
@@ -65,6 +75,12 @@ export type SpaceListItem = {
   access: SpaceAccessView;
 };
 
+type SpacesControllerOptions = {
+  getDb?: typeof getDb;
+  now?: () => number;
+  deleteAllMediaForItem?: typeof deleteAllMediaForItem;
+};
+
 const buildSpaceId = () => crypto.randomUUID?.() ?? `space_${Date.now()}_${Math.random()}`;
 
 const safeSlug = (name: string, fallback: string): string => {
@@ -77,6 +93,8 @@ export class SpacesController {
   private authAttempts = new Map<string, AuthAttemptState>();
   private recoveryPepperStorageKey = "vibe.search.recoveryPepper.v1";
   private spaceRepairVersionStorageKey = "vibe.search.spaceRepair.version";
+
+  constructor(private readonly options: SpacesControllerOptions = {}) {}
 
   private normalizeUserId(userId: string | null | undefined): string {
     return typeof userId === "string" ? userId : "";
@@ -220,7 +238,7 @@ export class SpacesController {
   }
 
   async ensureDefaults(): Promise<void> {
-    const db = await getDb();
+    const db = await (this.options.getDb ?? getDb)();
     const now = Date.now();
     const existing = await db.spaces.findByIds([PUBLIC_SPACE_ID, PRIVATE_SPACE_ID]).exec();
     const upserts: SpaceDocType[] = [];
@@ -268,69 +286,97 @@ export class SpacesController {
     folderUpdates: number;
     itemUpdates: number;
   }> {
-    const db = await getDb();
+    const db = await (this.options.getDb ?? getDb)();
     await this.ensureDefaults();
 
-    const [spaceDocs, folderDocs, itemDocs] = await Promise.all([
-      db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec(),
-      db.folders.find().exec(),
-      db.items.find().exec(),
-    ]);
-
-    const validSpaceIds = new Set(spaceDocs.map((doc) => doc.get("id") as string));
+    // This repair runs before the offscreen UI is ready. Loading every item
+    // here used to retain all text, OCR, and media payloads at once, which
+    // could put a large library into a repeatable startup/OOM loop before the
+    // completion marker was written. Keep only compact folder-to-space
+    // metadata and process RxDocuments in bounded, uncached keyset pages.
+    const validSpaceIds = new Set<string>();
+    await forEachIdKeysetPage({
+      collection: db.spaces as any,
+      selector: { isArchived: { $eq: false } },
+      pageSize: SPACE_ASSIGNMENT_REPAIR_PAGE_SIZE,
+      onPage: (spaceDocs: any[]) => {
+        for (const spaceDoc of spaceDocs) {
+          const id = spaceDoc.get("id") as string | undefined;
+          if (id) validSpaceIds.add(id);
+        }
+      },
+    });
     if (!validSpaceIds.has(PUBLIC_SPACE_ID)) {
       validSpaceIds.add(PUBLIC_SPACE_ID);
     }
 
-    const folderUpdates: any[] = [];
-    for (const folderDoc of folderDocs) {
-      const raw = folderDoc.toMutableJSON();
-      const currentSpaceId = (raw as any).spaceId as string | undefined;
-      const nextSpaceId =
-        currentSpaceId && validSpaceIds.has(currentSpaceId) ? currentSpaceId : PUBLIC_SPACE_ID;
-      if (currentSpaceId !== nextSpaceId) {
-        folderUpdates.push({
-          ...raw,
-          userId: this.normalizeUserId((raw as any).userId),
-          spaceId: nextSpaceId,
-          updatedAt: Date.now(),
-        });
-      }
-    }
-    if (folderUpdates.length > 0) {
-      await db.folders.bulkUpsert(folderUpdates);
-    }
-
-    const effectiveFolderDocs =
-      folderUpdates.length > 0 ? await db.folders.find().exec() : folderDocs;
     const folderSpaceById = new Map<string, string>();
-    for (const folderDoc of effectiveFolderDocs) {
-      const json = folderDoc.toMutableJSON() as any;
-      folderSpaceById.set(json.id, json.spaceId || PUBLIC_SPACE_ID);
-    }
+    let folderUpdates = 0;
+    await forEachIdKeysetPage({
+      collection: db.folders as any,
+      selector: {},
+      pageSize: SPACE_ASSIGNMENT_REPAIR_PAGE_SIZE,
+      onPage: async (folderDocs: any[]) => {
+        const updatedAt = Date.now();
+        const patches: Promise<unknown>[] = [];
+        for (const folderDoc of folderDocs) {
+          const id = folderDoc.primary as string;
+          const currentSpaceId = folderDoc.get("spaceId") as string | undefined;
+          const nextSpaceId =
+            currentSpaceId && validSpaceIds.has(currentSpaceId)
+              ? currentSpaceId
+              : PUBLIC_SPACE_ID;
+          folderSpaceById.set(id, nextSpaceId);
+          if (currentSpaceId === nextSpaceId) continue;
+          folderUpdates += 1;
+          patches.push(
+            folderDoc.incrementalPatch({
+              userId: this.normalizeUserId(
+                folderDoc.get("userId") as string | null | undefined
+              ),
+              spaceId: nextSpaceId,
+              updatedAt,
+            })
+          );
+        }
+        await Promise.all(patches);
+      },
+    });
 
-    const itemUpdates: any[] = [];
-    for (const itemDoc of itemDocs) {
-      const raw = itemDoc.toMutableJSON() as any;
-      const currentSpaceId = raw.spaceId as string | undefined;
-      const folderSpace = folderSpaceById.get(raw.folderId);
-      const targetSpaceId =
-        folderSpace ||
-        (currentSpaceId && validSpaceIds.has(currentSpaceId) ? currentSpaceId : PUBLIC_SPACE_ID);
-      if (currentSpaceId !== targetSpaceId) {
-        itemUpdates.push({
-          ...raw,
-          userId: this.normalizeUserId(raw.userId as string | null | undefined),
-          spaceId: targetSpaceId,
-          updatedAt: Date.now(),
-        });
-      }
-    }
-    if (itemUpdates.length > 0) {
-      await db.items.bulkUpsert(itemUpdates);
-    }
+    let itemUpdates = 0;
+    await forEachIdKeysetPage({
+      collection: db.items as any,
+      selector: {},
+      pageSize: SPACE_ASSIGNMENT_REPAIR_PAGE_SIZE,
+      onPage: async (itemDocs: any[]) => {
+        const updatedAt = Date.now();
+        const patches: Promise<unknown>[] = [];
+        for (const itemDoc of itemDocs) {
+          const currentSpaceId = itemDoc.get("spaceId") as string | undefined;
+          const folderId = itemDoc.get("folderId") as string | undefined;
+          const folderSpace = folderId ? folderSpaceById.get(folderId) : undefined;
+          const targetSpaceId =
+            folderSpace ||
+            (currentSpaceId && validSpaceIds.has(currentSpaceId)
+              ? currentSpaceId
+              : PUBLIC_SPACE_ID);
+          if (currentSpaceId === targetSpaceId) continue;
+          itemUpdates += 1;
+          patches.push(
+            itemDoc.incrementalPatch({
+              userId: this.normalizeUserId(
+                itemDoc.get("userId") as string | null | undefined
+              ),
+              spaceId: targetSpaceId,
+              updatedAt,
+            })
+          );
+        }
+        await Promise.all(patches);
+      },
+    });
 
-    if (folderUpdates.length > 0 || itemUpdates.length > 0) {
+    if (folderUpdates > 0 || itemUpdates > 0) {
       try {
         chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
       } catch {}
@@ -340,8 +386,8 @@ export class SpacesController {
     }
 
     return {
-      folderUpdates: folderUpdates.length,
-      itemUpdates: itemUpdates.length,
+      folderUpdates,
+      itemUpdates,
     };
   }
 
@@ -773,85 +819,105 @@ export class SpacesController {
   }
 
   async moveToBin(payload: { id: string }): Promise<{ success: boolean; purgeAt: number }> {
-    const db = await getDb();
+    const db = await (this.options.getDb ?? getDb)();
     const id = (payload.id || "").trim();
     if (!id || id === PUBLIC_SPACE_ID || id === PRIVATE_SPACE_ID) {
       throw new Error("DEFAULT_SPACE_BIN_NOT_ALLOWED");
     }
-    const doc = await db.spaces.findOne(id).exec();
-    if (!doc) throw new Error("SPACE_NOT_FOUND");
-    const current = doc.toMutableJSON() as SpaceDocType;
-    if ((current.deletedAt || 0) > 0) {
-      return { success: true, purgeAt: current.purgeAt || 0 };
-    }
-    const now = Date.now();
-    const purgeAt = computeBinPurgeAt(now);
-    await doc.patch({ deletedAt: now, purgeAt, updatedAt: now });
-    if (current.isPrivate) {
-      try {
-        spaceSessionService.lockSpace(current.id);
-      } catch {}
-    }
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
-    } catch {}
-    return { success: true, purgeAt };
+    return withBinMutationLock(db, () =>
+      withSpaceMutationLock(db, id, async () => {
+        const doc = await db.spaces.findOne(id).exec();
+        if (!doc) throw new Error("SPACE_NOT_FOUND");
+        const current = doc.toMutableJSON() as SpaceDocType;
+        if ((current.deletedAt || 0) > 0) {
+          return { success: true, purgeAt: current.purgeAt || 0 };
+        }
+        const now = nextBinMutationTimestamp(
+          this.options.now?.() ?? Date.now(),
+          current.updatedAt,
+          current.deletedAt
+        );
+        const purgeAt = computeBinPurgeAt(now);
+        await doc.patch({ deletedAt: now, purgeAt, updatedAt: now });
+        if (current.isPrivate) {
+          try {
+            spaceSessionService.lockSpace(current.id);
+          } catch {}
+        }
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+        } catch {}
+        return { success: true, purgeAt };
+      })
+    );
   }
 
   async restoreFromBin(payload: {
     id: string;
   }): Promise<{ success: boolean; relocated?: boolean; message?: string }> {
-    const db = await getDb();
+    const db = await (this.options.getDb ?? getDb)();
     const id = (payload.id || "").trim();
     if (!id) return { success: false };
-    const doc = await db.spaces.findOne(id).exec();
-    if (!doc) throw new Error("SPACE_NOT_FOUND");
-    const current = doc.toMutableJSON() as SpaceDocType;
-    if ((current.deletedAt || 0) === 0) return { success: true };
-    const now = Date.now();
-    if (isSpacePurgeable(current, now)) {
-      throw new Error("SPACE_PURGE_IN_PROGRESS");
-    }
-    const baseName = normalizeSpaceName(current.name || "").trim() || "Restored space";
-    const existing = await db.spaces.find({ selector: { ...LIVE_SPACE_SELECTOR } }).exec();
-    const existingNames = new Set(
-      existing
-        .map((row) => ((row.get("name") as string) || "").toLowerCase())
-        .filter((value) => value !== baseName.toLowerCase())
+    return withBinMutationLock(db, () =>
+      withSpaceMutationLock(db, id, async () => {
+        const doc = await db.spaces.findOne(id).exec();
+        if (!doc) throw new Error("SPACE_NOT_FOUND");
+        const current = doc.toMutableJSON() as SpaceDocType;
+        if ((current.deletedAt || 0) === 0) return { success: true };
+        const now = nextBinMutationTimestamp(
+          this.options.now?.() ?? Date.now(),
+          current.updatedAt,
+          current.deletedAt
+        );
+        if (isSpacePurgeable(current, now)) {
+          throw new Error("SPACE_PURGE_IN_PROGRESS");
+        }
+        const baseName = normalizeSpaceName(current.name || "").trim() || "Restored space";
+        const existing = await db.spaces.find({ selector: { ...LIVE_SPACE_SELECTOR } }).exec();
+        const existingNames = new Set(
+          existing
+            .map((row) => ((row.get("name") as string) || "").toLowerCase())
+            .filter((value) => value !== baseName.toLowerCase())
+        );
+        let nextName = baseName;
+        if (existingNames.has(nextName.toLowerCase())) {
+          let index = 2;
+          while (existingNames.has(`${baseName} (restored ${index})`.toLowerCase())) {
+            index += 1;
+          }
+          nextName = `${baseName} (restored ${index})`;
+        }
+        const patch: Partial<SpaceDocType> = {
+          deletedAt: SPACE_NOT_BINNED,
+          purgeAt: 0,
+          updatedAt: now,
+        };
+        let relocated = false;
+        if (nextName !== baseName) {
+          patch.name = nextName;
+          patch.slug = safeSlug(nextName, current.slug);
+        }
+        const originalGroupId = (current.spaceGroupId || "").trim();
+        if (originalGroupId && db.space_groups?.findOne) {
+          const groupDoc = await db.space_groups.findOne(originalGroupId).exec();
+          if (!groupDoc) {
+            patch.spaceGroupId = UNGROUPED_SPACE_GROUP_ID;
+            relocated = true;
+          }
+        }
+        await doc.patch(patch);
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+        } catch {}
+        return {
+          success: true,
+          relocated,
+          message: relocated
+            ? "Heads up: the original space group is no longer available, so this space was restored to Ungrouped."
+            : undefined,
+        };
+      })
     );
-    let nextName = baseName;
-    if (existingNames.has(nextName.toLowerCase())) {
-      let index = 2;
-      while (existingNames.has(`${baseName} (restored ${index})`.toLowerCase())) {
-        index += 1;
-      }
-      nextName = `${baseName} (restored ${index})`;
-    }
-    const patch: Partial<SpaceDocType> = { deletedAt: SPACE_NOT_BINNED, purgeAt: 0, updatedAt: now };
-    let relocated = false;
-    if (nextName !== baseName) {
-      patch.name = nextName;
-      patch.slug = safeSlug(nextName, current.slug);
-    }
-    const originalGroupId = (current.spaceGroupId || "").trim();
-    if (originalGroupId && db.space_groups?.findOne) {
-      const groupDoc = await db.space_groups.findOne(originalGroupId).exec();
-      if (!groupDoc) {
-        patch.spaceGroupId = UNGROUPED_SPACE_GROUP_ID;
-        relocated = true;
-      }
-    }
-    await doc.patch(patch);
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
-    } catch {}
-    return {
-      success: true,
-      relocated,
-      message: relocated
-        ? "Heads up: the original space group is no longer available, so this space was restored to Ungrouped."
-        : undefined,
-    };
   }
 
   async listBinSpaces(): Promise<SpaceListItem[]> {
@@ -865,77 +931,95 @@ export class SpacesController {
   }
 
   async purgeExpired(): Promise<{ purgedSpaceIds: string[] }> {
-    const db = await getDb();
-    const now = Date.now();
-    const docs = await db.spaces
-      .find({ selector: { deletedAt: { $gt: SPACE_NOT_BINNED }, purgeAt: { $lte: now } } })
-      .exec();
-    if (docs.length === 0) return { purgedSpaceIds: [] };
+    const db = await (this.options.getDb ?? getDb)();
+    return withBinMutationLock(db, async () => {
+      const now = this.options.now?.() ?? Date.now();
+      const docs = await db.spaces
+        .find({ selector: { deletedAt: { $gt: SPACE_NOT_BINNED } } })
+        .exec();
+      if (docs.length === 0) return { purgedSpaceIds: [] };
 
-    const purgedIds: string[] = [];
-    for (const doc of docs) {
-      const spaceId = doc.primary as string;
-      purgedIds.push(spaceId);
-      await this.hardDeleteSpaceContents(spaceId);
-      try {
-        await doc.remove();
-      } catch (removeError) {
-        console.error("[Spaces] purge: failed to remove space doc", removeError);
+      const purgedIds: string[] = [];
+      for (const candidate of docs) {
+        const spaceId = candidate.primary as string;
+        const purged = await withSpaceMutationLock(db, spaceId, async () => {
+          // The query above is only a candidate scan. Re-read inside the lock so
+          // a restore that won the race cannot lose its contents to stale purge.
+          const doc = await db.spaces.findOne(spaceId).exec();
+          if (!doc) return false;
+          const current = doc.toMutableJSON() as SpaceDocType;
+          if ((current.deletedAt || 0) === SPACE_NOT_BINNED) return false;
+          if (!hasValidSpacePurgeDeadline(current)) {
+            await doc.patch({ purgeAt: computeBinPurgeAt(now), updatedAt: now });
+            return false;
+          }
+          if (!isSpacePurgeable(current, now)) return false;
+
+          await this.hardDeleteSpaceContents(spaceId, db);
+          // A conflict here is an integrity failure and must not be swallowed:
+          // doing so could leave a concurrently restored, now-empty live space.
+          await doc.remove();
+          return true;
+        });
+        if (purged) purgedIds.push(spaceId);
       }
-    }
 
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
-    return { purgedSpaceIds: purgedIds };
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+      } catch {}
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
+      return { purgedSpaceIds: purgedIds };
+    });
   }
 
-  async deleteSpaceForever(payload: { id: string }): Promise<{ success: boolean; removedItems: number }> {
-    const db = await getDb();
+  async deleteSpaceForever(payload: {
+    id: string;
+    expectedDeletedAt: number;
+  }): Promise<{ success: boolean; removedItems: number }> {
+    const db = await (this.options.getDb ?? getDb)();
     const id = (payload.id || "").trim();
     if (!id || id === PUBLIC_SPACE_ID || id === PRIVATE_SPACE_ID) {
       throw new Error("DEFAULT_SPACE_DELETE_NOT_ALLOWED");
     }
-    const doc = await db.spaces.findOne(id).exec();
-    if (!doc) return { success: false, removedItems: 0 };
-    const removedItems = await this.hardDeleteSpaceContents(id);
-    try {
-      await doc.remove();
-    } catch (removeError) {
-      console.error("[Spaces] hard delete: failed to remove space doc", removeError);
-    }
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
-    return { success: true, removedItems };
+    return withBinMutationLock(db, () =>
+      withSpaceMutationLock(db, id, async () => {
+        const doc = await db.spaces.findOne(id).exec();
+        if (!doc) return { success: false, removedItems: 0 };
+        const current = doc.toMutableJSON() as SpaceDocType;
+        if (!(current.deletedAt > SPACE_NOT_BINNED)) {
+          throw new Error("SPACE_NOT_IN_BIN");
+        }
+        if (current.deletedAt !== payload.expectedDeletedAt) {
+          throw new Error("SPACE_BIN_ENTRY_CHANGED");
+        }
+        const removedItems = await this.hardDeleteSpaceContents(id, db);
+        await doc.remove();
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+        } catch {}
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+        } catch {}
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+        } catch {}
+        return { success: true, removedItems };
+      })
+    );
   }
 
-  private async hardDeleteSpaceContents(spaceId: string): Promise<number> {
-    const db = await getDb();
+  private async hardDeleteSpaceContents(
+    spaceId: string,
+    database?: Awaited<ReturnType<typeof getDb>>
+  ): Promise<number> {
+    const db = database ?? (await (this.options.getDb ?? getDb)());
     const PURGE_BATCH = 200;
     let removedItems = 0;
-
-    const folderDocs = await db.folders
-      .find({ selector: { spaceId: { $eq: spaceId } } })
-      .exec();
-    if (folderDocs.length > 0) {
-      for (let i = 0; i < folderDocs.length; i += PURGE_BATCH) {
-        const slice = folderDocs.slice(i, i + PURGE_BATCH);
-        await db.folders.bulkRemove(slice.map((doc) => doc.primary));
-      }
-    }
 
     let exhausted = false;
     while (!exhausted) {
@@ -946,8 +1030,61 @@ export class SpacesController {
         exhausted = true;
         break;
       }
+      const itemIds = itemDocs.map((doc) => doc.primary as string);
+
+      const removeResult = await db.items.bulkRemove(itemIds);
+      const writeErrors = Array.isArray(removeResult?.error)
+        ? removeResult.error
+        : [];
+      if (writeErrors.length > 0) {
+        throw new AggregateError(
+          writeErrors,
+          `SPACE_ITEM_PURGE_WRITE_FAILED:${writeErrors.length}`
+        );
+      }
+      const removedCount = Array.isArray(removeResult?.success)
+        ? removeResult.success.length
+        : 0;
+      if (removedCount !== itemIds.length) {
+        throw new Error(
+          `SPACE_ITEM_PURGE_NO_PROGRESS:${removedCount}/${itemIds.length}`
+        );
+      }
+
+      if (db.deleted_items?.find && db.deleted_items?.bulkRemove) {
+        const tombstones = await db.deleted_items
+          .find({ selector: { id: { $in: itemIds } } })
+          .exec();
+        if (tombstones.length > 0) {
+          await db.deleted_items.bulkRemove(
+            tombstones.map((doc: any) => doc.primary as string)
+          );
+        }
+      }
       removedItems += itemDocs.length;
-      await db.items.bulkRemove(itemDocs.map((doc) => doc.primary));
+      // Destructive OPFS cleanup is safe only after RxDB confirms that every
+      // row in this page was removed. A rejected/no-progress write must leave
+      // the still-live item's media untouched.
+      if (this.options.deleteAllMediaForItem) {
+        for (const itemId of itemIds) {
+          await this.options.deleteAllMediaForItem(itemId);
+        }
+      } else {
+        await deleteUnreferencedOpfsItemDirectories(db, itemIds);
+      }
+    }
+
+    // Retain the folder tree until all child rows are durably gone. If an item
+    // batch fails, the surviving records remain navigable and the caller never
+    // reaches parent-space deletion.
+    const folderDocs = await db.folders
+      .find({ selector: { spaceId: { $eq: spaceId } } })
+      .exec();
+    if (folderDocs.length > 0) {
+      for (let i = 0; i < folderDocs.length; i += PURGE_BATCH) {
+        const slice = folderDocs.slice(i, i + PURGE_BATCH);
+        await db.folders.bulkRemove(slice.map((doc) => doc.primary));
+      }
     }
     return removedItems;
   }

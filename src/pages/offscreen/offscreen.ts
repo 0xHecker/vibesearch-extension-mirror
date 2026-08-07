@@ -15,7 +15,11 @@ import { browserBookmarkImportService } from "@src/services/browser-bookmark-imp
 import { githubStarsImportService } from "@src/services/github-stars-import";
 import { cloudSyncService } from "@src/services/cloud-sync";
 import { cloudAuthService } from "@src/services/cloud-auth";
-import { ocrService, OCR_MODEL_VERSION } from "@src/services/ocr.service";
+import {
+  ocrService,
+  OCR_MODEL_VERSION,
+  OCR_SUPPORTED,
+} from "@src/services/ocr.service";
 import {
   isEmbeddingStateOnlyItemChange,
   isFolderCollapseOnlyChange,
@@ -212,8 +216,19 @@ console.log("[Offscreen] Document script loaded.");
 const router = new OffscreenRouter();
 const ocrController = {
   async extractImageText(payload: { url?: string }) {
+    if (!OCR_SUPPORTED) {
+      throw new Error(
+        "Local image OCR is unavailable in this browser build."
+      );
+    }
     const url = typeof payload?.url === "string" ? payload.url : "";
-    return ocrService.processImageUrl(url);
+    try {
+      return await ocrService.processImageUrl(url);
+    } finally {
+      // This ad-hoc path bypasses the OCR queue, so it must arrange the same
+      // idle teardown or the model iframe stays resident for the session.
+      ocrService.scheduleIdleRelease();
+    }
   },
 };
 
@@ -329,6 +344,8 @@ router.registerService("items", itemsController, {
     "addMedia",
     "replaceMedia",
     "listItemsWithOpfsMedia",
+    "applyOpfsMediaPromotions",
+    "deleteUnreferencedOpfsMedia",
   ],
 });
 router.registerService("folders", foldersController, {
@@ -416,7 +433,7 @@ const EMBEDDING_BATCH_SIZE = 20; // Process 20 items at a time for embeddings
 const MAX_SENTENCES_PER_EMBED_REQUEST = 16;
 const EMBEDDING_SCHEMA_VERSION_STORAGE_KEY = "vibe.search.embeddingTextVersion";
 const EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY = "vibe.search.embeddingStateRepairVersion";
-const EMBEDDING_STATE_REPAIR_VERSION = "v1";
+const EMBEDDING_STATE_REPAIR_VERSION = "v2-vector-bounds";
 let isEmbeddingRunning = false;
 let embeddingScheduled = false;
 let embeddingCheckTimer: number | null = null;
@@ -431,8 +448,16 @@ const queuedOcrItemIds = new Map<string, boolean>();
 
 type EmbeddingBatchItem = Pick<
   ItemDocType,
-  "id" | "title" | "textContent" | "ocrText" | "url" | "source" | "authorUsername" | "media"
->;
+  | "id"
+  | "title"
+  | "textContent"
+  | "ocrText"
+  | "url"
+  | "source"
+  | "authorUsername"
+  | "media"
+  | "updatedAt"
+> & { expectedRevision: string };
 
 const getExtensionStorageLocal = (): chrome.storage.LocalStorageArea | null => {
   const runtimeChrome = (globalThis as typeof globalThis & { chrome?: typeof chrome }).chrome;
@@ -535,7 +560,20 @@ const ensureEmbeddingSchemaVersion = async () => {
 const ensureEmbeddingStateRepair = async () => {
   try {
     const currentVersion = await getStoredEmbeddingStateRepairVersion();
-    if (currentVersion === EMBEDDING_STATE_REPAIR_VERSION) return;
+    const vectorCount = await vectorStoreService.getVectorCount();
+    const markerPrefix = `${EMBEDDING_STATE_REPAIR_VERSION}:`;
+    const previousVectorCount = currentVersion.startsWith(markerPrefix)
+      ? Number(currentVersion.slice(markerPrefix.length))
+      : Number.NaN;
+    // Growth cannot invalidate an older in-range reference. A missing file or
+    // compaction shrink must rerun the bounded-reference audit.
+    if (
+      vectorCount > 0 &&
+      Number.isSafeInteger(previousVectorCount) &&
+      vectorCount >= previousVectorCount
+    ) {
+      return;
+    }
 
     sendProcessStatus({
       id: "embedding-state",
@@ -543,8 +581,8 @@ const ensureEmbeddingStateRepair = async () => {
       state: "processing",
       detail: "Repairing records that are missing vectors...",
     });
-    const repairedCount = await databaseManager.repairItemsMissingVectors();
-    await setStoredEmbeddingStateRepairVersion(EMBEDDING_STATE_REPAIR_VERSION);
+    const repairedCount = await databaseManager.repairItemsMissingVectors(vectorCount);
+    await setStoredEmbeddingStateRepairVersion(`${markerPrefix}${vectorCount}`);
     sendProcessStatus({
       id: "embedding-state",
       label: "Embedding state",
@@ -662,6 +700,8 @@ const processEmbeddingQueue = async () => {
       try {
         const appendedCount = await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
           id: item.id,
+          expectedRevision: item.expectedRevision,
+          expectedUpdatedAt: item.updatedAt,
           vector_index: vectorIndexes[0] ?? -1,
           vector_indexes: vectorIndexes,
           isEmbedded: true,
@@ -698,6 +738,8 @@ const processEmbeddingQueue = async () => {
       try {
         await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
           id: item.id,
+          expectedRevision: item.expectedRevision,
+          expectedUpdatedAt: item.updatedAt,
           vector_index: vectorIndexes[0] ?? -1,
           vector_indexes: vectorIndexes,
           isEmbedded: true,
@@ -982,12 +1024,18 @@ const processOcrQueue = async () => {
     isOcrRunning = false;
     if (ocrScheduled) {
       window.setTimeout(processOcrQueue, 500);
+    } else if (queuedOcrItemIds.size === 0 && activeOcrItemIds.size === 0) {
+      // PaddleOCR keeps a sizeable WASM model in the sandbox iframe. The
+      // offscreen document lives for the browser session, so release that
+      // iframe once the queue is quiet instead of retaining the model forever.
+      ocrService.scheduleIdleRelease();
     }
     scheduleEmbeddingIfNeeded();
   }
 };
 
 export const triggerOcr = () => {
+  if (!OCR_SUPPORTED) return;
   if (isOcrRunning) {
     ocrScheduled = true;
   } else {
@@ -996,6 +1044,7 @@ export const triggerOcr = () => {
 };
 
 const scheduleOcrIfNeeded = () => {
+  if (!OCR_SUPPORTED) return;
   if (ocrCheckTimer !== null) return;
   ocrCheckTimer = window.setTimeout(async () => {
     ocrCheckTimer = null;
@@ -1028,6 +1077,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "TRIGGER_OCR" && message.isForwarded) {
     if (!isTrustedForwarderSender(sender)) {
       sendResponse({ success: false, error: "UNAUTHORIZED_FORWARDER" });
+      return true;
+    }
+
+    if (!OCR_SUPPORTED) {
+      sendResponse({
+        success: false,
+        error: "Local image OCR is unavailable in this browser build.",
+      });
       return true;
     }
 

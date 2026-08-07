@@ -3,7 +3,9 @@ import {
   buildFolderLoadKey,
   buildSearchSelectionSearch,
   getVisibleSelectionState,
+  includePendingRevealItem,
   resolveFolderSelectionContext,
+  resolveSearchResultSelectionContext,
 } from "../src/pages/search/selection-state";
 
 describe("search selection state", () => {
@@ -19,6 +21,75 @@ describe("search selection state", () => {
       activeSpaceGroupId: null,
       selectedFolderId: "folder-private",
     });
+  });
+
+  test("revealing a search result selects the result's folder", () => {
+    const context = resolveSearchResultSelectionContext(
+      { id: "item-target", folderId: "folder-reading", spaceId: "space-research" }
+    );
+
+    expect(context).toEqual({
+      activeSpaceId: "space-research",
+      activeSpaceGroupId: null,
+      selectedFolderId: "folder-reading",
+    });
+  });
+
+  test("keeps an older reveal target alongside a bounded folder page", () => {
+    const pageItems = Array.from({ length: 100 }, (_, index) => ({
+      id: `recent-${index}`,
+      folderId: "folder-reading",
+      spaceId: "space-research",
+    }));
+    const pendingItem = {
+      id: "older-target",
+      folderId: "folder-reading",
+      spaceId: "space-research",
+    };
+
+    const items = includePendingRevealItem(pageItems, pendingItem, {
+      activeSpaceId: "space-research",
+      activeSpaceGroupId: null,
+      selectedFolderId: "folder-reading",
+    });
+
+    expect(items).toHaveLength(101);
+    expect(items[0]).toBe(pendingItem);
+    // TabGroup mounts at most 100 cards at once. The reveal target must be in
+    // that first mounted window or the follow-up scroll can never find it.
+    expect(items.slice(0, 100).some((item) => item.id === pendingItem.id)).toBe(true);
+  });
+
+  test("does not inject a pending item into a different browse context", () => {
+    const pageItems = [{ id: "visible", folderId: "folder-other", spaceId: "space-research" }];
+    const pendingItem = {
+      id: "target",
+      folderId: "folder-reading",
+      spaceId: "space-research",
+    };
+
+    expect(
+      includePendingRevealItem(pageItems, pendingItem, {
+        activeSpaceId: "space-research",
+        activeSpaceGroupId: null,
+        selectedFolderId: "folder-other",
+      })
+    ).toBe(pageItems);
+  });
+
+  test("keeps an older ungrouped reveal target in the all-items view", () => {
+    const pageItems = [
+      { id: "new", spaceId: "space-a", folderId: "folder-a" },
+    ];
+    const pendingItem = { id: "old-ungrouped", spaceId: "space-a", folderId: "" };
+
+    expect(
+      includePendingRevealItem(pageItems, pendingItem, {
+        activeSpaceId: "space-a",
+        activeSpaceGroupId: null,
+        selectedFolderId: "all",
+      }).map((item) => item.id)
+    ).toEqual(["old-ungrouped", "new"]);
   });
 
   test("serializes folder selection without forcing the default public space param", () => {

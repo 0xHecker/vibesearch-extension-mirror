@@ -1,6 +1,11 @@
 import { Document, Charset } from "flexsearch";
 import { getDb } from "@src/services/DatabaseService";
 import type { ItemDocType } from "@src/schemas/item_schema";
+import { normalizeSearchIndexText } from "@src/search-core/search-text";
+import {
+  forEachIdKeysetPage,
+  throwIfOperationAborted,
+} from "@src/services/rxdb-keyset-pagination";
 
 type IndexedSearchDoc = {
   id: string;
@@ -21,6 +26,18 @@ type SearchRequest = {
   limit: number;
   keyword?: boolean;
   fuzzy?: boolean;
+  /** Optional database-scoped IDs used when a saturated global lookup is incomplete. */
+  allowedIds?: ReadonlySet<string>;
+  /** Records which input term produced each hit for explicit Boolean evaluation. */
+  trackTermMatches?: boolean;
+  signal?: AbortSignal;
+};
+
+type SearchResult = {
+  scores: Map<string, number>;
+  saturated: boolean;
+  terms: string[];
+  termMatchMasksById: Map<string, number[]>;
 };
 
 type SearchVariant = {
@@ -48,16 +65,17 @@ const FIELD_WEIGHTS: Record<string, number> = {
   phoneticAuthor: 1.5,
   source: 1,
 };
-const ENABLE_FLEXSEARCH_WORKER = (import.meta as any)?.env?.VITE_FLEXSEARCH_WORKER === "1";
+const ENABLE_FLEXSEARCH_WORKER =
+  import.meta.env.VITE_FLEXSEARCH_WORKER === "1";
+// Guard only against a broken/non-advancing index implementation. Production
+// searches use pages of at least 1,800 hits, so this still covers far more
+// records than a browser extension can practically retain.
+const MAX_SCOPED_SEARCH_PAGES = 1024;
+const SEARCH_INDEX_BUILD_PAGE_SIZE = 250;
+const MAX_REBUILD_PASSES = 2;
+const MAX_BUILD_CATCH_UP_IDS = 5_000;
 
-const normalizeForIndex = (input: string): string =>
-  input
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9._:/\-\s]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+const normalizeForIndex = normalizeSearchIndexText;
 
 const soundexToken = (input: string): string => {
   const token = normalizeForIndex(input).replace(/[^a-z]/g, "");
@@ -148,6 +166,9 @@ export class LocalSearchIndexService {
   private incrementalSyncInFlight = false;
   private incrementalSyncQueued = false;
   private pendingItemIds = new Set<string>();
+  private contentGeneration = 0;
+  private fullRebuildGeneration = 0;
+  private pendingItemIdsOverflowed = false;
 
   private emitProcessStatus(
     state: IndexProcessStatusState,
@@ -170,22 +191,39 @@ export class LocalSearchIndexService {
   }
 
   markDirty() {
+    this.contentGeneration += 1;
+    this.fullRebuildGeneration += 1;
     this.dirty = true;
   }
 
   scheduleItemSync(changedItemIds?: string[]) {
+    this.contentGeneration += 1;
+    if (this.dirty && this.pendingItemIdsOverflowed) return;
+    if (changedItemIds && changedItemIds.length > 0) {
+      for (const itemId of changedItemIds) {
+        if (!itemId) continue;
+        if (this.pendingItemIds.has(itemId)) continue;
+        if (this.pendingItemIds.size >= MAX_BUILD_CATCH_UP_IDS) {
+          this.pendingItemIdsOverflowed = true;
+          // We can no longer prove an incremental catch-up is complete. Drop
+          // the retained IDs immediately and let the existing keyset-paged
+          // rebuild recover the full index on the next search.
+          this.pendingItemIds.clear();
+          this.fullRebuildGeneration += 1;
+          this.dirty = true;
+          if (this.incrementalTimer !== null) {
+            clearTimeout(this.incrementalTimer);
+            this.incrementalTimer = null;
+          }
+          break;
+        }
+        this.pendingItemIds.add(itemId);
+      }
+    }
     // A full rebuild supersedes every queued per-item update. This is especially
     // important for bulk imports, where holding thousands of IDs only creates
     // duplicate work and a temporary memory spike.
     if (this.dirty) return;
-
-    if (changedItemIds && changedItemIds.length > 0) {
-      for (const itemId of changedItemIds) {
-        if (itemId) {
-          this.pendingItemIds.add(itemId);
-        }
-      }
-    }
 
     if (this.incrementalSyncInFlight) {
       this.incrementalSyncQueued = true;
@@ -239,60 +277,87 @@ export class LocalSearchIndexService {
 
   private async buildIndexWithMode(worker: boolean): Promise<void> {
     const db = await getDb();
-    const [itemDocs, tagDocs, joinDocs] = await Promise.all([
-      db.items.find({ selector: { deletedAt: { $eq: 0 } } }).exec(),
-      db.tags.find().exec(),
-      db.item_tags.find().exec(),
-    ]);
-
-    const tagsById = new Map<string, string>();
-    for (const doc of tagDocs) {
-      tagsById.set(doc.get("id") as string, (doc.get("name") as string) || "");
-    }
-
-    const tagsByItemId = new Map<string, string[]>();
-    for (const join of joinDocs) {
-      const itemId = join.get("itemId") as string;
-      const tagId = join.get("tagId") as string;
-      const tagName = tagsById.get(tagId);
-      if (!tagName) continue;
-      const current = tagsByItemId.get(itemId) || [];
-      current.push(tagName);
-      tagsByItemId.set(itemId, current);
-    }
-
     const index = this.createIndex(worker);
-    const docs = itemDocs.map((doc) => doc.toMutableJSON() as ItemDocType);
-    const chunkSize = 800;
-
-    for (let start = 0; start < docs.length; start += chunkSize) {
-      const chunk = docs.slice(start, start + chunkSize);
-      const indexDocs = chunk.map((item) => toIndexDoc(item, (tagsByItemId.get(item.id) || []).join(" ")));
-      await this.addBatch(index, indexDocs);
-    }
+    // Read, project, and index one deterministic primary-key page at a time.
+    // Neither RxDocuments nor their full text/media JSON are retained for the
+    // complete library, and tag joins are restricted to the active page.
+    const indexedCount = await forEachIdKeysetPage({
+      collection: db.items as any,
+      selector: { deletedAt: { $eq: 0 } },
+      pageSize: SEARCH_INDEX_BUILD_PAGE_SIZE,
+      onPage: async (itemDocs: any[]) => {
+        const itemIds = itemDocs.map((doc) => doc.primary as string).filter(Boolean);
+        const tagsByItemId = await this.getTagsByItemIds(itemIds, db);
+        const indexDocs = itemDocs.map((doc) => {
+          const item = doc.toMutableJSON() as ItemDocType;
+          return toIndexDoc(item, (tagsByItemId.get(item.id) || []).join(" "));
+        });
+        await this.addBatch(index, indexDocs);
+      },
+    });
 
     this.index = index;
     this.usingWorker = worker;
-    this.indexedCount = docs.length;
+    this.indexedCount = indexedCount;
     this.lastBuiltAt = Date.now();
-    this.lastItemSyncAt = Date.now();
-    this.pendingItemIds.clear();
-    this.dirty = false;
   }
 
   private async rebuild(): Promise<void> {
     this.emitProcessStatus("processing", "Rebuilding local search index...");
-    if (ENABLE_FLEXSEARCH_WORKER) {
-      try {
-        await this.buildIndexWithMode(true);
-      } catch (error) {
-        console.warn("[LocalSearchIndex] Worker mode unavailable, falling back to in-thread mode.", error);
+    for (let pass = 1; pass <= MAX_REBUILD_PASSES; pass += 1) {
+      const buildContentGeneration = this.contentGeneration;
+      const buildFullGeneration = this.fullRebuildGeneration;
+      const buildStartedAt = Date.now();
+      this.pendingItemIds.clear();
+      this.pendingItemIdsOverflowed = false;
+      const previousIndex = this.index;
+      this.index = null;
+      if (previousIndex && typeof (previousIndex as any).clear === "function") {
+        // A rebuild can be as large as the live index. Clear the stale copy first
+        // so large libraries do not temporarily retain two full text indexes.
+        await Promise.resolve((previousIndex as any).clear());
+      }
+      if (ENABLE_FLEXSEARCH_WORKER) {
+        try {
+          await this.buildIndexWithMode(true);
+        } catch (error) {
+          console.warn("[LocalSearchIndex] Worker mode unavailable, falling back to in-thread mode.", error);
+          await this.buildIndexWithMode(false);
+        }
+      } else {
         await this.buildIndexWithMode(false);
       }
-    } else {
-      await this.buildIndexWithMode(false);
+
+      const catchUpIds = Array.from(this.pendingItemIds);
+      this.pendingItemIds.clear();
+      const contentChanged = buildContentGeneration !== this.contentGeneration;
+      const needsAnotherFullBuild =
+        buildFullGeneration !== this.fullRebuildGeneration ||
+        this.pendingItemIdsOverflowed ||
+        (contentChanged && catchUpIds.length === 0);
+
+      if (needsAnotherFullBuild && pass < MAX_REBUILD_PASSES) {
+        this.emitProcessStatus(
+          "processing",
+          "Library changed during indexing; refreshing the search index..."
+        );
+        continue;
+      }
+
+      this.dirty = false;
+      this.lastItemSyncAt = buildStartedAt;
+      for (let start = 0; start < catchUpIds.length; start += SEARCH_INDEX_BUILD_PAGE_SIZE) {
+        await this.syncItemsIncremental(
+          catchUpIds.slice(start, start + SEARCH_INDEX_BUILD_PAGE_SIZE)
+        );
+      }
+      // A full/tag change or an overflow on the final pass cannot be repaired
+      // by item-ID catch-up alone. Publish the bounded completed index now and
+      // leave it dirty so the next search performs another bounded rebuild.
+      this.dirty = needsAnotherFullBuild;
+      this.emitProcessStatus("success", `Index ready (${this.indexedCount} records).`);
+      return;
     }
-    this.emitProcessStatus("success", `Index ready (${this.indexedCount} records).`);
   }
 
   async ensureReady(): Promise<void> {
@@ -319,11 +384,14 @@ export class LocalSearchIndexService {
     await this.buildPromise;
   }
 
-  private async getTagsByItemIds(itemIds: string[]): Promise<Map<string, string[]>> {
+  private async getTagsByItemIds(
+    itemIds: string[],
+    database?: Awaited<ReturnType<typeof getDb>>
+  ): Promise<Map<string, string[]>> {
     const map = new Map<string, string[]>();
     if (itemIds.length === 0) return map;
 
-    const db = await getDb();
+    const db = database || (await getDb());
     const joins = await db.item_tags.find({ selector: { itemId: { $in: itemIds } } }).exec();
     if (joins.length === 0) return map;
 
@@ -499,7 +567,11 @@ export class LocalSearchIndexService {
     rawResults: unknown,
     scoreMap: Map<string, number>,
     variantBoost: number,
-    includeOcrText: boolean
+    includeOcrText: boolean,
+    rankOffset: number,
+    allowedIds?: ReadonlySet<string>,
+    termMatchMasksById?: Map<string, number[]>,
+    termMatchIndex = -1
   ) {
     if (!Array.isArray(rawResults)) return;
 
@@ -517,17 +589,72 @@ export class LocalSearchIndexService {
       for (let index = 0; index < results.length; index += 1) {
         const id = toIdString(results[index]);
         if (!id) continue;
-        const score = (weight * variantBoost) / (index + 1);
+        if (allowedIds && !allowedIds.has(id)) continue;
+        if (termMatchMasksById && termMatchIndex >= 0) {
+          const wordIndex = Math.floor(termMatchIndex / 32);
+          const termBit = 1 << (termMatchIndex % 32);
+          const words = termMatchMasksById.get(id) || [];
+          words[wordIndex] = (words[wordIndex] || 0) | termBit;
+          termMatchMasksById.set(id, words);
+        }
+        const score = (weight * variantBoost) / (rankOffset + index + 1);
         scoreMap.set(id, (scoreMap.get(id) || 0) + score);
       }
     }
   }
 
-  async search({ query, queries, limit, keyword, fuzzy }: SearchRequest): Promise<Map<string, number>> {
+  private isResultPageSaturated(rawResults: unknown, pageSize: number): boolean {
+    if (!Array.isArray(rawResults)) return false;
+    return rawResults.some((row) => {
+      if (!row || typeof row !== "object" || !("result" in row)) return false;
+      const result = (row as { result?: unknown[] }).result;
+      return Array.isArray(result) && result.length >= pageSize;
+    });
+  }
+
+  private getResultPageSignature(rawResults: unknown): string {
+    if (!Array.isArray(rawResults)) return "invalid";
+    return rawResults
+      .map((row) => {
+        if (!row || typeof row !== "object" || !("result" in row)) return "invalid-row";
+        const typed = row as { field?: string; result?: unknown[] };
+        const results = Array.isArray(typed.result) ? typed.result : [];
+        const middleIndex = Math.floor(results.length / 2);
+        return [
+          typed.field || "",
+          results.length,
+          toIdString(results[0]) || "",
+          toIdString(results[middleIndex]) || "",
+          toIdString(results[results.length - 1]) || "",
+        ].join(":");
+      })
+      .join("|");
+  }
+
+  async searchWithStatus({
+    query,
+    queries,
+    limit,
+    keyword,
+    fuzzy,
+    allowedIds,
+    trackTermMatches,
+    signal,
+  }: SearchRequest): Promise<SearchResult> {
+    throwIfOperationAborted(signal);
     await this.ensureReady();
-    if (!this.index) return new Map();
+    throwIfOperationAborted(signal);
+    if (!this.index) {
+      return {
+        scores: new Map(),
+        saturated: false,
+        terms: [],
+        termMatchMasksById: new Map(),
+      };
+    }
 
     const safeLimit = clamp(limit, 20, 2500);
+    const resultPageSize = safeLimit * 3;
     const includeKeyword = keyword !== false;
     const includeFuzzy = fuzzy === true;
     const queryInputs = Array.from(
@@ -536,24 +663,79 @@ export class LocalSearchIndexService {
           .map((value) => normalizeForIndex(value))
           .filter(Boolean)
       )
-    ).slice(0, 12);
-    if (queryInputs.length === 0) return new Map();
+    );
+    if (queryInputs.length === 0 || allowedIds?.size === 0) {
+      return {
+        scores: new Map(),
+        saturated: false,
+        terms: queryInputs,
+        termMatchMasksById: new Map(),
+      };
+    }
     const scoreMap = new Map<string, number>();
+    const termMatchMasksById = new Map<string, number[]>();
+    let saturated = false;
 
-    for (const queryInput of queryInputs) {
+    for (let queryIndex = 0; queryIndex < queryInputs.length; queryIndex += 1) {
+      const queryInput = queryInputs[queryIndex];
+      const termMatchIndex = trackTermMatches ? queryIndex : -1;
       const variants = this.buildVariants(queryInput, includeKeyword, includeFuzzy);
       for (const variant of variants) {
-        const results = await Promise.resolve(
-          (this.index as any).search(variant.query, {
-            limit: safeLimit * 3,
-            suggest: variant.suggest,
-          })
-        );
-        this.accumulateScores(results, scoreMap, variant.boost, !variant.suggest);
+        let offset = 0;
+        let pagesRead = 0;
+        let previousPageSignature: string | null = null;
+
+        while (pagesRead < MAX_SCOPED_SEARCH_PAGES) {
+          throwIfOperationAborted(signal);
+          const results = await Promise.resolve(
+            (this.index as any).search(variant.query, {
+              limit: resultPageSize,
+              offset,
+              suggest: variant.suggest,
+            })
+          );
+          throwIfOperationAborted(signal);
+          const pageSaturated = this.isResultPageSaturated(results, resultPageSize);
+          const pageSignature = this.getResultPageSignature(results);
+          if (pageSignature === previousPageSignature) {
+            break;
+          }
+          previousPageSignature = pageSignature;
+          pagesRead += 1;
+          if (offset === 0 && pageSaturated) saturated = true;
+          this.accumulateScores(
+            results,
+            scoreMap,
+            variant.boost,
+            !variant.suggest,
+            offset,
+            allowedIds,
+            trackTermMatches ? termMatchMasksById : undefined,
+            termMatchIndex
+          );
+
+          if (!allowedIds || !pageSaturated) {
+            break;
+          }
+          offset += resultPageSize;
+          // Let input, timers, and cancellation work run between large index
+          // pages instead of monopolizing the offscreen document's event loop.
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          throwIfOperationAborted(signal);
+        }
       }
     }
 
-    return scoreMap;
+    return {
+      scores: scoreMap,
+      saturated,
+      terms: trackTermMatches ? queryInputs : [],
+      termMatchMasksById,
+    };
+  }
+
+  async search(request: SearchRequest): Promise<Map<string, number>> {
+    return (await this.searchWithStatus(request)).scores;
   }
 }
 

@@ -31,6 +31,7 @@
   },
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "activeTab",
     "tabs",
     "bookmarks",
@@ -65,7 +66,7 @@
   ],
   "devtools_page": "src/pages/devtools/index.html",
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; frame-src https://vibesearch-web.watermelons.workers.dev; connect-src 'self' data: https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://metadata-worker.watermelons.workers.dev https://meta.vibesearch.app https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://vibesearch-api.watermelons.workers.dev https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://sheets.googleapis.com https://api.github.com",
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; frame-src 'self' https://vibesearch-web.watermelons.workers.dev; connect-src 'self' data: https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://metadata-worker.watermelons.workers.dev https://meta.vibesearch.app https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://vibesearch-api.watermelons.workers.dev https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://sheets.googleapis.com https://api.github.com",
     "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self' blob:; connect-src 'self' data: https://metadata-worker.watermelons.workers.dev https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://sheets.googleapis.com"
   },
   "sandbox": {

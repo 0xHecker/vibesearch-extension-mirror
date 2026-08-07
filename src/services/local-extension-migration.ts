@@ -1,8 +1,17 @@
 import { getDb } from "@src/services/DatabaseService";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { UNGROUPED_SPACE_GROUP_ID } from "@src/schemas/space_schema";
-import { readOpfsFile, saveMediaToOpfs } from "@src/services/media-storage";
+import { PUBLIC_SPACE_ID } from "@src/common/spaces";
+import {
+  readOpfsFile,
+  saveMediaToOpfs,
+  withOpfsMutationLock,
+} from "@src/services/media-storage";
 import { isMetadataFetchableUrl } from "@src/utils/metadata-url";
+import {
+  withBinMutationLock,
+  withStableAffectedSpaceLocks,
+} from "@src/services/entity-mutation-lock";
 
 const MIGRATION_FORMAT = "vibesearch-local-extension-migration";
 const MIGRATION_VERSION = 1;
@@ -84,6 +93,67 @@ const createEmptyCollections = (): MigrationCollections => ({
   deleted_items: [],
 });
 
+const addSpaceId = (spaceIds: Set<string>, value: unknown): void => {
+  if (typeof value !== "string") return;
+  const id = value.trim();
+  if (id) spaceIds.add(id);
+};
+
+const incomingMigrationSpaceIds = (collections: MigrationCollections): Set<string> => {
+  const ids = new Set<string>([PUBLIC_SPACE_ID]);
+  for (const space of collections.spaces) addSpaceId(ids, space.id);
+  for (const folder of collections.folders) addSpaceId(ids, folder.spaceId);
+  for (const item of collections.items) addSpaceId(ids, item.spaceId);
+  return ids;
+};
+
+const findDocsByIds = async (collection: any, ids: Iterable<string>): Promise<any[]> => {
+  const uniqueIds = Array.from(new Set(ids)).filter(Boolean);
+  const documents: any[] = [];
+  for (let offset = 0; offset < uniqueIds.length; offset += RESTORE_BATCH_SIZE) {
+    const batch = uniqueIds.slice(offset, offset + RESTORE_BATCH_SIZE);
+    const batchSet = new Set(batch);
+    const rows = await collection
+      .find({ selector: { id: { $in: batch } } })
+      .exec();
+    for (const row of rows) {
+      const id = row.get("id") as string | undefined;
+      if (id && batchSet.has(id)) documents.push(row);
+    }
+  }
+  return documents;
+};
+
+const currentMigrationSpaceIds = async (
+  collections: MigrationCollections,
+  db: Awaited<ReturnType<typeof getDb>>
+): Promise<Set<string>> => {
+  const ids = new Set<string>();
+  const folderIds = new Set<string>();
+  for (const folder of collections.folders) {
+    if (typeof folder.id === "string" && folder.id) folderIds.add(folder.id);
+  }
+  for (const item of collections.items) {
+    if (typeof item.folderId === "string" && item.folderId) folderIds.add(item.folderId);
+  }
+
+  const itemDocs = await findDocsByIds(
+    db.items,
+    collections.items
+      .map((item) => (typeof item.id === "string" ? item.id : ""))
+      .filter(Boolean)
+  );
+  for (const itemDoc of itemDocs) {
+    addSpaceId(ids, itemDoc.get("spaceId"));
+    const folderId = itemDoc.get("folderId");
+    if (typeof folderId === "string" && folderId) folderIds.add(folderId);
+  }
+
+  const folderDocs = await findDocsByIds(db.folders, folderIds);
+  for (const folderDoc of folderDocs) addSpaceId(ids, folderDoc.get("spaceId"));
+  return ids;
+};
+
 const summarize = (
   collections: MigrationCollections,
   opfsFileCount: number,
@@ -98,9 +168,41 @@ const summarize = (
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
 
-const bulkUpsertInBatches = async (collection: { bulkUpsert: (rows: Record<string, unknown>[]) => Promise<unknown> }, rows: Record<string, unknown>[]) => {
+const bulkUpsertInBatches = async (
+  collectionName: MigrationCollectionName,
+  collection: {
+    bulkUpsert: (
+      rows: Record<string, unknown>[]
+    ) => Promise<{ error?: unknown[] } | unknown>;
+  },
+  rows: Record<string, unknown>[]
+) => {
   for (let start = 0; start < rows.length; start += RESTORE_BATCH_SIZE) {
-    await collection.bulkUpsert(rows.slice(start, start + RESTORE_BATCH_SIZE));
+    const batch = rows.slice(start, start + RESTORE_BATCH_SIZE);
+    const result = await collection.bulkUpsert(batch);
+    const writeErrors =
+      result &&
+      typeof result === "object" &&
+      Array.isArray((result as { error?: unknown[] }).error)
+        ? (result as { error: unknown[] }).error
+        : [];
+    if (writeErrors.length > 0) {
+      throw new AggregateError(
+        writeErrors,
+        `MIGRATION_RESTORE_WRITE_FAILED:${collectionName}:${writeErrors.length}`
+      );
+    }
+    const committedCount =
+      result &&
+      typeof result === "object" &&
+      Array.isArray((result as { success?: unknown[] }).success)
+        ? (result as { success: unknown[] }).success.length
+        : 0;
+    if (committedCount !== batch.length) {
+      throw new Error(
+        `MIGRATION_RESTORE_WRITE_INCOMPLETE:${collectionName}:${committedCount}/${batch.length}`
+      );
+    }
     await yieldToEventLoop();
   }
 };
@@ -108,6 +210,102 @@ const bulkUpsertInBatches = async (collection: { bulkUpsert: (rows: Record<strin
 export const summarizeLocalExtensionMigrationBundle = (
   bundle: LocalExtensionMigrationBundle
 ): LocalExtensionMigrationSummary => summarize(bundle.collections, bundle.opfsFiles.length, bundle.warnings.length);
+
+const normalizeMigrationReferences = (
+  source: MigrationCollections,
+  existingSpaceIds: ReadonlySet<string>
+): { collections: MigrationCollections; warningCount: number } => {
+  let warningCount = 0;
+  const groupIds = new Set(
+    source.space_groups
+      .map((group) => (typeof group.id === "string" ? group.id : ""))
+      .filter(Boolean)
+  );
+  const spaces: Record<string, unknown>[] = source.spaces.map((space) => {
+    const groupId = typeof space.spaceGroupId === "string" ? space.spaceGroupId : "";
+    if (groupId && !groupIds.has(groupId)) warningCount += 1;
+    return {
+      ...space,
+      spaceGroupId: groupId && groupIds.has(groupId) ? groupId : UNGROUPED_SPACE_GROUP_ID,
+    };
+  });
+  const knownSpaceIds = new Set(existingSpaceIds);
+  for (const space of spaces) {
+    if (typeof space.id === "string" && space.id) knownSpaceIds.add(space.id);
+  }
+
+  const folders = source.folders.map((folder) => ({ ...folder }));
+  const folderById = new Map<string, Record<string, unknown>>();
+  for (const folder of folders) {
+    if (typeof folder.id === "string" && folder.id) folderById.set(folder.id, folder);
+  }
+  for (const folder of folders) {
+    const spaceId = typeof folder.spaceId === "string" ? folder.spaceId : "";
+    if (!knownSpaceIds.has(spaceId) && knownSpaceIds.has(PUBLIC_SPACE_ID)) {
+      folder.spaceId = PUBLIC_SPACE_ID;
+      warningCount += 1;
+    }
+    const parentId = typeof folder.parentId === "string" ? folder.parentId : "";
+    if (!parentId) {
+      folder.parentId = null;
+      continue;
+    }
+    const parent = folderById.get(parentId);
+    if (
+      !parent ||
+      parent === folder ||
+      parent.spaceId !== folder.spaceId
+    ) {
+      folder.parentId = null;
+      warningCount += 1;
+    }
+  }
+  for (const folder of folders) {
+    const id = typeof folder.id === "string" ? folder.id : "";
+    if (!id) continue;
+    const seen = new Set<string>([id]);
+    let parentId = typeof folder.parentId === "string" ? folder.parentId : "";
+    let cyclic = false;
+    while (parentId) {
+      if (seen.has(parentId)) {
+        cyclic = true;
+        break;
+      }
+      seen.add(parentId);
+      const parent = folderById.get(parentId);
+      parentId = typeof parent?.parentId === "string" ? parent.parentId : "";
+    }
+    if (cyclic) {
+      folder.parentId = null;
+      warningCount += 1;
+    }
+  }
+
+  const items = source.items.map((item) => {
+    const next = { ...item };
+    const folderId = typeof next.folderId === "string" ? next.folderId : "";
+    const folder = folderId ? folderById.get(folderId) : undefined;
+    if (folder && typeof folder.spaceId === "string") {
+      if (next.spaceId !== folder.spaceId) warningCount += 1;
+      next.spaceId = folder.spaceId;
+    } else if (folderId) {
+      // Preserve an unresolved legacy row for recovery instead of rejecting
+      // the entire origin restore, but surface it in the summary.
+      warningCount += 1;
+    }
+    return next;
+  });
+
+  return {
+    collections: {
+      ...source,
+      spaces,
+      folders,
+      items,
+    },
+    warningCount,
+  };
+};
 
 const getReferencedOpfsPaths = (items: Record<string, unknown>[]): string[] => {
   const paths = new Set<string>();
@@ -235,10 +433,32 @@ export const restoreLocalExtensionMigrationBundle = async (
 ): Promise<RestoreLocalExtensionMigrationResult> => {
   const bundle = validateLocalExtensionMigrationBundle(value);
   const db = await getDb();
+  const incomingSpaceIds = incomingMigrationSpaceIds(bundle.collections);
+  return withBinMutationLock(db, () =>
+    withStableAffectedSpaceLocks(
+      db,
+      incomingSpaceIds,
+      () => currentMigrationSpaceIds(bundle.collections, db),
+      () => withOpfsMutationLock(() => restoreLocalExtensionMigrationBundleLocked(bundle, db))
+    )
+  );
+};
+
+const restoreLocalExtensionMigrationBundleLocked = async (
+  bundle: LocalExtensionMigrationBundle,
+  db: Awaited<ReturnType<typeof getDb>>
+): Promise<RestoreLocalExtensionMigrationResult> => {
+  const existingSpaceDocs = await db.spaces.find().exec();
+  const existingSpaceIds = new Set(
+    existingSpaceDocs
+      .map((doc: any) => doc.get("id") as string)
+      .filter(Boolean)
+  );
+  const normalized = normalizeMigrationReferences(bundle.collections, existingSpaceIds);
 
   // A vector index belongs to one OPFS origin. The source vector file is not
   // copied, so every migrated item enters the destination embedding queue.
-  const migratedItems = bundle.collections.items.map((item) => {
+  const migratedItems = normalized.collections.items.map((item) => {
     const url = typeof item.url === "string" ? item.url : "";
     return {
       ...item,
@@ -249,22 +469,15 @@ export const restoreLocalExtensionMigrationBundle = async (
       isMetaFetched: isMetadataFetchableUrl(url) ? item.isMetaFetched === true : true,
     };
   });
-  const migratedSpaces = bundle.collections.spaces.map((space) => ({
-    ...space,
-    spaceGroupId:
-      typeof space.spaceGroupId === "string" ? space.spaceGroupId : UNGROUPED_SPACE_GROUP_ID,
-  }));
-
   const collections: MigrationCollections = {
-    ...bundle.collections,
-    spaces: migratedSpaces,
+    ...normalized.collections,
     items: migratedItems,
   };
 
   for (const name of COLLECTION_NAMES) {
     const rows = collections[name];
     if (rows.length > 0) {
-      await bulkUpsertInBatches(db[name] as any, rows);
+      await bulkUpsertInBatches(name, db[name] as any, rows);
     }
   }
 
@@ -286,7 +499,11 @@ export const restoreLocalExtensionMigrationBundle = async (
   queueMetadataForRestoredItems(metadataPendingUrls);
 
   return {
-    ...summarize(collections, bundle.opfsFiles.length, bundle.warnings.length),
+    ...summarize(
+      collections,
+      bundle.opfsFiles.length,
+      bundle.warnings.length + normalized.warningCount
+    ),
     restoredOpfsFileCount,
     scheduledReembeddingItemCount: migratedItems.length,
     metadataPendingUrlCount: metadataPendingUrls.length,

@@ -130,7 +130,7 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 1,
+  version: 9,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
@@ -394,8 +394,49 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
   attachments: {},
 };
 
-// v1 declares the polymorphic content captured locally and uploaded to cloud.
-// Existing v0 rows remain valid and gain fields on their next local update.
+const ITEM_OCR_STATUSES = new Set<ItemDocType["ocrStatus"]>([
+  "pending",
+  "processing",
+  "done",
+  "error",
+  "skipped",
+]);
+
+const keepLegacyItem = (oldDoc: ItemDocType): ItemDocType => oldDoc;
+
+const normalizeLegacyItem = (oldDoc: ItemDocType): ItemDocType => {
+  const row = oldDoc as ItemDocType & Record<string, unknown>;
+  row.userId = typeof row.userId === "string" ? row.userId : "";
+  row.folderId = typeof row.folderId === "string" ? row.folderId : "";
+  row.spaceId = typeof row.spaceId === "string" && row.spaceId ? row.spaceId : "space_public_default";
+  row.isFavorite = row.isFavorite === true;
+  row.isEmbedded = row.isEmbedded === true;
+  row.isMetaFetched = row.isMetaFetched === true;
+  row.isDirty = row.isDirty === true;
+  row.ocrStatus = ITEM_OCR_STATUSES.has(row.ocrStatus) ? row.ocrStatus : "pending";
+  row.ocrModelVersion = typeof row.ocrModelVersion === "string" ? row.ocrModelVersion : "";
+  row.ocrUpdatedAt = Number.isSafeInteger(row.ocrUpdatedAt) && row.ocrUpdatedAt >= 0 ? row.ocrUpdatedAt : 0;
+  const vectorIndex = row.vector_index;
+  row.vector_index =
+    typeof vectorIndex === "number" && Number.isSafeInteger(vectorIndex) && vectorIndex >= -1
+      ? vectorIndex
+      : -1;
+  row.deletedAt = Number.isSafeInteger(row.deletedAt) && row.deletedAt >= 0 ? row.deletedAt : 0;
+  row.createdAt = Number.isSafeInteger(row.createdAt) && row.createdAt >= 0 ? row.createdAt : 0;
+  row.updatedAt = Number.isSafeInteger(row.updatedAt) && row.updatedAt >= 0 ? row.updatedAt : row.createdAt;
+  return row;
+};
+
+// Versions 2–8 were shipped before a regression reset the collection to v0.
+// v9 is the permanent high-water mark and normalizes rows from every lineage.
 export const itemMigrationStrategies = {
-  1: (oldDoc: ItemDocType): ItemDocType => oldDoc,
+  1: keepLegacyItem,
+  2: keepLegacyItem,
+  3: keepLegacyItem,
+  4: keepLegacyItem,
+  5: keepLegacyItem,
+  6: keepLegacyItem,
+  7: keepLegacyItem,
+  8: keepLegacyItem,
+  9: normalizeLegacyItem,
 };

@@ -27,6 +27,7 @@ interface TabGroupsProps {
   items: ItemDocType[];
   spaces: SpaceMoveOption[];
   preserveInputOrder?: boolean;
+  revealItemId?: string;
   debugScoresByItemId?: Record<string, QueryRankDebugScore>;
   showDebugScores?: boolean;
   onShareSelectedItems?: (itemIds: string[]) => void;
@@ -40,6 +41,7 @@ const TabGroupsComponent = ({
   items,
   spaces,
   preserveInputOrder = false,
+  revealItemId,
   debugScoresByItemId,
   showDebugScores = false,
   onShareSelectedItems,
@@ -139,8 +141,13 @@ const TabGroupsComponent = ({
   // Memoized per-folder items so TabGroup props stay referentially stable
   // and memo'd TabGroup/FlatItem/GridItem don't re-render on unrelated parent updates.
   const itemsByFolder = useMemo(() => {
-    return groupItemsByFolder(orderedFolders, itemsState, preserveInputOrder);
-  }, [orderedFolders, itemsState, preserveInputOrder]);
+    return groupItemsByFolder(
+      orderedFolders,
+      itemsState,
+      preserveInputOrder,
+      revealItemId
+    );
+  }, [orderedFolders, itemsState, preserveInputOrder, revealItemId]);
 
   const itemCountsByFolderTree = useMemo(() => {
     const childrenByParent = new Map<string | null, FolderDocType[]>();
@@ -510,6 +517,7 @@ const TabGroupsComponent = ({
                     onShareSelectedItems={onShareSelectedItems}
                     onShareFolder={onShareFolder}
                     dragMode={dragMode}
+                    revealItemId={revealItemId}
                   />
                 );
               })}

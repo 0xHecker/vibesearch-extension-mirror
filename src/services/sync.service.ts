@@ -1,8 +1,18 @@
 import { databaseManager } from "./db-manager";
-import { vectorStoreService } from "./vector-store.service";
+import {
+  isVectorStoreIntegrityError,
+  vectorStoreService,
+} from "./vector-store.service";
 import { vectorPipelineCoordinator } from "./vector-pipeline-coordinator";
 import { vectorMaintenanceJournalService } from "./vector-maintenance-journal.service";
-import { isMetadataReadyForEmbedding } from "@src/search-core/embedding-state";
+import {
+  commitCompactionWithRecovery,
+  invalidatePartiallyCommittedCompaction,
+} from "./vector-store/compaction-commit";
+import {
+  getVectorIndexes,
+  isMetadataReadyForEmbedding,
+} from "@src/search-core/embedding-state";
 
 const sendProcessStatus = (payload: {
   id: string;
@@ -43,6 +53,33 @@ class SyncService {
       await vectorPipelineCoordinator.runExclusive("compaction", async () => {
         const journal = await vectorMaintenanceJournalService.read();
         if (journal.phase === "idle") {
+          try {
+            await vectorStoreService.getVectorCount();
+          } catch (error) {
+            if (!isVectorStoreIntegrityError(error)) throw error;
+            const recoveryOperationId =
+              crypto.randomUUID?.() ?? `integrity-${Date.now()}-${Math.random()}`;
+            await vectorMaintenanceJournalService.setPhase("swapped", {
+              operationId: recoveryOperationId,
+              startedAt: Date.now(),
+              detail: `Recovering corrupt vector storage: ${error.message}`,
+            });
+            let resetCount = 0;
+            await vectorStoreService.runWithSearchesPaused(
+              async () => {
+                resetCount = await invalidatePartiallyCommittedCompaction({
+                  clearVectors: () => vectorStoreService.clearStorage(),
+                  invalidateItems: () => databaseManager.markAllActiveItemsForReembedding(),
+                });
+                await databaseManager.clearDeletedItems();
+                await this.cleanupResidualCompactionFiles();
+                await vectorMaintenanceJournalService.clear(
+                  `Recovered corrupt vector storage; scheduled ${resetCount} items for re-embedding.`
+                );
+              },
+              { blockSearchesOnError: true }
+            );
+          }
           await this.cleanupResidualCompactionFiles();
           return;
         }
@@ -67,17 +104,23 @@ class SyncService {
         }
 
         if (journal.phase === "swapped") {
-          const hasBackup = await vectorStoreService.fileExists(this.backupFileName);
-          if (hasBackup) {
-            await vectorStoreService.renameFile(this.backupFileName, "vectors.bin");
-          }
-          await vectorStoreService.deleteFile(this.tempFileName);
-
-          const resetCount = await databaseManager.markAllActiveItemsForReembedding();
-          await vectorStoreService.clearStorage();
-          await databaseManager.clearDeletedItems();
-          await vectorMaintenanceJournalService.clear(
-            `Recovered interrupted swap; scheduled ${resetCount} items for re-embedding.`
+          // `swapped` may mean the process died after any DB commit batch. We
+          // cannot safely restore only the old file because earlier batches may
+          // already contain compacted indexes. Discard all vectors and rebuild.
+          let resetCount = 0;
+          await vectorStoreService.runWithSearchesPaused(
+            async () => {
+              resetCount = await invalidatePartiallyCommittedCompaction({
+                clearVectors: () => vectorStoreService.clearStorage(),
+                invalidateItems: () => databaseManager.markAllActiveItemsForReembedding(),
+              });
+              await databaseManager.clearDeletedItems();
+              await this.cleanupResidualCompactionFiles();
+              await vectorMaintenanceJournalService.clear(
+                `Recovered interrupted swap; scheduled ${resetCount} items for re-embedding.`
+              );
+            },
+            { blockSearchesOnError: true }
           );
 
           sendProcessStatus({
@@ -171,9 +214,10 @@ class SyncService {
           detail: "Compacting vector store...",
         });
 
-        // Step 1: Get all active items from the database
-        const activeItems = await databaseManager.getAllActiveItems();
-        if (activeItems.length === 0) {
+        // Step 1: Build a lightweight inventory. Full text/media is loaded only
+        // for each small batch that actually needs re-embedding.
+        const inventory = await databaseManager.getActiveVectorInventory();
+        if (inventory.length === 0) {
           console.log("No active items found. Clearing vector store.");
           await vectorStoreService.clearStorage();
           sendProcessStatus({
@@ -191,36 +235,30 @@ class SyncService {
         // Step 3: Separate dirty and clean items. A restore/import can be left
         // without vectors until the user explicitly asks to create them; routine
         // periodic compaction must not silently start that expensive work.
-        const getVectorIndexes = (item: (typeof activeItems)[number]): number[] => {
-          const primaryIndex =
-            Number.isInteger(item.vector_index) && typeof item.vector_index === "number" && item.vector_index >= 0
-              ? item.vector_index
-              : -1;
-          const indexes =
-            Array.isArray(item.vector_indexes) && item.vector_indexes.length > 0
-              ? item.vector_indexes
-              : primaryIndex >= 0
-                ? [primaryIndex]
-                : [];
-          return indexes.filter((index): index is number => Number.isInteger(index) && index >= 0);
-        };
-        const shouldReembed = (item: (typeof activeItems)[number]) =>
+        const shouldReembed = (item: (typeof inventory)[number]) =>
           isMetadataReadyForEmbedding(item) &&
           (item.isDirty ||
             !item.isEmbedded ||
             (options?.reembedMissing === true && getVectorIndexes(item).length === 0));
-        const dirtyItems = activeItems.filter(shouldReembed);
-        const cleanItems = activeItems
+        const dirtyItemIds = inventory.filter(shouldReembed).map((item) => item.id);
+        const dirtyItemIdSet = new Set(dirtyItemIds);
+        const inventoryByItemId = new Map(inventory.map((item) => [item.id, item]));
+        const cleanItems = inventory
           .filter((item) => !shouldReembed(item))
           .flatMap((item) => {
-            return getVectorIndexes(item).map((vector_index) => ({ id: item.id, vector_index }));
+            return getVectorIndexes(item).map((vector_index) => ({
+              id: item.id,
+              vector_index,
+              snapshotRevision: item.revision,
+            }));
           });
 
         // Step 4: Re-embed dirty items and copy clean vectors
         let lastReportedEmbedded = 0;
-        const { newIndexMap } = await vectorStoreService.rebuildVectors(
+        const { newIndexMap, sourceRevisionByItemId } = await vectorStoreService.rebuildVectors(
           tempFileName,
-          dirtyItems,
+          dirtyItemIds,
+          (itemIds) => databaseManager.getActiveItemsByIds(itemIds),
           cleanItems,
           ({ completedItems, totalItems }) => {
             if (completedItems < totalItems && completedItems - lastReportedEmbedded < 100) return;
@@ -241,52 +279,82 @@ class SyncService {
         // Step 5: Create backup, swap in rebuilt vectors, then commit DB index updates.
         await vectorStoreService.copyFile("vectors.bin", backupFileName, { truncateDest: true });
         backupExists = true;
-        await vectorStoreService.renameFile(tempFileName, "vectors.bin");
-        await vectorMaintenanceJournalService.setPhase("swapped", {
-          operationId,
-          detail: "Swapped compacted vector file into place.",
-        });
+        let recoveredCommitError: Error | null = null;
+        await vectorStoreService.runWithSearchesPaused(
+          async () => {
+            await vectorStoreService.renameFile(tempFileName, "vectors.bin");
+            await vectorMaintenanceJournalService.setPhase("swapped", {
+              operationId,
+              detail: "Swapped compacted vector file into place.",
+            });
 
-        const indexesByItemId = new Map<string, number[]>();
-        for (const item of newIndexMap) {
-          const indexes = indexesByItemId.get(item.id) || [];
-          indexes.push(item.vector_index);
-          indexesByItemId.set(item.id, indexes);
-        }
-        const updates = Array.from(indexesByItemId.entries()).map(([id, vectorIndexes]) => ({
-          id,
-          vector_index: vectorIndexes[0] ?? -1,
-          vector_indexes: vectorIndexes,
-          isEmbedded: true,
-          isDirty: false,
-        }));
-
-        try {
-          await databaseManager.bulkUpdateItems(updates);
-          await databaseManager.clearDeletedItems();
-          await vectorMaintenanceJournalService.setPhase("db_committed", {
-            operationId,
-            detail: `Committed vector indexes for ${updates.length} items.`,
-          });
-        } catch (dbError) {
-          if (backupExists) {
             try {
-              await vectorStoreService.renameFile(backupFileName, "vectors.bin");
-              backupExists = false;
-              await vectorMaintenanceJournalService.setPhase("prepared", {
-                operationId,
-                detail: "Rolled back swapped vectors after DB commit failure.",
+              await commitCompactionWithRecovery({
+                commit: async () => {
+                  const indexesByItemId = new Map<string, number[]>();
+                  for (const item of newIndexMap) {
+                    const indexes = indexesByItemId.get(item.id) || [];
+                    indexes.push(item.vector_index);
+                    indexesByItemId.set(item.id, indexes);
+                  }
+                  const updates = Array.from(indexesByItemId.entries()).map(
+                    ([id, vectorIndexes]) => {
+                      const expectedRevision = sourceRevisionByItemId.get(id);
+                      if (!expectedRevision) {
+                        throw new Error(`Missing source revision for compacted item ${id}.`);
+                      }
+                      const snapshot = inventoryByItemId.get(id);
+                      if (!snapshot) {
+                        throw new Error(`Missing inventory state for compacted item ${id}.`);
+                      }
+                      const wasReembedded = dirtyItemIdSet.has(id);
+                      return {
+                        id,
+                        vector_index: vectorIndexes[0] ?? -1,
+                        vector_indexes: vectorIndexes,
+                        expectedRevision,
+                        // Copied vectors retain the snapshot's pending/clean state.
+                        // Only a vector regenerated now becomes freshly clean.
+                        isEmbeddedOnMatch: wasReembedded ? true : snapshot.isEmbedded,
+                        isDirtyOnMatch: wasReembedded ? false : snapshot.isDirty,
+                      };
+                    }
+                  );
+
+                  await databaseManager.commitCompactedVectorIndexes(updates);
+                  await databaseManager.clearDeletedItems();
+                  await vectorMaintenanceJournalService.setPhase("db_committed", {
+                    operationId,
+                    detail: `Committed vector indexes for ${updates.length} items.`,
+                  });
+                },
+                clearVectors: () => vectorStoreService.clearStorage(),
+                invalidateItems: () => databaseManager.markAllActiveItemsForReembedding(),
+                finalizeRecovery: async (invalidatedCount) => {
+                  await databaseManager.clearDeletedItems();
+                  if (backupExists) {
+                    await vectorStoreService.deleteFile(backupFileName);
+                    backupExists = false;
+                  }
+                  await vectorStoreService.deleteFile(tempFileName);
+                  await vectorMaintenanceJournalService.clear(
+                    `Discarded a partial vector commit; scheduled ${invalidatedCount} items for re-embedding.`
+                  );
+                },
               });
-            } catch (rollbackError) {
-              throw new Error(
-                `Database update failed after vector swap, and rollback failed: ${
-                  rollbackError instanceof Error ? rollbackError.message : "unknown rollback error"
-                }`
-              );
+            } catch (error) {
+              const journal = await vectorMaintenanceJournalService.read();
+              if (journal.phase === "idle") {
+                recoveredCommitError =
+                  error instanceof Error ? error : new Error("Vector index commit failed.");
+                return;
+              }
+              throw error;
             }
-          }
-          throw dbError;
-        }
+          },
+          { blockSearchesOnError: true }
+        );
+        if (recoveredCommitError) throw recoveredCommitError;
 
         if (backupExists) {
           await vectorStoreService.deleteFile(backupFileName);
@@ -311,19 +379,25 @@ class SyncService {
         detail: error instanceof Error ? error.message : "Vector compaction failed.",
         retryAction: "REBUILD_VECTORS",
       });
-      // Attempt to clean up the temporary file if it exists
-      try {
-        await vectorStoreService.deleteFile(tempFileName);
-      } catch {}
-      try {
-        await vectorStoreService.deleteFile(backupFileName);
-      } catch {}
+      // Preserve the backup while a swapped journal still needs conservative
+      // startup recovery. Other phases are safe to clean immediately.
+      let preserveBackupForRecovery = true;
       try {
         const journal = await vectorMaintenanceJournalService.read();
+        preserveBackupForRecovery =
+          journal.operationId === operationId && journal.phase === "swapped";
         if (journal.operationId === operationId && journal.phase !== "swapped") {
           await vectorMaintenanceJournalService.clear("Compaction failed before commit completion.");
         }
       } catch {}
+      try {
+        await vectorStoreService.deleteFile(tempFileName);
+      } catch {}
+      if (!preserveBackupForRecovery) {
+        try {
+          await vectorStoreService.deleteFile(backupFileName);
+        } catch {}
+      }
     } finally {
       this.isSyncing = false;
     }

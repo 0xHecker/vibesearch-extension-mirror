@@ -13,6 +13,7 @@ import {
 } from "@src/services/ocr-model-config";
 
 export { OCR_MODEL_VERSION } from "@src/services/ocr-model-config";
+export const OCR_SUPPORTED = true;
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
 const MAX_IMAGE_LONG_SIDE = 1600;
 const MIN_IMAGE_SIDE = 24;
@@ -183,10 +184,12 @@ const cleanupDevModelCaches: ((cache: Cache) => Promise<void>) | null = ENABLE_D
     })()
   : null;
 
-class OcrSandboxClient {
+export class OcrSandboxClient {
   private frame: HTMLIFrameElement | null = null;
   private readyPromise: Promise<void> | null = null;
   private resolveReady: (() => void) | null = null;
+  private rejectReady: ((error: Error) => void) | null = null;
+  private readyTimeout: number | null = null;
   private readonly pending = new Map<
     string,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -205,11 +208,17 @@ class OcrSandboxClient {
 
     this.readyPromise = new Promise((resolve, reject) => {
       this.resolveReady = resolve;
-      const timeout = window.setTimeout(() => {
+      this.rejectReady = reject;
+      this.readyTimeout = window.setTimeout(() => {
+        this.readyTimeout = null;
         reject(new Error("OCR sandbox did not initialize."));
       }, 30_000);
       this.resolveReady = () => {
-        window.clearTimeout(timeout);
+        if (this.readyTimeout !== null) {
+          window.clearTimeout(this.readyTimeout);
+          this.readyTimeout = null;
+        }
+        this.rejectReady = null;
         resolve();
       };
     });
@@ -285,6 +294,7 @@ class OcrSandboxClient {
         [buffer]
       );
     } catch (error) {
+      if (!this.frame) return;
       this.postToSandbox({
         target: "vibe-search-ocr-parent",
         type: "modelFetchResponse",
@@ -352,13 +362,68 @@ class OcrSandboxClient {
   public async prepare(): Promise<void> {
     await this.ensureReady();
   }
+
+  public dispose(reason = "OCR sandbox released to free memory."): void {
+    window.removeEventListener("message", this.handleMessage);
+    if (this.readyTimeout !== null) {
+      window.clearTimeout(this.readyTimeout);
+      this.readyTimeout = null;
+    }
+    const error = new Error(reason);
+    this.rejectReady?.(error);
+    this.resolveReady = null;
+    this.rejectReady = null;
+    this.readyPromise = null;
+    for (const [id, pending] of this.pending) {
+      this.pending.delete(id);
+      pending.reject(error);
+    }
+    this.frame?.remove();
+    this.frame = null;
+  }
 }
 
-class OcrService {
+export class OcrService {
   private sandbox: OcrSandboxClient | null = null;
+  private idleReleaseTimer: number | null = null;
+  private activeOperations = 0;
+  private idleReleaseRequested = false;
   private consecutiveInitFailures = 0;
   private initCircuitOpenUntil = 0;
   private readonly INIT_CIRCUIT_OPEN_MS = 60_000;
+  private readonly IDLE_RELEASE_MS = 60_000;
+
+  private cancelIdleRelease(): void {
+    if (this.idleReleaseTimer === null) return;
+    window.clearTimeout(this.idleReleaseTimer);
+    this.idleReleaseTimer = null;
+  }
+
+  private async withActiveOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.cancelIdleRelease();
+    this.activeOperations += 1;
+    try {
+      return await operation();
+    } finally {
+      this.activeOperations = Math.max(0, this.activeOperations - 1);
+      if (this.activeOperations === 0 && this.idleReleaseRequested) {
+        this.armIdleRelease();
+      }
+    }
+  }
+
+  private armIdleRelease(): void {
+    if (!this.sandbox || this.activeOperations > 0) return;
+    this.cancelIdleRelease();
+    this.idleReleaseTimer = window.setTimeout(() => {
+      this.idleReleaseTimer = null;
+      if (this.activeOperations > 0) return;
+      this.idleReleaseRequested = false;
+      const sandbox = this.sandbox;
+      this.sandbox = null;
+      sandbox?.dispose();
+    }, this.IDLE_RELEASE_MS);
+  }
 
   private async fetchWithModelCache(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const request = new Request(input, init);
@@ -462,13 +527,15 @@ class OcrService {
   }
 
   private async initialize(): Promise<OcrSandboxClient> {
+    this.cancelIdleRelease();
     if (this.sandbox) return this.sandbox;
     if (Date.now() < this.initCircuitOpenUntil) {
       const seconds = Math.ceil((this.initCircuitOpenUntil - Date.now()) / 1000);
       throw new Error(`OCR model temporarily unavailable. Retry in ${seconds}s.`);
     }
+    let sandbox: OcrSandboxClient | null = null;
     try {
-      const sandbox = new OcrSandboxClient(this.fetchWithModelCache.bind(this));
+      sandbox = new OcrSandboxClient(this.fetchWithModelCache.bind(this));
       this.sandbox = sandbox;
       await sandbox.prepare();
       await this.prefetchModelAssets();
@@ -476,13 +543,28 @@ class OcrService {
       this.initCircuitOpenUntil = 0;
       return sandbox;
     } catch (error) {
-      this.sandbox = null;
+      if (this.sandbox === sandbox) this.sandbox = null;
+      sandbox?.dispose("OCR sandbox initialization failed.");
       this.consecutiveInitFailures += 1;
       if (this.consecutiveInitFailures >= 2) {
         this.initCircuitOpenUntil = Date.now() + this.INIT_CIRCUIT_OPEN_MS;
       }
       throw error;
     }
+  }
+
+  public scheduleIdleRelease(): void {
+    if (!this.sandbox) return;
+    this.idleReleaseRequested = true;
+    this.armIdleRelease();
+  }
+
+  public releaseResources(): void {
+    this.cancelIdleRelease();
+    this.idleReleaseRequested = false;
+    const sandbox = this.sandbox;
+    this.sandbox = null;
+    sandbox?.dispose();
   }
 
   private stableHash(input: string): string {
@@ -672,7 +754,7 @@ class OcrService {
   public async processItem(item: ItemDocType): Promise<ItemOcrResult> {
     const candidates = this.getImageCandidates(item);
     const sourceHash = this.getSourceHashForCandidates(candidates);
-    return this.processCandidates(candidates, sourceHash);
+    return this.withActiveOperation(() => this.processCandidates(candidates, sourceHash));
   }
 
   public async processImageUrl(url: string): Promise<ItemOcrResult> {
@@ -681,7 +763,7 @@ class OcrService {
       ? [{ url: trimmed, source: "original", capturedAt: Date.now() }]
       : [];
     const sourceHash = this.getSourceHashForCandidates(candidates);
-    return this.processCandidates(candidates, sourceHash);
+    return this.withActiveOperation(() => this.processCandidates(candidates, sourceHash));
   }
 
   private async processCandidates(

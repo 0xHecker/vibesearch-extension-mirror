@@ -12,7 +12,8 @@
     "ensure:import-token": "bun scripts/ensure-import-media-token.mjs",
     "build": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=production bunx vite build --config vite.config.chrome.ts",
     "build:chrome": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=production bunx vite build --config vite.config.chrome.ts",
-    "build:firefox": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=production bunx vite build --config vite.config.firefox.ts",
+    "build:firefox": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=production bunx vite build --config vite.config.firefox.ts && node scripts/validate-firefox-build.mjs",
+    "validate:firefox-build": "node scripts/validate-firefox-build.mjs",
     "dev": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=development bunx nodemon --config nodemon.chrome.json",
     "dev:chrome": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=development bunx nodemon --config nodemon.chrome.json",
     "dev:firefox": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=development bunx nodemon --config nodemon.firefox.json"

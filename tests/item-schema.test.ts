@@ -109,4 +109,27 @@ describe("item schema", () => {
       await newDatabase.remove();
     }
   });
+
+  it("normalizes required fields from every legacy schema lineage", () => {
+    const legacy = item() as ItemDocType & Record<string, unknown>;
+    delete legacy.userId;
+    delete legacy.spaceId;
+    delete legacy.ocrStatus;
+    delete legacy.ocrModelVersion;
+    delete legacy.ocrUpdatedAt;
+    legacy.vector_index = Number.NaN;
+    legacy.deletedAt = -1;
+
+    const migrated = itemMigrationStrategies[9](legacy as ItemDocType);
+
+    expect(migrated).toMatchObject({
+      userId: "",
+      spaceId: "space_public_default",
+      ocrStatus: "pending",
+      ocrModelVersion: "",
+      ocrUpdatedAt: 0,
+      vector_index: -1,
+      deletedAt: 0,
+    });
+  });
 });

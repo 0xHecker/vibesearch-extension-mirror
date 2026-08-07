@@ -35,7 +35,7 @@ import { ConfirmDialog } from "@src/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@src/components/ui/dialog";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { SpaceGroupDocType } from "@src/schemas/space_group_schema";
-import type { BinEntry } from "@src/services/controllers/bin.controller";
+import type { BinEntry } from "@src/common/bin";
 import { PUBLIC_SPACE_ID, PRIVATE_SPACE_ID } from "@src/common/spaces";
 import {
   type SidebarSpace,
@@ -98,11 +98,11 @@ export type SidebarHandlers = {
   reorderSpaces: (orderedIds: string[], groupId: string | null) => Promise<void>;
   moveSpaceToBin: (id: string) => Promise<void>;
   restoreSpaceFromBin: (id: string) => Promise<void>;
-  deleteSpaceForever: (id: string) => Promise<void>;
+  deleteSpaceForever: (id: string, expectedDeletedAt: number) => Promise<void>;
   restoreFolderFromBin: (id: string) => Promise<void>;
-  deleteFolderForever: (id: string) => Promise<void>;
+  deleteFolderForever: (id: string, expectedDeletedAt: number) => Promise<void>;
   restoreItemFromBin: (id: string) => Promise<void>;
-  deleteItemForever: (id: string) => Promise<void>;
+  deleteItemForever: (id: string, expectedDeletedAt: number) => Promise<void>;
   reorderSpaceGroups: (orderedIds: string[]) => Promise<void>;
   renameSpaceGroup: (id: string, name: string) => Promise<void>;
   deleteSpaceGroup: (id: string, mode: "moveToUngrouped" | "deleteContents") => Promise<void>;
@@ -126,6 +126,13 @@ export type SidebarProps = {
   activeSpaceGroupId: string | null;
   selectedFolderId: string | "all";
   binEntries: BinEntry[];
+  binTotal: number;
+  binHasMore: boolean;
+  binPage: number;
+  binPageLoading: boolean;
+  onNextBinPage: () => void;
+  onPreviousBinPage: () => void;
+  onOpenBin: () => void;
   now: number;
   handlers: SidebarHandlers;
   /** Incremented by the page (e.g. Settings → Open bin) to open the Bin view. */
@@ -241,6 +248,13 @@ export const Sidebar = React.memo(function Sidebar({
   activeSpaceGroupId,
   selectedFolderId,
   binEntries,
+  binTotal,
+  binHasMore,
+  binPage,
+  binPageLoading,
+  onNextBinPage,
+  onPreviousBinPage,
+  onOpenBin,
   now,
   handlers,
   openBinNonce,
@@ -257,8 +271,10 @@ export const Sidebar = React.memo(function Sidebar({
 
   // Allow the page (Settings → Open bin) to open the Bin view.
   React.useEffect(() => {
-    if (openBinNonce && openBinNonce > 0) setBinViewOpen(true);
-  }, [openBinNonce]);
+    if (!openBinNonce || openBinNonce <= 0) return;
+    setBinViewOpen(true);
+    onOpenBin();
+  }, [onOpenBin, openBinNonce]);
   const [newTabGroupTarget, setNewTabGroupTarget] = React.useState<
     { spaceId: string; parentId: string | null; name: string } | null
   >(null);
@@ -676,11 +692,11 @@ export const Sidebar = React.memo(function Sidebar({
     setDeleteBinEntryState(null);
     try {
       if (entry.kind === "space") {
-        await handlers.deleteSpaceForever(entry.id);
+        await handlers.deleteSpaceForever(entry.id, entry.deletedAt);
       } else if (entry.kind === "folder") {
-        await handlers.deleteFolderForever(entry.id);
+        await handlers.deleteFolderForever(entry.id, entry.deletedAt);
       } else {
-        await handlers.deleteItemForever(entry.id);
+        await handlers.deleteItemForever(entry.id, entry.deletedAt);
       }
     } catch (deleteError) {
       console.error("[Sidebar] purge bin entry failed", deleteError);
@@ -1330,15 +1346,18 @@ export const Sidebar = React.memo(function Sidebar({
         <div className="mt-1 border-t border-border-neutral-faded/70 pt-1">
           <button
             type="button"
-            onClick={() => setBinViewOpen(true)}
+            onClick={() => {
+              setBinViewOpen(true);
+              onOpenBin();
+            }}
             aria-haspopup="dialog"
             className="group/bin flex min-h-9 w-full items-center gap-2 rounded-xl px-2 py-1.5 text-left text-sm text-foreground-secondary transition-colors hover:bg-background-neutral/60"
           >
             <Trash2 size={14} className="shrink-0 text-foreground-tertiary" />
             <span className="min-w-0 flex-1 truncate">Bin</span>
-            {binEntries.length > 0 && (
+            {binTotal > 0 && (
               <span className="shrink-0 rounded-full bg-background-page-secondary px-1.5 py-0.5 text-[10px] font-medium text-foreground-tertiary">
-                {binEntries.length}
+                {binTotal}
               </span>
             )}
           </button>
@@ -1349,7 +1368,13 @@ export const Sidebar = React.memo(function Sidebar({
         open={binViewOpen}
         onOpenChange={setBinViewOpen}
         entries={binEntries}
+        total={binTotal}
+        page={binPage}
+        hasMore={binHasMore}
+        loading={binPageLoading}
         now={now}
+        onNextPage={onNextBinPage}
+        onPreviousPage={onPreviousBinPage}
         onRestore={(entry) => void restoreBinEntry(entry)}
         onRequestDelete={(entry) => setDeleteBinEntryState({ entry })}
       />

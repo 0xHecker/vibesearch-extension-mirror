@@ -18,6 +18,7 @@ class FakeCollection {
   readonly rows = new Map<string, StoredRow>();
   readonly upsertBatches: StoredRow[][] = [];
   readonly removedBatches: string[][] = [];
+  nextBulkUpsertResult: { success: StoredRow[]; error: unknown[] } | null = null;
   findCalls = 0;
 
   findOne(id: string) {
@@ -40,6 +41,8 @@ class FakeCollection {
             if (spaceGroupId && row.spaceGroupId !== spaceGroupId.$eq) return false;
             const spaceId = selector.spaceId as { $in?: unknown } | undefined;
             if (spaceId && (!Array.isArray(spaceId.$in) || !spaceId.$in.includes(row.spaceId))) return false;
+            const id = selector.id as { $in?: unknown } | undefined;
+            if (id && (!Array.isArray(id.$in) || !id.$in.includes(row.id))) return false;
             return true;
           })
           .map((row) => ({
@@ -51,7 +54,13 @@ class FakeCollection {
 
   async bulkUpsert(rows: StoredRow[]) {
     this.upsertBatches.push(rows.map(cloneRow));
+    if (this.nextBulkUpsertResult) {
+      const result = this.nextBulkUpsertResult;
+      this.nextBulkUpsertResult = null;
+      return result;
+    }
     for (const row of rows) this.rows.set(String(row.id), cloneRow(row));
+    return { success: rows.map(cloneRow), error: [] };
   }
 
   async bulkRemove(ids: string[]) {
@@ -269,6 +278,292 @@ describe("buildBrowserBookmarkImportPlan", () => {
     expect(enqueued).toHaveLength(1);
     expect(enqueued[0].items).toHaveLength(1);
     expect(enqueued[0].items![0]).toMatchObject({ deletedAt: now, updatedAt: now });
+  });
+
+  test("automatic resync preserves user-owned records inside the managed bookmark group", async () => {
+    const db = createFakeBookmarkDb();
+    let now = NOW + 100_000;
+    const service = new BrowserBookmarkImportService({
+      getDb: async () => db as never,
+      cloudSync: {
+        enqueueDocs: async () => ({ queued: 0, added: 0 }),
+      } as never,
+      markSearchDirty: () => {},
+      now: () => now,
+      yieldToEventLoop: async () => {},
+      notifyDbChange: () => {},
+    });
+    const tree = createLargeBookmarkTree(1);
+    const initial = await service.importTree({ tree });
+    const importedSpaceId = initial.primarySpaceId!;
+    const importedFolder = Array.from(db.folders.rows.values())[0];
+    const importedBookmark = Array.from(db.items.rows.values())[0];
+
+    db.spaces.rows.set("user-space", {
+      ...db.spaces.rows.get(importedSpaceId)!,
+      id: "user-space",
+      name: "My saved research",
+      slug: "my-saved-research",
+    });
+    db.folders.rows.set("user-folder", {
+      ...importedFolder,
+      id: "user-folder",
+      name: "My folder",
+      spaceId: importedSpaceId,
+      parentId: importedFolder.id,
+    });
+    db.items.rows.set("user-item-in-imported-folder", {
+      ...importedBookmark,
+      id: "user-item-in-imported-folder",
+      title: "Keep me",
+      url: "https://example.com/user-owned",
+      folderId: importedFolder.id,
+      deletedAt: 0,
+    });
+    db.items.rows.set("user-item-in-user-space", {
+      ...importedBookmark,
+      id: "user-item-in-user-space",
+      title: "Keep my space",
+      url: "https://example.com/user-space",
+      spaceId: "user-space",
+      folderId: "user-folder",
+      deletedAt: 0,
+    });
+
+    now += 1_000;
+    const result = await service.importTree({ tree: [{ id: "0", children: [] }] });
+
+    expect(result.removedBookmarkCount).toBe(1);
+    expect(db.items.rows.get(String(importedBookmark.id))?.deletedAt).toBe(now);
+    expect(db.items.rows.get("user-item-in-imported-folder")?.deletedAt).toBe(0);
+    expect(db.items.rows.get("user-item-in-user-space")?.deletedAt).toBe(0);
+    expect(db.folders.rows.has(String(importedFolder.id))).toBe(true);
+    expect(db.folders.rows.has("user-folder")).toBe(true);
+    expect(db.spaces.rows.get(importedSpaceId)?.isArchived).toBe(false);
+    expect(db.spaces.rows.get("user-space")?.isArchived).toBe(false);
+  });
+
+  test("reimport preserves a relocated managed bookmark and all of its local edits", async () => {
+    const db = createFakeBookmarkDb();
+    const enqueued: CloudSyncDocBatch[] = [];
+    let now = NOW + 100_000;
+    const service = new BrowserBookmarkImportService({
+      getDb: async () => db as never,
+      cloudSync: {
+        enqueueDocs: async (batch) => {
+          enqueued.push(batch);
+          return { queued: 0, added: 0 };
+        },
+      } as never,
+      markSearchDirty: () => {},
+      now: () => now,
+      yieldToEventLoop: async () => {},
+      notifyDbChange: () => {},
+    });
+    const initialTree = createLargeBookmarkTree(1);
+    await service.importTree({ tree: initialTree });
+    const imported = Array.from(db.items.rows.values())[0];
+    const relocated = {
+      ...imported,
+      title: "My annotated bookmark",
+      textContent: "Local notes that must survive source reconciliation",
+      folderId: "user-folder",
+      spaceId: "user-space",
+      isFavorite: true,
+      media: [{ type: "image", url: "https://example.com/local-preview.png" }],
+      updatedAt: now + 1,
+    };
+    db.items.rows.set(String(imported.id), cloneRow(relocated));
+    db.spaces.rows.set("user-space", {
+      id: "user-space",
+      name: "My research",
+      slug: "my-research",
+      spaceGroupId: "",
+      isPrivate: false,
+      isArchived: false,
+      deletedAt: 0,
+    });
+    db.folders.rows.set("user-folder", {
+      id: "user-folder",
+      name: "My notes",
+      spaceId: "user-space",
+      parentId: null,
+      deletedAt: 0,
+    });
+    enqueued.length = 0;
+    db.items.resetWriteHistory();
+
+    const changedTree = structuredClone(initialTree);
+    changedTree[0].children![0].children![0] = {
+      ...changedTree[0].children![0].children![0],
+      title: "Source renamed this",
+      url: "https://example.com/source-changed",
+    };
+    now += 1_000;
+    const result = await service.importTree({ tree: changedTree });
+
+    expect(result.updatedBookmarkCount).toBe(0);
+    expect(result.metadataUrls).toEqual([]);
+    expect(db.items.rows.get(String(imported.id))).toEqual(relocated);
+    expect(db.items.upsertBatches).toHaveLength(0);
+    expect(enqueued).toHaveLength(0);
+  });
+
+  test("rejects a managed bookmark import when RxDB rejects an item batch", async () => {
+    const db = createFakeBookmarkDb();
+    const enqueued: CloudSyncDocBatch[] = [];
+    const writeError = {
+      status: 422,
+      documentId: "browser-bookmark-rejected",
+      isError: true,
+      message: "schema validation failed",
+    };
+    db.items.nextBulkUpsertResult = { success: [], error: [writeError] };
+    let searchDirtyCalls = 0;
+    const notifications: string[] = [];
+    const service = new BrowserBookmarkImportService({
+      getDb: async () => db as never,
+      cloudSync: {
+        enqueueDocs: async (batch) => {
+          enqueued.push(batch);
+          return { queued: 0, added: 0 };
+        },
+      } as never,
+      markSearchDirty: () => {
+        searchDirtyCalls += 1;
+      },
+      now: () => NOW,
+      yieldToEventLoop: async () => {},
+      notifyDbChange: (scope) => notifications.push(scope),
+    });
+
+    const importError = await service.importTree({ tree: createLargeBookmarkTree(1) }).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect(importError).toBeInstanceOf(AggregateError);
+    expect(importError).toMatchObject({
+      message: "RXDB_BULK_WRITE_FAILED:browser-bookmarks.items:1",
+      errors: [writeError],
+    });
+    expect(db.items.rows.size).toBe(0);
+    expect(enqueued).toHaveLength(0);
+    expect(searchDirtyCalls).toBe(0);
+    expect(notifications).toEqual([]);
+  });
+
+  test("retains structure when user content lands at the final resync cleanup boundary", async () => {
+    const db = createFakeBookmarkDb();
+    let now = NOW + 100_000;
+    let armed = false;
+    let injected = false;
+    let concurrentItem: StoredRow | null = null;
+    let staleManagedItemId: string | null = null;
+    const service = new BrowserBookmarkImportService({
+      getDb: async () => db as never,
+      cloudSync: {
+        enqueueDocs: async () => ({ queued: 0, added: 0 }),
+      } as never,
+      markSearchDirty: () => {},
+      now: () => now,
+      yieldToEventLoop: async () => {
+        if (!armed || injected || !concurrentItem) return;
+        if (!staleManagedItemId || db.items.rows.get(staleManagedItemId)?.deletedAt !== now) return;
+        db.items.rows.set(String(concurrentItem.id), cloneRow(concurrentItem));
+        injected = true;
+      },
+      notifyDbChange: () => {},
+    });
+    const initialTree: BrowserBookmarkNode[] = [{
+      id: "0",
+      children: [
+        {
+          id: "keep-folder",
+          title: "Keep",
+          children: [{ id: "keep-bookmark", title: "Keep", url: "https://example.com/keep" }],
+        },
+        {
+          id: "stale-folder",
+          title: "Stale",
+          children: [{ id: "stale-bookmark", title: "Stale", url: "https://example.com/stale" }],
+        },
+      ],
+    }];
+    const initialPlan = buildBrowserBookmarkImportPlan({ tree: initialTree }, { now });
+    await service.importTree({ tree: initialTree });
+
+    const staleSpace = initialPlan.spaces.find((space) => space.name === "Stale")!;
+    const staleFolder = initialPlan.folders.find((folder) => folder.spaceId === staleSpace.id)!;
+    const staleBookmark = initialPlan.bookmarks.find((item) => item.spaceId === staleSpace.id)!;
+    staleManagedItemId = staleBookmark.id;
+    concurrentItem = {
+      ...staleBookmark,
+      id: "user-save-during-browser-resync",
+      title: "Saved while syncing",
+      url: "https://example.com/concurrent-user-save",
+      folderId: staleFolder.id,
+      spaceId: staleSpace.id,
+      deletedAt: 0,
+    };
+    armed = true;
+    now += 1_000;
+
+    await service.importTree({ tree: [{ id: "0", children: [initialTree[0].children![0]] }] });
+
+    expect(injected).toBe(true);
+    expect(db.items.rows.get("user-save-during-browser-resync")?.deletedAt).toBe(0);
+    expect(db.folders.rows.has(staleFolder.id)).toBe(true);
+    expect(db.spaces.rows.get(staleSpace.id)?.isArchived).toBe(false);
+  });
+
+  test("rejects a missing bookmark tree before destructive reconciliation", async () => {
+    const db = createFakeBookmarkDb();
+    const service = new BrowserBookmarkImportService({
+      getDb: async () => db as never,
+      cloudSync: {
+        enqueueDocs: async () => ({ queued: 0, added: 0 }),
+      } as never,
+      markSearchDirty: () => {},
+      now: () => NOW,
+      yieldToEventLoop: async () => {},
+      notifyDbChange: () => {},
+    });
+    const tree = createLargeBookmarkTree(1);
+    await service.importTree({ tree });
+    const before = {
+      spaces: Array.from(db.spaces.rows.keys()),
+      folders: Array.from(db.folders.rows.keys()),
+      items: Array.from(db.items.rows.entries()),
+    };
+
+    await expect(service.importTree({ tree: [] })).rejects.toThrow("BOOKMARK_TREE_INVALID");
+
+    expect(Array.from(db.spaces.rows.keys())).toEqual(before.spaces);
+    expect(Array.from(db.folders.rows.keys())).toEqual(before.folders);
+    expect(Array.from(db.items.rows.entries())).toEqual(before.items);
+  });
+
+  test("does not silently resurrect a managed destination space from Bin", async () => {
+    const db = createFakeBookmarkDb();
+    const service = new BrowserBookmarkImportService({
+      getDb: async () => db as never,
+      cloudSync: { enqueueDocs: async () => ({ queued: 0, added: 0 }) } as never,
+      markSearchDirty: () => {},
+      now: () => NOW,
+      yieldToEventLoop: async () => {},
+      notifyDbChange: () => {},
+    });
+    const tree = createLargeBookmarkTree(1);
+    const initial = await service.importTree({ tree });
+    const space = db.spaces.rows.get(initial.primarySpaceId!)!;
+    space.deletedAt = NOW + 1;
+    space.purgeAt = NOW + 2;
+    db.items.resetWriteHistory();
+
+    await expect(service.importTree({ tree })).rejects.toThrow("DESTINATION_SPACE_NOT_LIVE");
+    expect(space.deletedAt).toBe(NOW + 1);
+    expect(db.items.upsertBatches).toHaveLength(0);
   });
 
   test("bounds space and folder writes for a very wide bookmark tree", async () => {

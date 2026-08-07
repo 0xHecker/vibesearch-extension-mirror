@@ -6,11 +6,40 @@ import { databaseManager } from "@src/services/db-manager";
 import { appendUnorderedIds } from "@src/utils/ordered-ids";
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID, computeBinPurgeAt } from "@src/common/spaces";
 import { spaceSessionService } from "@src/services/space-session.service";
-import { deleteAllMediaForItem } from "@src/services/media-storage";
-import { resolveRestoreSpace, restoreFallbackMessage } from "@src/services/bin-restore-location";
+import {
+  cloneOpfsMediaEntriesForItem,
+  withOpfsMutationLock,
+} from "@src/services/media-storage";
+import { deleteUnreferencedOpfsItemDirectories } from "@src/services/opfs-media-lifecycle";
+import {
+  createRestoreTabGroup,
+  resolveRestoreSpace,
+  restoreFallbackMessage,
+} from "@src/services/bin-restore-location";
+import { nextBinMutationTimestamp } from "@src/common/bin";
+import {
+  withBinMutationLock,
+  withEntityMutationLock,
+  withSpaceMutationLock,
+  withSpaceMutationLocks,
+} from "@src/services/entity-mutation-lock";
+import {
+  requireLiveFolderDestination,
+  requireLiveSpaceDestination,
+  withLiveSpaceDestination,
+} from "@src/services/live-destination";
+import { forEachIdKeysetPage } from "@src/services/rxdb-keyset-pagination";
+
+const FOLDER_ITEM_PAGE_SIZE = 200;
+
+type FoldersControllerOptions = {
+  cloneOpfsMediaEntriesForItem?: typeof cloneOpfsMediaEntriesForItem;
+  deleteUnreferencedOpfsItemDirectories?: typeof deleteUnreferencedOpfsItemDirectories;
+};
 
 export class FoldersController {
   [key: string]: any;
+  constructor(private readonly options: FoldersControllerOptions = {}) {}
 
   private normalizeUserId(userId: string | null | undefined): string {
     return typeof userId === "string" ? userId : "";
@@ -35,25 +64,154 @@ export class FoldersController {
   }
 
   private collectFolderTreeIds(folders: FolderDocType[], rootId: string): Set<string> {
-    const ids = new Set<string>([rootId]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const folder of folders) {
-        const parentId = folder.parentId || null;
-        if (parentId && ids.has(parentId) && !ids.has(folder.id)) {
-          ids.add(folder.id);
-          changed = true;
-        }
+    const childrenByParent = new Map<string, string[]>();
+    for (const folder of folders) {
+      const parentId = folder.parentId || null;
+      if (!parentId) continue;
+      const children = childrenByParent.get(parentId);
+      if (children) children.push(folder.id);
+      else childrenByParent.set(parentId, [folder.id]);
+    }
+
+    const visited = new Set<string>();
+    const pending = [rootId];
+    while (pending.length > 0) {
+      const id = pending.pop() as string;
+      if (visited.has(id)) continue;
+      visited.add(id);
+      for (const childId of childrenByParent.get(id) || []) {
+        if (!visited.has(childId)) pending.push(childId);
       }
     }
-    return ids;
+    return visited;
   }
 
   private async removeDeletedItemTombstone(db: any, id: string): Promise<void> {
     if (!db.deleted_items?.findOne) return;
     const tombstone = await db.deleted_items.findOne(id).exec();
     if (tombstone) await tombstone.remove();
+  }
+
+  /**
+   * Move live rows out of a folder tree before that tree can be hard-purged.
+   * The destination is a new live root tab group, so kept tabs never become
+   * invisible children of a binned folder and cannot be swept up later.
+   */
+  private async relocateLiveItemsFromTree(
+    db: any,
+    folderIds: ReadonlySet<string>,
+    sourceFolder: FolderDocType,
+    targetSpaceId: string
+  ): Promise<number> {
+    let recoveryFolder: FolderDocType | null = null;
+    let relocatedItems = 0;
+    const clockNow = Date.now();
+    await forEachIdKeysetPage({
+      collection: db.items,
+      selector: { folderId: { $in: Array.from(folderIds) } },
+      pageSize: FOLDER_ITEM_PAGE_SIZE,
+      onPage: async (candidates: any[]) => {
+        for (const candidate of candidates) {
+          const itemId = candidate.primary as string;
+          await withEntityMutationLock(db, "item", itemId, async () => {
+            const itemDoc = await db.items.findOne(itemId).exec();
+            if (!itemDoc) return;
+            const item = itemDoc.toMutableJSON() as ItemDocType;
+            if (typeof item.deletedAt === "number" && item.deletedAt > 0) return;
+            if (!folderIds.has(item.folderId)) return;
+
+            if (!recoveryFolder) {
+              await requireLiveSpaceDestination(db, targetSpaceId);
+              recoveryFolder = await createRestoreTabGroup(db, {
+                spaceId: targetSpaceId,
+                userId: sourceFolder.userId,
+                name: `Kept tabs from ${sourceFolder.name || "deleted folder"}`,
+              });
+            }
+            const updatedAt = nextBinMutationTimestamp(
+              clockNow,
+              item.updatedAt,
+              item.deletedAt
+            );
+            await itemDoc.patch({
+              folderId: recoveryFolder.id,
+              spaceId: targetSpaceId,
+              deletedAt: 0,
+              updatedAt,
+              isDirty: true,
+            });
+            await this.removeDeletedItemTombstone(db, itemId);
+            relocatedItems += 1;
+          });
+        }
+      },
+    });
+    return relocatedItems;
+  }
+
+  private async purgeFolderTreeItems(
+    db: any,
+    folderIds: ReadonlySet<string>,
+    sourceFolder: FolderDocType,
+    targetSpaceId: string
+  ): Promise<number> {
+    // Validate before deleting even the first row so a malformed legacy tree
+    // never leaves a partially purged set when its live fallback is unsafe.
+    await requireLiveSpaceDestination(db, targetSpaceId);
+    let recoveryFolder: FolderDocType | null = null;
+    let removedItems = 0;
+    const clockNow = Date.now();
+    await forEachIdKeysetPage({
+      collection: db.items,
+      selector: { folderId: { $in: Array.from(folderIds) } },
+      pageSize: FOLDER_ITEM_PAGE_SIZE,
+      onPage: async (candidates: any[]) => {
+        const removedItemIds: string[] = [];
+        for (const candidate of candidates) {
+          const itemId = candidate.primary as string;
+          await withEntityMutationLock(db, "item", itemId, async () => {
+            const itemDoc = await db.items.findOne(itemId).exec();
+            if (!itemDoc) return;
+            const item = itemDoc.toMutableJSON() as ItemDocType;
+            if (!folderIds.has(item.folderId)) return;
+
+            if (typeof item.deletedAt === "number" && item.deletedAt > 0) {
+              await itemDoc.remove();
+              await this.removeDeletedItemTombstone(db, itemId);
+              removedItemIds.push(itemId);
+              removedItems += 1;
+              return;
+            }
+
+            if (!recoveryFolder) {
+              recoveryFolder = await createRestoreTabGroup(db, {
+                spaceId: targetSpaceId,
+                userId: sourceFolder.userId,
+                name: `Kept tabs from ${sourceFolder.name || "deleted folder"}`,
+              });
+            }
+            const updatedAt = nextBinMutationTimestamp(
+              clockNow,
+              item.updatedAt,
+              item.deletedAt
+            );
+            await itemDoc.patch({
+              folderId: recoveryFolder.id,
+              spaceId: targetSpaceId,
+              deletedAt: 0,
+              updatedAt,
+              isDirty: true,
+            });
+            await this.removeDeletedItemTombstone(db, itemId);
+          });
+        }
+        const deleteDirectories =
+          this.options.deleteUnreferencedOpfsItemDirectories ||
+          deleteUnreferencedOpfsItemDirectories;
+        await deleteDirectories(db, removedItemIds);
+      },
+    });
+    return removedItems;
   }
 
   async getById(payload: { id: string; skipLockCheck?: boolean }): Promise<FolderDocType | null> {
@@ -73,38 +231,40 @@ export class FoldersController {
     allowLockedPrivateWrite?: boolean;
   }): Promise<FolderDocType> {
     const db = await getDb();
-    const now = Date.now();
-    const requestedSpaceId = (payload.spaceId || "").trim();
-    const spaceDoc = requestedSpaceId ? await db.spaces.findOne(requestedSpaceId).exec() : null;
-    const spaceId = (spaceDoc?.get("id") as string | undefined) || PUBLIC_SPACE_ID;
-    const bypassLockCheck =
-      payload.allowLockedPrivateWrite === true && spaceId === PRIVATE_SPACE_ID;
-    if (!bypassLockCheck) {
-      this.assertSpaceUnlocked(spaceId);
-    }
-    const folder: FolderDocType = {
-      id: uuidv4(),
-      name: payload.name,
-      userId: this.normalizeUserId(payload.userId),
-      spaceId,
-      parentId: payload.parentId ?? null,
-      type: "folder",
-      sortOrder: now,
-      isLocked: false,
-      isPinned: false,
-      isCollapsed: false,
-      deletedAt: 0,
-      purgeAt: 0,
-      isDirty: false,
-      serverVersion: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await db.folders.insert(folder);
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    return folder;
+    const requestedSpaceId = (payload.spaceId || PUBLIC_SPACE_ID).trim() || PUBLIC_SPACE_ID;
+    return withLiveSpaceDestination(db, requestedSpaceId, async (_spaceDoc, spaceId) => {
+      const bypassLockCheck =
+        payload.allowLockedPrivateWrite === true && spaceId === PRIVATE_SPACE_ID;
+      if (!bypassLockCheck) this.assertSpaceUnlocked(spaceId);
+      if (payload.parentId) {
+        await requireLiveFolderDestination(db, payload.parentId, spaceId);
+      }
+
+      const now = Date.now();
+      const folder: FolderDocType = {
+        id: uuidv4(),
+        name: payload.name,
+        userId: this.normalizeUserId(payload.userId),
+        spaceId,
+        parentId: payload.parentId ?? null,
+        type: "folder",
+        sortOrder: now,
+        isLocked: false,
+        isPinned: false,
+        isCollapsed: false,
+        deletedAt: 0,
+        purgeAt: 0,
+        isDirty: false,
+        serverVersion: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await db.folders.insert(folder);
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+      return folder;
+    });
   }
 
   async setPinned(payload: { id: string; value: boolean }): Promise<{ success: boolean }> {
@@ -158,148 +318,294 @@ export class FoldersController {
     alsoDeleteItems?: boolean;
   }): Promise<{ success: boolean; error?: string }> {
     const db = await getDb();
-    const doc = await this.getFolderWithAccess(db, payload.id);
-    if (!doc) return { success: false, error: "NOT_FOUND" };
-    const current = doc.toMutableJSON();
-    if (current.isLocked) return { success: false, error: "LOCKED" };
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+    return withBinMutationLock(db, () =>
+      withEntityMutationLock(db, "folder", id, async () => {
+        const initial = await this.getFolderWithAccess(db, id);
+        if (!initial) return { success: false, error: "NOT_FOUND" };
+        const initialSpaceId = this.resolveSpaceId(
+          initial.get("spaceId") as string | undefined
+        );
+        return withSpaceMutationLock(db, initialSpaceId, async () => {
+          const doc = await this.getFolderWithAccess(db, id);
+          if (!doc) return { success: false, error: "NOT_FOUND" };
+          const current = doc.toMutableJSON() as FolderDocType;
+          if (this.resolveSpaceId(current.spaceId) !== initialSpaceId) {
+            throw new Error("DESTINATION_FOLDER_CHANGED");
+          }
+          if (current.deletedAt !== 0) return { success: true };
+          if (current.isLocked) return { success: false, error: "LOCKED" };
 
-    const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: current.spaceId } } }).exec();
-    const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
-    const folderIds = this.collectFolderTreeIds(folders, payload.id);
+          const alsoDeleteItems = payload.alsoDeleteItems !== false;
+          // Keeping live items needs a provably live destination. The older
+          // delete-with-items path is also used while constructing/restoring
+          // binned-space trees and does not create any live descendants.
+          if (!alsoDeleteItems) {
+            await requireLiveSpaceDestination(db, initialSpaceId);
+          }
 
-    const now = Date.now();
-    const purgeAt = computeBinPurgeAt(now);
-    const alsoDeleteItems = payload.alsoDeleteItems !== false;
-    if (alsoDeleteItems) {
-      const items = await db.items
-        .find({ selector: { folderId: { $in: Array.from(folderIds) }, deletedAt: { $eq: 0 } } })
-        .exec();
-      for (const item of items) {
-        await databaseManager.deleteItem({ id: item.primary });
-      }
-    }
+          const folderDocs = await db.folders
+            .find({ selector: { spaceId: { $eq: current.spaceId } } })
+            .exec();
+          const folders = folderDocs.map(
+            (folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType
+          );
+          const folderIds = this.collectFolderTreeIds(folders, id);
 
-    for (const folderDoc of folderDocs) {
-      if (folderIds.has(folderDoc.primary)) {
-        await folderDoc.patch({ deletedAt: now, purgeAt, updatedAt: now });
-      }
-    }
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    return { success: true };
+          const clockNow = Date.now();
+          let relocatedItems = 0;
+          if (alsoDeleteItems) {
+            await forEachIdKeysetPage({
+              collection: db.items,
+              selector: {
+                folderId: { $in: Array.from(folderIds) },
+                deletedAt: { $eq: 0 },
+              },
+              pageSize: FOLDER_ITEM_PAGE_SIZE,
+              onPage: async (items: any[]) => {
+                for (const item of items) {
+                  await databaseManager.deleteItem({ id: item.primary });
+                }
+              },
+            });
+          } else {
+            relocatedItems = await this.relocateLiveItemsFromTree(
+              db,
+              folderIds,
+              current,
+              initialSpaceId
+            );
+          }
+
+          for (const folderDoc of folderDocs) {
+            if (!folderIds.has(folderDoc.primary)) continue;
+            const folder = folderDoc.toMutableJSON() as FolderDocType;
+            const deletedAt = nextBinMutationTimestamp(
+              clockNow,
+              folder.updatedAt,
+              folder.deletedAt
+            );
+            await folderDoc.patch({
+              deletedAt,
+              purgeAt: computeBinPurgeAt(deletedAt),
+              updatedAt: deletedAt,
+            });
+          }
+          try {
+            chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+          } catch {}
+          if (relocatedItems > 0) {
+            try {
+              chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+            } catch {}
+          }
+          return { success: true };
+        });
+      })
+    );
   }
 
   async restoreFromBin(payload: {
     id: string;
   }): Promise<{ success: boolean; restoredItems: number; error?: string; relocated?: boolean; message?: string }> {
     const db = await getDb();
-    const doc = await this.getFolderWithAccess(db, payload.id);
-    if (!doc) return { success: false, restoredItems: 0, error: "NOT_FOUND" };
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, restoredItems: 0, error: "NOT_FOUND" };
+    return withBinMutationLock(db, () =>
+      withEntityMutationLock(db, "folder", id, async () => {
+        const doc = await this.getFolderWithAccess(db, id);
+        if (!doc) return { success: false, restoredItems: 0, error: "NOT_FOUND" };
 
-    const current = doc.toMutableJSON() as FolderDocType;
-    if ((current.deletedAt || 0) === 0) return { success: true, restoredItems: 0 };
+        const current = doc.toMutableJSON() as FolderDocType;
+        if ((current.deletedAt || 0) === 0) return { success: true, restoredItems: 0 };
 
-    const restoreSpace = await resolveRestoreSpace(db, current.spaceId || PUBLIC_SPACE_ID);
-    let targetParentId = current.parentId || null;
-    let relocated = restoreSpace.relocated;
-    const parentId = current.parentId || null;
-    if (!relocated && parentId) {
-      const parentDoc = await db.folders.findOne(parentId).exec();
-      const parentDeletedAt = (parentDoc?.get("deletedAt") as number | undefined) || 0;
-      relocated = !parentDoc || parentDeletedAt > 0;
-    }
-    if (relocated) {
-      targetParentId = null;
-    }
+        const restoreSpace = await resolveRestoreSpace(db, current.spaceId || PUBLIC_SPACE_ID);
+        return withSpaceMutationLocks(
+          db,
+          [current.spaceId || PUBLIC_SPACE_ID, restoreSpace.space.id],
+          async () => {
+        const lockedDoc = await db.folders.findOne(id).exec();
+        if (!lockedDoc) {
+          return { success: false, restoredItems: 0, error: "NOT_FOUND" };
+        }
+        const current = lockedDoc.toMutableJSON() as FolderDocType;
+        if ((current.deletedAt || 0) === 0) return { success: true, restoredItems: 0 };
+        let targetParentId = current.parentId || null;
+        let relocated = restoreSpace.relocated;
+        const parentId = current.parentId || null;
+        if (!relocated && parentId) {
+          const parentDoc = await db.folders.findOne(parentId).exec();
+          const parentDeletedAt = (parentDoc?.get("deletedAt") as number | undefined) || 0;
+          relocated = !parentDoc || parentDeletedAt > 0;
+        }
+        if (relocated) targetParentId = null;
 
-    const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: current.spaceId } } }).exec();
-    const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
-    const folderIds = this.collectFolderTreeIds(folders, payload.id);
-    const now = Date.now();
+        const folderDocs = await db.folders
+          .find({ selector: { spaceId: { $eq: current.spaceId } } })
+          .exec();
+        const folders = folderDocs.map(
+          (folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType
+        );
+        const folderIds = this.collectFolderTreeIds(folders, id);
+        const clockNow = Date.now();
 
-    for (const folderDoc of folderDocs) {
-      if (folderIds.has(folderDoc.primary)) {
-        await folderDoc.patch({
-          spaceId: restoreSpace.space.id,
-          parentId: folderDoc.primary === payload.id ? targetParentId : (folderDoc.get("parentId") as string | null),
-          deletedAt: 0,
-          purgeAt: 0,
-          updatedAt: now,
+        for (const folderDoc of folderDocs) {
+          if (!folderIds.has(folderDoc.primary)) continue;
+          const folder = folderDoc.toMutableJSON() as FolderDocType;
+          const updatedAt = nextBinMutationTimestamp(
+            clockNow,
+            folder.updatedAt,
+            folder.deletedAt
+          );
+          await folderDoc.patch({
+            spaceId: restoreSpace.space.id,
+            parentId:
+              folderDoc.primary === id
+                ? targetParentId
+                : (folderDoc.get("parentId") as string | null),
+            deletedAt: 0,
+            purgeAt: 0,
+            updatedAt,
+          });
+        }
+
+        let restoredItems = 0;
+        await forEachIdKeysetPage({
+          collection: db.items,
+          selector: {
+            folderId: { $in: Array.from(folderIds) },
+            deletedAt: { $gt: 0 },
+          },
+          pageSize: FOLDER_ITEM_PAGE_SIZE,
+          onPage: async (candidates: any[]) => {
+            for (const candidate of candidates) {
+              const itemId = candidate.primary as string;
+              await withEntityMutationLock(db, "item", itemId, async () => {
+                const itemDoc = await db.items.findOne(itemId).exec();
+                if (!itemDoc) return;
+                const item = itemDoc.toMutableJSON() as ItemDocType;
+                if (!(item.deletedAt > 0) || !folderIds.has(item.folderId)) return;
+                const updatedAt = nextBinMutationTimestamp(
+                  clockNow,
+                  item.updatedAt,
+                  item.deletedAt
+                );
+                await itemDoc.patch({
+                  spaceId: restoreSpace.space.id,
+                  deletedAt: 0,
+                  updatedAt,
+                  isDirty: true,
+                });
+                await this.removeDeletedItemTombstone(db, itemId);
+                restoredItems += 1;
+              });
+            }
+          },
         });
-      }
-    }
 
-    const itemDocs = await db.items
-      .find({ selector: { folderId: { $in: Array.from(folderIds) }, deletedAt: { $gt: 0 } } })
-      .exec();
-    for (const itemDoc of itemDocs) {
-      await itemDoc.patch({
-        spaceId: restoreSpace.space.id,
-        deletedAt: 0,
-        updatedAt: now,
-        isDirty: true,
-      });
-      await this.removeDeletedItemTombstone(db, itemDoc.primary);
-    }
+        if (restoreSpace.created) {
+          try {
+            chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+          } catch {}
+        }
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+        } catch {}
+        try {
+          chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+        } catch {}
 
-    if (restoreSpace.created) {
-      try {
-        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
-      } catch {}
-    }
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
-
-    return {
-      success: true,
-      restoredItems: itemDocs.length,
-      relocated,
-      message: relocated ? restoreFallbackMessage(restoreSpace.space.name) : undefined,
-    };
+            return {
+              success: true,
+              restoredItems,
+              relocated,
+              message: relocated
+                ? restoreFallbackMessage(restoreSpace.space.name)
+                : undefined,
+            };
+          }
+        );
+      })
+    );
   }
 
   async deleteForever(payload: {
     id: string;
+    expectedDeletedAt: number;
   }): Promise<{ success: boolean; removedItems: number; removedFolders: number; error?: string }> {
     const db = await getDb();
-    const doc = await this.getFolderWithAccess(db, payload.id);
-    if (!doc) return { success: false, removedItems: 0, removedFolders: 0, error: "NOT_FOUND" };
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, removedItems: 0, removedFolders: 0, error: "NOT_FOUND" };
+    return withBinMutationLock(db, () =>
+      withEntityMutationLock(db, "folder", id, async () => {
+        const doc = await this.getFolderWithAccess(db, id);
+        if (!doc) {
+          return { success: false, removedItems: 0, removedFolders: 0, error: "NOT_FOUND" };
+        }
 
-    const current = doc.toMutableJSON() as FolderDocType;
-    if (current.isLocked) return { success: false, removedItems: 0, removedFolders: 0, error: "LOCKED" };
+        const current = doc.toMutableJSON() as FolderDocType;
+        if (current.isLocked) {
+          return { success: false, removedItems: 0, removedFolders: 0, error: "LOCKED" };
+        }
+        if (!(current.deletedAt > 0)) throw new Error("FOLDER_NOT_IN_BIN");
+        if (current.deletedAt !== payload.expectedDeletedAt) {
+          throw new Error("FOLDER_BIN_ENTRY_CHANGED");
+        }
+        const spaceId = this.resolveSpaceId(current.spaceId);
+        return withSpaceMutationLock(db, spaceId, async () => {
+          const freshDoc = await db.folders.findOne(id).exec();
+          if (!freshDoc) {
+            return {
+              success: false,
+              removedItems: 0,
+              removedFolders: 0,
+              error: "NOT_FOUND",
+            };
+          }
+          const fresh = freshDoc.toMutableJSON() as FolderDocType;
+          if (this.resolveSpaceId(fresh.spaceId) !== spaceId) {
+            throw new Error("FOLDER_BIN_ENTRY_CHANGED");
+          }
+          if (!(fresh.deletedAt > 0)) throw new Error("FOLDER_NOT_IN_BIN");
+          if (fresh.deletedAt !== payload.expectedDeletedAt) {
+            throw new Error("FOLDER_BIN_ENTRY_CHANGED");
+          }
 
-    const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: current.spaceId } } }).exec();
-    const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
-    const folderIds = this.collectFolderTreeIds(folders, payload.id);
+          const folderDocs = await db.folders
+            .find({ selector: { spaceId: { $eq: spaceId } } })
+            .exec();
+          const folders = folderDocs.map(
+            (folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType
+          );
+          const folderIds = this.collectFolderTreeIds(folders, id);
 
-    const itemDocs = await db.items
-      .find({ selector: { folderId: { $in: Array.from(folderIds) } } })
-      .exec();
-    for (const itemDoc of itemDocs) {
-      await deleteAllMediaForItem(itemDoc.primary);
-      await this.removeDeletedItemTombstone(db, itemDoc.primary);
-      await itemDoc.remove();
-    }
+          const removedItems = await this.purgeFolderTreeItems(
+            db,
+            folderIds,
+            fresh,
+            spaceId
+          );
 
-    for (const folderDoc of folderDocs) {
-      if (folderIds.has(folderDoc.primary)) {
-        await folderDoc.remove();
-      }
-    }
+          for (const folderDoc of folderDocs) {
+            if (folderIds.has(folderDoc.primary)) await folderDoc.remove();
+          }
 
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
+          try {
+            chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+          } catch {}
+          try {
+            chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+          } catch {}
 
-    return { success: true, removedItems: itemDocs.length, removedFolders: folderIds.size };
+          return {
+            success: true,
+            removedItems,
+            removedFolders: folderIds.size,
+          };
+        });
+      })
+    );
   }
 
   async countItemsInTree(payload: { ids: string[] }): Promise<Record<string, number>> {
@@ -316,10 +622,14 @@ export class FoldersController {
       const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: root.spaceId } } }).exec();
       const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
       const folderIds = this.collectFolderTreeIds(folders, id);
-      const items = await db.items
-        .find({ selector: { folderId: { $in: Array.from(folderIds) }, deletedAt: { $eq: 0 } } })
+      counts[id] = await db.items
+        .count({
+          selector: {
+            folderId: { $in: Array.from(folderIds) },
+            deletedAt: { $eq: 0 },
+          },
+        })
         .exec();
-      counts[id] = items.length;
     }
     return counts;
   }
@@ -381,58 +691,52 @@ export class FoldersController {
       return { success: false, error: "FOLDER_CANNOT_BE_OWN_DESCENDANT" };
     }
 
-    const folderDoc = await this.getFolderWithAccess(db, folderId);
-    if (!folderDoc) return { success: false, error: "NOT_FOUND" };
-    const folder = folderDoc.toMutableJSON() as FolderDocType;
-    const spaceId = this.resolveSpaceId(folder.spaceId);
+    const initialFolderDoc = await this.getFolderWithAccess(db, folderId);
+    if (!initialFolderDoc) return { success: false, error: "NOT_FOUND" };
+    const initialSpaceId = this.resolveSpaceId(
+      initialFolderDoc.get("spaceId") as string | undefined
+    );
 
-    let parentSpaceId = spaceId;
-    let parentDoc: any | null = null;
-    if (parentId) {
-      parentDoc = await this.getFolderWithAccess(db, parentId);
-      if (!parentDoc) return { success: false, error: "PARENT_NOT_FOUND" };
-      const parentFolder = parentDoc.toMutableJSON() as FolderDocType;
-      parentSpaceId = this.resolveSpaceId(parentFolder.spaceId);
-      if (parentSpaceId !== spaceId) {
-        return { success: false, error: "CROSS_SPACE_NESTING_NOT_ALLOWED" };
+    return withSpaceMutationLock(db, initialSpaceId, async () => {
+      const { folderDoc, spaceId } = await requireLiveFolderDestination(
+        db,
+        folderId,
+        initialSpaceId
+      );
+      this.assertSpaceUnlocked(spaceId);
+      const folder = (folderDoc as any).toMutableJSON() as FolderDocType;
+
+      if (parentId) {
+        const parent = await requireLiveFolderDestination(db, parentId, spaceId);
+        this.assertSpaceUnlocked(parent.spaceId);
+        const descendantIds = await this.collectDescendantIds(folderId, spaceId);
+        if (descendantIds.has(parentId)) {
+          return { success: false, error: "FOLDER_CANNOT_BE_OWN_DESCENDANT" };
+        }
       }
-      const descendantIds = await this.collectDescendantIds(folderId, spaceId);
-      if (descendantIds.has(parentId)) {
-        return { success: false, error: "FOLDER_CANNOT_BE_OWN_DESCENDANT" };
-      }
-    }
 
-    if (folder.parentId === parentId) return { success: true };
+      if (folder.parentId === parentId) return { success: true };
 
-    const now = Date.now();
-    const patch: Partial<FolderDocType> = { updatedAt: now };
-    if (parentId) {
-      patch.parentId = parentId;
-      const siblings = await db.folders
-        .find({ selector: { parentId: { $eq: parentId }, spaceId: { $eq: spaceId } } })
-        .exec();
-      const maxOrder = siblings.reduce((max, doc) => {
-        const order = (doc.get("sortOrder") as number | undefined) ?? 0;
-        return Math.max(max, order);
-      }, 0);
-      patch.sortOrder = maxOrder + 1;
-    } else {
-      patch.parentId = null;
-      const topLevel = await db.folders
-        .find({ selector: { parentId: { $eq: null }, spaceId: { $eq: spaceId } } })
-        .exec();
-      const maxOrder = topLevel.reduce((max, doc) => {
-        const order = (doc.get("sortOrder") as number | undefined) ?? 0;
-        return Math.max(max, order);
-      }, 0);
-      patch.sortOrder = maxOrder + 1;
-    }
+      const patch: Partial<FolderDocType> = {
+        parentId,
+        updatedAt: Date.now(),
+      };
+      const selector = parentId
+        ? { parentId: { $eq: parentId }, spaceId: { $eq: spaceId }, deletedAt: { $eq: 0 } }
+        : { parentId: { $eq: null }, spaceId: { $eq: spaceId }, deletedAt: { $eq: 0 } };
+      const siblings = await db.folders.find({ selector }).exec();
+      patch.sortOrder =
+        siblings.reduce((max, doc) => {
+          const order = (doc.get("sortOrder") as number | undefined) ?? 0;
+          return Math.max(max, order);
+        }, 0) + 1;
 
-    await folderDoc.incrementalPatch(patch);
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    return { success: true };
+      await (folderDoc as any).incrementalPatch(patch);
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+      return { success: true };
+    });
   }
 
   /**
@@ -456,56 +760,79 @@ export class FoldersController {
     if (!sourceId || !targetId || sourceId === targetId) {
       return { success: false, movedItems: 0, error: "INVALID_MERGE" };
     }
-    const sourceDoc = await this.getFolderWithAccess(db, sourceId);
-    const targetDoc = await this.getFolderWithAccess(db, targetId);
-    if (!sourceDoc || !targetDoc) return { success: false, movedItems: 0, error: "NOT_FOUND" };
-    if (sourceDoc.get("isLocked") === true) {
-      return { success: false, movedItems: 0, error: "LOCKED" };
+    const initialSource = await this.getFolderWithAccess(db, sourceId);
+    const initialTarget = await this.getFolderWithAccess(db, targetId);
+    if (!initialSource || !initialTarget) {
+      return { success: false, movedItems: 0, error: "NOT_FOUND" };
     }
+    const sourceSpaceId = this.resolveSpaceId(
+      initialSource.get("spaceId") as string | undefined
+    );
+    const targetSpaceId = this.resolveSpaceId(
+      initialTarget.get("spaceId") as string | undefined
+    );
 
-    const targetSpaceId = this.resolveSpaceId(targetDoc.get("spaceId") as string | undefined);
-    const now = Date.now();
+    return withSpaceMutationLocks(db, [sourceSpaceId, targetSpaceId], async () => {
+      const source = await requireLiveFolderDestination(db, sourceId, sourceSpaceId);
+      const target = await requireLiveFolderDestination(db, targetId, targetSpaceId);
+      this.assertSpaceUnlocked(source.spaceId);
+      this.assertSpaceUnlocked(target.spaceId);
+      if (source.spaceId !== target.spaceId) {
+        return {
+          success: false,
+          movedItems: 0,
+          error: "CROSS_SPACE_MERGE_NOT_ALLOWED",
+        };
+      }
+      if ((source.folderDoc as any).get("isLocked") === true) {
+        return { success: false, movedItems: 0, error: "LOCKED" };
+      }
 
-    const targetItems = await db.items
-      .find({ selector: { folderId: { $eq: targetId }, deletedAt: { $eq: 0 } } })
-      .exec();
-    let nextOrder =
-      targetItems.reduce(
-        (max, doc) => Math.max(max, (doc.get("chunkOrder") as number | undefined) ?? -1),
-        -1
-      ) + 1;
+      const now = Date.now();
+      const targetItems = await db.items
+        .find({ selector: { folderId: { $eq: targetId }, deletedAt: { $eq: 0 } } })
+        .exec();
+      let nextOrder =
+        targetItems.reduce(
+          (max, doc) =>
+            Math.max(max, (doc.get("chunkOrder") as number | undefined) ?? -1),
+          -1
+        ) + 1;
 
-    const sourceItems = await db.items
-      .find({ selector: { folderId: { $eq: sourceId }, deletedAt: { $eq: 0 } } })
-      .exec();
-    for (const doc of sourceItems) {
-      await doc.incrementalPatch({
-        folderId: targetId,
-        spaceId: targetSpaceId,
-        chunkOrder: nextOrder++,
-        updatedAt: now,
-      });
-    }
-    const movedItems = sourceItems.length;
+      const sourceItems = await db.items
+        .find({ selector: { folderId: { $eq: sourceId }, deletedAt: { $eq: 0 } } })
+        .exec();
+      for (const doc of sourceItems) {
+        await doc.incrementalPatch({
+          folderId: targetId,
+          spaceId: target.spaceId,
+          chunkOrder: nextOrder++,
+          updatedAt: now,
+        });
+      }
+      const movedItems = sourceItems.length;
 
-    // Re-parent any sub-groups of the source so they aren't orphaned.
-    const childFolders = await db.folders
-      .find({ selector: { parentId: { $eq: sourceId } } })
-      .exec();
-    for (const child of childFolders) {
-      await child.incrementalPatch({ parentId: targetId, updatedAt: now });
-    }
+      const childFolders = await db.folders
+        .find({ selector: { parentId: { $eq: sourceId }, deletedAt: { $eq: 0 } } })
+        .exec();
+      for (const child of childFolders) {
+        await child.incrementalPatch({
+          parentId: targetId,
+          spaceId: target.spaceId,
+          updatedAt: now,
+        });
+      }
 
-    await sourceDoc.remove();
+      await (source.folderDoc as any).remove();
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
 
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-
-    return { success: true, movedItems };
+      return { success: true, movedItems };
+    });
   }
 
   private async collectDescendantIds(folderId: string, spaceId: string): Promise<Set<string>> {
@@ -545,63 +872,89 @@ export class FoldersController {
       return { success: false, movedItems: 0 };
     }
 
-    const folderDoc = await this.getFolderWithAccess(db, folderId);
-    if (!folderDoc) return { success: false, movedItems: 0 };
-    const folder = folderDoc.toMutableJSON() as FolderDocType;
+    const initialFolder = await this.getFolderWithAccess(db, folderId);
+    if (!initialFolder) return { success: false, movedItems: 0 };
+    const sourceSpaceId = this.resolveSpaceId(
+      initialFolder.get("spaceId") as string | undefined
+    );
+    return withSpaceMutationLocks(db, [sourceSpaceId, targetSpaceId], async () => {
+      const source = await requireLiveFolderDestination(db, folderId, sourceSpaceId);
+      await requireLiveSpaceDestination(db, targetSpaceId);
+      this.assertSpaceUnlocked(source.spaceId);
+      this.assertSpaceUnlocked(targetSpaceId);
+      if (source.spaceId === targetSpaceId) {
+        return { success: true, movedItems: 0 };
+      }
 
-    const targetSpaceDoc = await db.spaces.findOne(targetSpaceId).exec();
-    if (!targetSpaceDoc) {
-      throw new Error("TARGET_SPACE_NOT_FOUND");
-    }
-    if (targetSpaceDoc.get("isArchived") === true) {
-      throw new Error("TARGET_SPACE_ARCHIVED");
-    }
+      const sourceFolderDocs = await db.folders
+        .find({ selector: { spaceId: { $in: [sourceSpaceId, targetSpaceId] } } })
+        .exec();
+      const sourceFolders = sourceFolderDocs.map(
+        (doc) => doc.toMutableJSON() as FolderDocType
+      );
+      const treeIds = this.collectFolderTreeIds(sourceFolders, folderId);
+      const treeDocs = sourceFolderDocs.filter((doc) => treeIds.has(doc.primary));
+      if (treeDocs.some((doc) => doc.get("deletedAt") !== 0)) {
+        throw new Error("SOURCE_FOLDER_TREE_NOT_LIVE");
+      }
 
-    if ((folder.spaceId || PUBLIC_SPACE_ID) === targetSpaceId) {
-      return { success: true, movedItems: 0 };
-    }
-
-    const now = Date.now();
-    const targetFolders = await db.folders.find({ selector: { spaceId: { $eq: targetSpaceId } } }).exec();
-    const maxSortOrder = targetFolders.reduce((max, doc) => {
-      const sortOrder = (doc.get("sortOrder") as number | undefined) ?? 0;
-      return Math.max(max, sortOrder);
-    }, 0);
-
-    await folderDoc.incrementalPatch({
-      spaceId: targetSpaceId,
-      sortOrder: maxSortOrder + 1,
-      updatedAt: now,
-    });
-
-    const itemDocs = await db.items
-      .find({
-        selector: {
-          folderId: { $eq: folderId },
-          deletedAt: { $eq: 0 },
+      const targetFolders = await db.folders
+        .find({ selector: { spaceId: { $eq: targetSpaceId }, deletedAt: { $eq: 0 } } })
+        .exec();
+      const maxSortOrder = targetFolders.reduce((max, doc) => {
+        if (treeIds.has(doc.primary)) return max;
+        const sortOrder = (doc.get("sortOrder") as number | undefined) ?? 0;
+        return Math.max(max, sortOrder);
+      }, 0);
+      const now = Date.now();
+      let movedItems = 0;
+      await forEachIdKeysetPage({
+        collection: db.items,
+        selector: { folderId: { $in: Array.from(treeIds) } },
+        pageSize: FOLDER_ITEM_PAGE_SIZE,
+        onPage: async (candidates: any[]) => {
+          for (const candidate of candidates) {
+            const itemId = candidate.primary as string;
+            await withEntityMutationLock(db, "item", itemId, async () => {
+              const itemDoc = await db.items.findOne(itemId).exec();
+              if (!itemDoc) return;
+              const currentFolderId = itemDoc.get("folderId") as string | undefined;
+              if (!currentFolderId || !treeIds.has(currentFolderId)) return;
+              await itemDoc.incrementalPatch({
+                spaceId: targetSpaceId,
+                updatedAt: now,
+              });
+              movedItems += 1;
+            });
+          }
         },
-      })
-      .exec();
-    if (itemDocs.length > 0) {
-      const updates = itemDocs.map((doc) => {
-        const item = doc.toMutableJSON() as ItemDocType;
-        return {
-          ...item,
-          spaceId: targetSpaceId,
-          updatedAt: now,
-        };
       });
-      await db.items.bulkUpsert(updates);
-    }
 
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
+      // Items move first and the root folder moves last. If any write fails,
+      // the root remains in the source space, so retrying can rediscover the
+      // complete tree (including descendants already patched to the target).
+      const orderedTreeDocs = [...treeDocs].sort((left, right) => {
+        if (left.primary === folderId) return 1;
+        if (right.primary === folderId) return -1;
+        return 0;
+      });
+      for (const doc of orderedTreeDocs) {
+        await doc.incrementalPatch({
+          spaceId: targetSpaceId,
+          parentId: doc.primary === folderId ? null : doc.get("parentId"),
+          sortOrder: doc.primary === folderId ? maxSortOrder + 1 : doc.get("sortOrder"),
+          updatedAt: now,
+        });
+      }
 
-    return { success: true, movedItems: itemDocs.length };
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
+      return { success: true, movedItems };
+    });
   }
 
   async copyToSpace(payload: {
@@ -616,116 +969,146 @@ export class FoldersController {
       return { success: false, copiedItems: 0 };
     }
 
-    const sourceFolderDoc = await this.getFolderWithAccess(db, folderId);
-    if (!sourceFolderDoc) return { success: false, copiedItems: 0 };
-    const sourceFolder = sourceFolderDoc.toMutableJSON() as FolderDocType;
-
-    const targetSpaceDoc = await db.spaces.findOne(targetSpaceId).exec();
-    if (!targetSpaceDoc) {
-      throw new Error("TARGET_SPACE_NOT_FOUND");
-    }
-    if (targetSpaceDoc.get("isArchived") === true) {
-      throw new Error("TARGET_SPACE_ARCHIVED");
-    }
-
-    const now = Date.now();
-    const targetFolders = await db.folders.find({ selector: { spaceId: { $eq: targetSpaceId } } }).exec();
-    const existingNames = new Set(
-      targetFolders.map((doc) => ((doc.get("name") as string | undefined) || "").toLowerCase())
+    const initialSourceFolder = await this.getFolderWithAccess(db, folderId);
+    if (!initialSourceFolder) return { success: false, copiedItems: 0 };
+    const sourceSpaceId = this.resolveSpaceId(
+      initialSourceFolder.get("spaceId") as string | undefined
     );
-    const baseName = (payload.name || sourceFolder.name || "Untitled").trim().slice(0, 80) || "Untitled";
-    let nextName = baseName;
-    if (existingNames.has(nextName.toLowerCase())) {
-      let index = 2;
-      while (existingNames.has(`${baseName} (copy ${index})`.toLowerCase())) {
-        index += 1;
+    return withSpaceMutationLocks(db, [sourceSpaceId, targetSpaceId], async () => {
+      const source = await requireLiveFolderDestination(db, folderId, sourceSpaceId);
+      await requireLiveSpaceDestination(db, targetSpaceId);
+      this.assertSpaceUnlocked(source.spaceId);
+      this.assertSpaceUnlocked(targetSpaceId);
+      const sourceFolder = (source.folderDoc as any).toMutableJSON() as FolderDocType;
+
+      const sourceFolderDocs = await db.folders
+        .find({ selector: { spaceId: { $eq: sourceSpaceId } } })
+        .exec();
+      const sourceFolders = sourceFolderDocs.map(
+        (doc) => doc.toMutableJSON() as FolderDocType
+      );
+      const treeIds = this.collectFolderTreeIds(sourceFolders, folderId);
+      const treeFolders = sourceFolders.filter((folder) => treeIds.has(folder.id));
+      if (treeFolders.some((folder) => folder.deletedAt !== 0)) {
+        throw new Error("SOURCE_FOLDER_TREE_NOT_LIVE");
       }
-      nextName = `${baseName} (copy ${index})`;
-    }
 
-    const maxSortOrder = targetFolders.reduce((max, doc) => {
-      const sortOrder = (doc.get("sortOrder") as number | undefined) ?? 0;
-      return Math.max(max, sortOrder);
-    }, 0);
+      const now = Date.now();
+      const targetFolders = await db.folders
+        .find({ selector: { spaceId: { $eq: targetSpaceId }, deletedAt: { $eq: 0 } } })
+        .exec();
+      const existingNames = new Set(
+        targetFolders.map((doc) =>
+          ((doc.get("name") as string | undefined) || "").toLowerCase()
+        )
+      );
+      const baseName =
+        (payload.name || sourceFolder.name || "Untitled").trim().slice(0, 80) ||
+        "Untitled";
+      let nextName = baseName;
+      if (existingNames.has(nextName.toLowerCase())) {
+        let index = 2;
+        while (existingNames.has(`${baseName} (copy ${index})`.toLowerCase())) index += 1;
+        nextName = `${baseName} (copy ${index})`;
+      }
+      const maxSortOrder = targetFolders.reduce((max, doc) => {
+        const sortOrder = (doc.get("sortOrder") as number | undefined) ?? 0;
+        return Math.max(max, sortOrder);
+      }, 0);
 
-    const clonedFolder: FolderDocType = {
-      id: uuidv4(),
-      name: nextName,
-      userId: this.normalizeUserId(sourceFolder.userId),
-      spaceId: targetSpaceId,
-      parentId: null,
-      type: sourceFolder.type || "folder",
-      sortOrder: maxSortOrder + 1,
-      isLocked: !!sourceFolder.isLocked,
-      isPinned: !!sourceFolder.isPinned,
-      isCollapsed: !!sourceFolder.isCollapsed,
-      deletedAt: 0,
-      purgeAt: 0,
-      isDirty: false,
-      serverVersion: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await db.folders.insert(clonedFolder);
-
-    const sourceItemDocs = await db.items
-      .find({
-        selector: {
-          folderId: { $eq: folderId },
-          deletedAt: { $eq: 0 },
-        },
-      })
-      .exec();
-    const sourceItems = sourceItemDocs
-      .map((doc) => doc.toMutableJSON() as ItemDocType)
-      .sort((a, b) => {
-        const ao = a.chunkOrder ?? Number.MAX_SAFE_INTEGER;
-        const bo = b.chunkOrder ?? Number.MAX_SAFE_INTEGER;
-        if (ao !== bo) return ao - bo;
-        return a.createdAt - b.createdAt;
-      });
-
-    const idMap = new Map<string, string>();
-    for (const item of sourceItems) {
-      idMap.set(item.id, uuidv4());
-    }
-
-    const clonedItems: ItemDocType[] = sourceItems.map((item, index) => {
-      const clonedId = idMap.get(item.id) as string;
-      const mappedParentId =
-        item.parentId && idMap.has(item.parentId) ? (idMap.get(item.parentId) as string) : null;
-      return {
-        ...item,
-        userId: this.normalizeUserId(item.userId),
-        id: clonedId,
-        folderId: clonedFolder.id,
+      const folderIdMap = new Map(treeFolders.map((folder) => [folder.id, uuidv4()]));
+      const clonedFolders = treeFolders.map((folder) => ({
+        ...folder,
+        id: folderIdMap.get(folder.id) as string,
+        name: folder.id === folderId ? nextName : folder.name,
+        userId: this.normalizeUserId(folder.userId),
         spaceId: targetSpaceId,
-        parentId: mappedParentId,
-        vector_index: -1,
-        vector_indexes: [],
-        isEmbedded: false,
-        isDirty: true,
-        createdAt: now + index,
-        updatedAt: now + index,
+        parentId:
+          folder.id === folderId
+            ? null
+            : folder.parentId
+              ? folderIdMap.get(folder.parentId) || null
+              : null,
+        sortOrder: folder.id === folderId ? maxSortOrder + 1 : folder.sortOrder,
         deletedAt: 0,
+        purgeAt: 0,
+        isDirty: false,
+        serverVersion: 0,
+        createdAt: now,
+        updatedAt: now,
+      })) satisfies FolderDocType[];
+      const folderInsert = await db.folders.bulkInsert(clonedFolders);
+      if (folderInsert.error.length > 0) {
+        throw new Error(`Failed to copy ${folderInsert.error.length} folders.`);
+      }
+
+      const sourceItemDocs = await db.items
+        .find({
+          selector: {
+            folderId: { $in: Array.from(treeIds) },
+            deletedAt: { $eq: 0 },
+          },
+        })
+        .exec();
+      const sourceItems = sourceItemDocs.map(
+        (doc) => doc.toMutableJSON() as ItemDocType
+      );
+      const itemIdMap = new Map(sourceItems.map((item) => [item.id, uuidv4()]));
+      const clonedItems: ItemDocType[] = [];
+      const cloneIds = Array.from(itemIdMap.values());
+      try {
+        await withOpfsMutationLock(async () => {
+          for (let index = 0; index < sourceItems.length; index += 1) {
+            const item = sourceItems[index];
+            const cloneId = itemIdMap.get(item.id) as string;
+            const cloneMedia =
+              this.options.cloneOpfsMediaEntriesForItem || cloneOpfsMediaEntriesForItem;
+            const clonedMedia = await cloneMedia(item.media, cloneId);
+            clonedItems.push({
+              ...item,
+              id: cloneId,
+              userId: this.normalizeUserId(item.userId),
+              folderId: folderIdMap.get(item.folderId) as string,
+              spaceId: targetSpaceId,
+              parentId: item.parentId ? itemIdMap.get(item.parentId) || null : null,
+              media: clonedMedia.media,
+              displayImageUrl:
+                clonedMedia.pathMap.get(item.displayImageUrl || "") || item.displayImageUrl,
+              vector_index: -1,
+              vector_indexes: [],
+              isEmbedded: false,
+              isDirty: true,
+              serverVersion: 0,
+              createdAt: now + index,
+              updatedAt: now + index,
+              deletedAt: 0,
+            });
+          }
+          if (clonedItems.length > 0) {
+            const itemInsert = await db.items.bulkInsert(clonedItems);
+            if (itemInsert.error.length > 0) {
+              throw new Error(`Failed to copy ${itemInsert.error.length} items.`);
+            }
+          }
+        });
+      } catch (error) {
+        await deleteUnreferencedOpfsItemDirectories(db, cloneIds).catch(() => {});
+        throw error;
+      }
+
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
+
+      return {
+        success: true,
+        folderId: folderIdMap.get(folderId),
+        copiedItems: clonedItems.length,
       };
     });
-
-    if (clonedItems.length > 0) {
-      const insertResult = await db.items.bulkInsert(clonedItems);
-      if (insertResult.error.length > 0) {
-        throw new Error(`Failed to copy ${insertResult.error.length} items.`);
-      }
-    }
-
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
-
-    return { success: true, folderId: clonedFolder.id, copiedItems: clonedItems.length };
   }
 }
 

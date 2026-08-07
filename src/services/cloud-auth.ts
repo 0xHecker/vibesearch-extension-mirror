@@ -1,5 +1,7 @@
 import {
   CLOUD_SYNC_TOKEN_KEY,
+  DEVELOPMENT_CLOUD_AUTH_ENABLED,
+  DEVELOPMENT_CLOUD_AUTH_UID,
   DEFAULT_VIBESEARCH_AUTH_URL,
 } from "./cloud-config";
 
@@ -53,6 +55,7 @@ export type CloudAuthServiceOptions = {
   storage?: CloudAuthStorage;
   requestHostedToken?: (request: HostedAuthRequest) => Promise<CloudAuthToken>;
   now?: () => number;
+  autoConnect?: boolean;
 };
 
 const chromeStorage: CloudAuthStorage = {
@@ -221,16 +224,31 @@ export const requestHostedCloudToken = async (request: HostedAuthRequest): Promi
   });
 };
 
+export const requestDevelopmentCloudToken = async (): Promise<CloudAuthToken> => ({
+  token: `dev:${DEVELOPMENT_CLOUD_AUTH_UID}`,
+  expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+  user: {
+    uid: DEVELOPMENT_CLOUD_AUTH_UID,
+    name: "Dev User",
+    email: null,
+    photoURL: null,
+  },
+});
+
 export class CloudAuthService {
   private readonly storage: CloudAuthStorage;
   private readonly requestToken: (request: HostedAuthRequest) => Promise<CloudAuthToken>;
   private readonly now: () => number;
+  private readonly autoConnect: boolean;
   private refreshInFlight: Promise<string> | null = null;
 
   constructor(options: CloudAuthServiceOptions = {}) {
     this.storage = options.storage ?? chromeStorage;
-    this.requestToken = options.requestHostedToken ?? requestHostedCloudToken;
+    this.requestToken = options.requestHostedToken ?? (
+      DEVELOPMENT_CLOUD_AUTH_ENABLED ? requestDevelopmentCloudToken : requestHostedCloudToken
+    );
     this.now = options.now ?? Date.now;
+    this.autoConnect = options.autoConnect ?? DEVELOPMENT_CLOUD_AUTH_ENABLED;
   }
 
   private async read() {
@@ -248,7 +266,7 @@ export class CloudAuthService {
       token,
       expiresAt: storedExpiry || firebaseTokenExpiresAt(token),
       user: normalizeProfile(row[CLOUD_AUTH_PROFILE_KEY]),
-      optedIn: row[CLOUD_AUTH_OPT_IN_KEY] === true || Boolean(token),
+      optedIn: this.autoConnect || row[CLOUD_AUTH_OPT_IN_KEY] === true || Boolean(token),
     };
   }
 

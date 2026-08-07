@@ -24,7 +24,7 @@ think:
 
 - **By meaning** — describe it and find it, even if the page never used those words.
 - **By exact words too** — semantic, keyword, fuzzy, and *sounds-like* matching, fused on every query.
-- **Inside images** — on-device OCR makes the text in screenshots and images searchable.
+- **Inside images (Chrome/Brave)** — on-device OCR makes the text in screenshots and images searchable.
 - **Bring it all in** — import your browser bookmarks and GitHub stars in seconds.
 - **Private spaces** — password-protect anything sensitive.
 - **Back up, sync & restore** — to a JSON file or Google Drive.
@@ -35,7 +35,7 @@ think:
 ## What you get
 
 - **Save anything** — quick-save a tab, or right-click a link, image, video, quote, or whole page.
-- **Screenshots** — grab the full view or a region; their text is OCR'd and searchable.
+- **Screenshots** — grab the full view or a region; Chrome/Brave also index their text with OCR.
 - **Hybrid search** — semantic + keyword + fuzzy + phonetic, fused into one ranked list.
 - **Query language** — filter by space, source, site, tag, folder, author, date, and more.
 - **Private spaces** — password-protected, with recovery questions and auto-lock.
@@ -46,7 +46,9 @@ think:
 - **Share** — send a space, folder, or selection as a link (optional PIN, revocable).
 - **Back up** — export to JSON or Google Drive.
 - **Recycle bin** — 30-day undo for deletes.
-- **Cross-browser** — Chrome and Firefox.
+- **Cross-browser** — genuine Chrome/Brave and Firefox MV3 packages. Firefox keeps semantic search
+  local but does not currently ship OCR because Gecko MV3 has no equivalent to Chrome's sandboxed
+  extension pages.
 
 ---
 
@@ -55,9 +57,10 @@ think:
 ### Install (from a build)
 
 1. Build the extension (see [Development](#development)) or grab a packaged build.
-2. Open `chrome://extensions` (or `about:debugging` in Firefox).
-3. Enable **Developer mode**.
-4. Click **Load unpacked** and select the `dist_chrome` folder (or `dist_firefox`).
+2. For Chrome/Brave, open `chrome://extensions`, enable **Developer mode**, click
+   **Load unpacked**, and select `dist_chrome`.
+3. For Firefox 142+, open `about:debugging#/runtime/this-firefox`, click
+   **Load Temporary Add-on**, and select `dist_firefox/manifest.json`.
 
 Pin the Vibesearch icon to your toolbar and you're set.
 
@@ -72,7 +75,7 @@ Pin the Vibesearch icon to your toolbar and you're set.
    add a tag or two.
 
 That's the whole loop: **save → search → (optionally) organize.** Vibesearch does the indexing,
-embedding, metadata fetching, and OCR quietly in the background.
+embedding and metadata fetching quietly in the background. Chrome/Brave also run OCR there.
 
 ### Make the most of it
 
@@ -223,8 +226,8 @@ Vibesearch is **local-first**. Here's exactly what lives where, in plain terms:
   a Vibesearch server.
 - **Search is fully local.** Your query is embedded on your own machine and matched against your
   local index. What you search for doesn't leave your computer.
-- **The AI models** (for embeddings and OCR) are downloaded **once** from Vibesearch's CDN, cached,
-  and run entirely **on-device** after that.
+- **The AI models** (embeddings on every supported browser, plus OCR on Chrome/Brave) are downloaded
+  **once** from Vibesearch's CDN, cached, and run entirely **on-device** after that.
 - **When you save a link**, its URL is sent to Vibesearch's metadata service to fetch the page's
   title, description, and preview image — the same way a link unfurls in a chat app.
 - **Saved images and screenshots** are uploaded to Vibesearch's media storage so they survive cache

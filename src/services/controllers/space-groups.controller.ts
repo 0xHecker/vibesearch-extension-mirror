@@ -91,10 +91,17 @@ export class SpaceGroupsController {
     if (!group) throw new Error("SPACE_GROUP_NOT_FOUND");
 
     const spaces = await db.spaces
-      .find({ selector: { spaceGroupId: { $eq: payload.spaceGroupId }, isArchived: { $eq: false } } })
+      .find({
+        selector: {
+          spaceGroupId: { $eq: payload.spaceGroupId },
+          isArchived: { $eq: false },
+          deletedAt: { $eq: 0 },
+        },
+      })
       .exec();
     const firstSpace = spaces
       .map((doc) => doc.toMutableJSON() as SpaceDocType)
+      .filter((space) => space.deletedAt === 0 && space.isArchived === false)
       .sort((left, right) => left.sortOrder - right.sortOrder || left.createdAt - right.createdAt)[0];
     if (firstSpace) return firstSpace;
 

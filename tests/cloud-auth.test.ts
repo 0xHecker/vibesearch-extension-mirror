@@ -61,6 +61,31 @@ test("cloud auth requires explicit connection before a hosted session can upload
   expect(await service.status()).toMatchObject({ connected: false, optedIn: false });
 });
 
+test("development auth can auto-connect the same identity without an iframe", async () => {
+  const now = 1_000_000;
+  const local = storage();
+  const service = new CloudAuthService({
+    storage: local.adapter,
+    now: () => now,
+    autoConnect: true,
+    requestHostedToken: async () => ({
+      token: "dev:user_demo",
+      expiresAt: now + 60_000,
+      user: { ...profile, uid: "user_demo" },
+    }),
+  });
+
+  expect(await service.getCredentials()).toEqual({
+    token: "dev:user_demo",
+    userId: "user_demo",
+  });
+  expect(await service.status()).toMatchObject({
+    connected: true,
+    optedIn: true,
+    user: { uid: "user_demo" },
+  });
+});
+
 test("cloud auth connection persists identity and refreshes one expired token once", async () => {
   const now = 1_000_000;
   const local = storage();

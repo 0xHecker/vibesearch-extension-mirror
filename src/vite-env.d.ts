@@ -5,6 +5,8 @@ interface ImportMetaEnv {
   readonly VITE_GOOGLE_OAUTH_CLIENT_ID?: string;
   readonly VITE_VIBESEARCH_API_BASE?: string;
   readonly VITE_VIBESEARCH_AUTH_URL?: string;
+  readonly VITE_VIBESEARCH_DEV_AUTH?: string;
+  readonly VITE_VIBESEARCH_DEV_UID?: string;
 }
 
 interface ImportMeta {

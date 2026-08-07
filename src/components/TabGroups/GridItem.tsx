@@ -41,7 +41,7 @@ import { Star, Maximize2 } from "lucide-react";
 import { useSelection } from "./SelectionContext";
 import { WebsitePreview } from "./WebsitePreview";
 import { ItemMediaPreview } from "./ItemMediaPreview";
-import { resolveOpfsMedia, revokeObjectUrl } from "@src/services/media-storage";
+import { ObjectUrlOwner, resolveOpfsMedia } from "@src/services/media-storage";
 import { useDraggable, useDroppable, type DraggableAttributes, type DraggableSyntheticListeners } from "@dnd-kit/core";
 import type { SpaceMoveOption } from "./TabGroups";
 import type { QueryRankDebugScore } from "@src/search-core/contracts";
@@ -91,6 +91,7 @@ export const GridItem = memo(({
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const [lightboxEntries, setLightboxEntries] = useState<LightboxEntry[]>([]);
+  const lightboxUrlOwnerRef = useRef<ObjectUrlOwner | null>(null);
   const [isFavorite, setIsFavorite] = useState(item.isFavorite);
   const [isUpdatingFavorite, setIsUpdatingFavorite] = useState(false);
   const [tags, setTags] = useState<{ id: string; name: string; color?: string | null }[]>([]);
@@ -262,9 +263,16 @@ export const GridItem = memo(({
 
   useEffect(() => {
     setIsExpanded(false);
+    return () => {
+      lightboxUrlOwnerRef.current?.dispose();
+      lightboxUrlOwnerRef.current = null;
+    };
   }, [item.id]);
 
   const handleOpenLightbox = useCallback(async (): Promise<boolean> => {
+    lightboxUrlOwnerRef.current?.dispose();
+    const urlOwner = new ObjectUrlOwner();
+    lightboxUrlOwnerRef.current = urlOwner;
     const entries: LightboxEntry[] = [];
     const seen = new Set<string>();
     const isYouTube =
@@ -287,7 +295,10 @@ export const GridItem = memo(({
         src = normalizeIframeEmbedUrl(m.embedUrl);
         if (src) embedType = m.embedType || "iframe";
       }
-      if (m.opfsPath) src = await resolveOpfsMedia(m.opfsPath);
+      if (m.opfsPath) {
+        src = urlOwner.own(await resolveOpfsMedia(m.opfsPath));
+        if (!urlOwner.isActive || lightboxUrlOwnerRef.current !== urlOwner) return false;
+      }
       if (!src) src = m.s3Url || m.originalUrl;
       if (!src) continue;
       const isVertical = (() => {
@@ -334,10 +345,13 @@ export const GridItem = memo(({
         return aEmbedVideo ? -1 : 1;
       });
     }
+    if (!urlOwner.isActive || lightboxUrlOwnerRef.current !== urlOwner) return false;
     if (entries.length > 0) {
       setLightboxEntries(entries);
       return true;
     }
+    urlOwner.dispose();
+    if (lightboxUrlOwnerRef.current === urlOwner) lightboxUrlOwnerRef.current = null;
     return false;
   }, [item.displayImageUrl, item.media, item.source, item.url]);
 
@@ -897,7 +911,8 @@ export const GridItem = memo(({
         entries={lightboxEntries}
         metadata={lightboxMetadata}
         onClose={() => {
-          lightboxEntries.forEach((entry) => revokeObjectUrl(entry.src));
+          lightboxUrlOwnerRef.current?.dispose();
+          lightboxUrlOwnerRef.current = null;
           setLightboxEntries([]);
         }}
       />

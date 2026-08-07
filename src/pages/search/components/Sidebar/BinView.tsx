@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArchiveRestore, Clock, Trash2 } from "lucide-react";
+import { ArchiveRestore, ChevronLeft, ChevronRight, Clock, Loader2, Trash2 } from "lucide-react";
 import { Button } from "@src/components/ui/button";
 import {
   Dialog,
@@ -8,19 +8,38 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@src/components/ui/dialog";
-import type { BinEntry } from "@src/services/controllers/bin.controller";
+import type { BinEntry } from "@src/common/bin";
 import { formatBinRemainingLabel } from "./sidebar-sort";
 
 export interface BinViewProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   entries: BinEntry[];
+  total: number;
+  page: number;
+  hasMore: boolean;
+  loading: boolean;
   now: number;
+  onNextPage: () => void;
+  onPreviousPage: () => void;
   onRestore: (entry: BinEntry) => void;
   onRequestDelete: (entry: BinEntry) => void;
 }
 
-export function BinView({ open, onOpenChange, entries, now, onRestore, onRequestDelete }: BinViewProps) {
+export function BinView({
+  open,
+  onOpenChange,
+  entries,
+  total,
+  page,
+  hasMore,
+  loading,
+  now,
+  onNextPage,
+  onPreviousPage,
+  onRestore,
+  onRequestDelete,
+}: BinViewProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="w-[520px] max-w-[calc(100vw-2rem)] sm:max-w-[520px] gap-0 p-0 overflow-hidden" showCloseButton>
@@ -28,9 +47,9 @@ export function BinView({ open, onOpenChange, entries, now, onRestore, onRequest
           <DialogTitle className="flex items-center gap-2 text-[17px]">
             <Trash2 className="size-4 text-foreground-icon" />
             Bin
-            {entries.length > 0 && (
+            {total > 0 && (
               <span className="rounded-full bg-background-page-secondary px-2 py-0.5 text-xs font-medium text-foreground-secondary">
-                {entries.length}
+                {total}
               </span>
             )}
           </DialogTitle>
@@ -40,7 +59,12 @@ export function BinView({ open, onOpenChange, entries, now, onRestore, onRequest
         </DialogHeader>
 
         <div className="max-h-[60vh] min-h-[180px] overflow-y-auto scrollbar-subtle px-3 py-3">
-          {entries.length === 0 ? (
+          {loading && entries.length === 0 ? (
+            <div className="flex h-[180px] items-center justify-center gap-2 text-sm text-foreground-secondary">
+              <Loader2 className="size-4 animate-spin" />
+              Loading bin…
+            </div>
+          ) : entries.length === 0 ? (
             <div className="flex h-[180px] flex-col items-center justify-center gap-2 text-center">
               <div className="grid size-11 place-items-center rounded-full bg-background-page-secondary">
                 <Trash2 className="size-5 text-foreground-tertiary" />
@@ -90,6 +114,36 @@ export function BinView({ open, onOpenChange, entries, now, onRestore, onRequest
             </ul>
           )}
         </div>
+
+        {total > 0 && (page > 1 || hasMore) && (
+          <div className="flex items-center justify-between gap-3 border-t border-border-neutral-faded px-4 py-3">
+            <span className="text-xs text-foreground-tertiary" aria-live="polite">
+              Page {page} · {entries.length} shown of {total}
+            </span>
+            <div className="flex items-center gap-1.5">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={page <= 1 || loading}
+                onClick={onPreviousPage}
+              >
+                <ChevronLeft className="size-4" />
+                Previous
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!hasMore || loading}
+                onClick={onNextPage}
+              >
+                Next
+                <ChevronRight className="size-4" />
+              </Button>
+            </div>
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   );

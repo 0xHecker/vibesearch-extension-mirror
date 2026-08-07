@@ -66,6 +66,7 @@ interface TabGroupProps {
   onShareSelectedItems?: (itemIds: string[]) => void;
   onShareFolder?: (folderId: string) => void;
   dragMode?: boolean;
+  revealItemId?: string;
 }
 
 const TabGroupContent = ({
@@ -79,6 +80,7 @@ const TabGroupContent = ({
   showDebugScores = false,
   onShareFolder,
   dragMode = false,
+  revealItemId,
 }: TabGroupProps) => {
   const [isCollapsed, setIsCollapsed] = useState(folder.isCollapsed ?? false);
   const [isContentRendered, setIsContentRendered] = useState(!isCollapsed);
@@ -96,6 +98,15 @@ const TabGroupContent = ({
   // hundreds of heavy item cards at once — keeps rendering snappy.
   const [page, setPage] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!revealItemId || !items.some((item) => item.id === revealItemId)) return;
+    // Reveals are explicitly prioritized by TabGroups, so page zero contains
+    // the target even when the folder has more than 100 rows.
+    setPage(0);
+    setIsCollapsed(false);
+    setIsContentRendered(true);
+  }, [items, revealItemId]);
   const moveSpaceOptions = useMemo(
     () => spaces.filter((space) => space.id !== folder.spaceId),
     [folder.spaceId, spaces]

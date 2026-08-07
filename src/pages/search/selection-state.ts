@@ -10,6 +10,12 @@ type SelectableItemLike = {
   id: string;
 };
 
+type LocatedItemLike = {
+  id: string;
+  folderId: string;
+  spaceId: string;
+};
+
 export type FolderSelectionContext = {
   activeSpaceId: string;
   activeSpaceGroupId: string | null;
@@ -53,6 +59,45 @@ export const resolveFolderSelectionContext = (
     activeSpaceGroupId: space?.spaceGroupId || null,
     selectedFolderId: folderId,
   };
+};
+
+/** Derive the browse context used when leaving search results to reveal an item. */
+export const resolveSearchResultSelectionContext = (
+  item: LocatedItemLike
+): FolderSelectionContext => {
+  const activeSpaceId = item.spaceId || PUBLIC_SPACE_ID;
+
+  return {
+    activeSpaceId,
+    // A folder reveal is an exact location, not a collection-wide browse.
+    activeSpaceGroupId: null,
+    selectedFolderId: item.folderId || "all",
+  };
+};
+
+/** Keep the pending reveal item available while the bounded folder page renders. */
+export const includePendingRevealItem = <Item extends LocatedItemLike>(
+  pageItems: readonly Item[],
+  pendingItem: Item | null,
+  selection: FolderSelectionContext
+): Item[] => {
+  if (!pendingItem || pageItems.some((item) => item.id === pendingItem.id)) {
+    return pageItems as Item[];
+  }
+  if (
+    pendingItem.spaceId !== selection.activeSpaceId ||
+    (selection.selectedFolderId !== "all" &&
+      pendingItem.folderId !== selection.selectedFolderId)
+  ) {
+    return pageItems as Item[];
+  }
+
+  // Folder browsing is intentionally paginated. Keep just the requested item
+  // beside that bounded page so Reveal works for older entries without
+  // mounting the folder's entire media-heavy item tree.
+  // Keep it at the front because the folder renderer independently caps its
+  // mounted page. A trailing 101st item would still never reach the DOM.
+  return [pendingItem, ...pageItems];
 };
 
 export const buildSearchSelectionSearch = (input: {

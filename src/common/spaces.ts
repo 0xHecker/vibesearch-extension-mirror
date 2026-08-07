@@ -14,8 +14,11 @@ export const SPACE_NOT_BINNED = 0;
 export const computeBinPurgeAt = (now: number): number =>
   Number.isFinite(now) && now > 0 ? now + BIN_RETENTION_MS : 0;
 
+export const hasValidSpacePurgeDeadline = (space: { deletedAt: number; purgeAt: number }): boolean =>
+  space.deletedAt > 0 && space.purgeAt > space.deletedAt;
+
 export const isSpacePurgeable = (space: { deletedAt: number; purgeAt: number }, now: number): boolean =>
-  space.deletedAt > 0 && space.purgeAt > 0 && space.purgeAt <= now;
+  hasValidSpacePurgeDeadline(space) && space.purgeAt <= now;
 
 // Shared selector for "live, in-active-nav" space reads. `deletedAt: 0` means
 // not in bin; `isArchived: false` keeps the legacy archived flag active.
