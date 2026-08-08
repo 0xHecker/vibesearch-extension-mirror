@@ -10,6 +10,7 @@ import {
   canAddMedia,
   MEDIA_LIMITS,
   opfsFileIdentitiesEqual,
+  listOpfsMediaItemDirectoryIds,
   readOpfsFileIdentity,
   withOpfsMutationLock,
   type OpfsFileIdentity,
@@ -18,6 +19,7 @@ import {
 import {
   deleteUnreferencedOpfsFiles,
   deleteUnreferencedOpfsItemDirectories,
+  requestOpfsMediaReconciliation,
 } from "@src/services/opfs-media-lifecycle";
 import type {
   QueryDebugPayload,
@@ -88,6 +90,7 @@ import {
   requireLiveSpaceDestination,
   withLiveFolderDestination,
 } from "@src/services/live-destination";
+import { notifyArchivedItemsPurged } from "@src/services/archive-lifecycle";
 
 type LocalQuerySortBy = "relevance" | "createdAt" | "updatedAt" | "title" | "source";
 type LocalQuerySortOrder = "asc" | "desc";
@@ -110,6 +113,7 @@ type ItemsControllerOptions = {
   readOpfsFileIdentity?: typeof readOpfsFileIdentity;
   cloneOpfsMediaEntriesForItem?: typeof cloneOpfsMediaEntriesForItem;
   deleteUnreferencedOpfsItemDirectories?: typeof deleteUnreferencedOpfsItemDirectories;
+  notifyArchivedItemsPurged?: typeof notifyArchivedItemsPurged;
 };
 
 const mediaEntryKey = (entry: ItemMediaEntry): string | null => {
@@ -3414,7 +3418,13 @@ export class ItemsController {
         const deleteDirectories =
           this.options.deleteUnreferencedOpfsItemDirectories ||
           deleteUnreferencedOpfsItemDirectories;
-        await deleteDirectories(db, [id]);
+        try {
+          await deleteDirectories(db, [id]);
+        } catch (error) {
+          console.warn("[items] media cleanup deferred after permanent delete", error);
+          requestOpfsMediaReconciliation();
+        }
+        await (this.options.notifyArchivedItemsPurged || notifyArchivedItemsPurged)([id]);
 
         try {
           chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
@@ -4026,6 +4036,27 @@ export class ItemsController {
       }))
     );
     return { deletedOpfsPaths };
+  }
+
+  async reconcileOrphanedOpfsItemDirectories(payload: {
+    afterId?: string;
+    limit?: number;
+  } = {}): Promise<{ scanned: number; deleted: number; nextCursor: string | null; hasMore: boolean }> {
+    const db = await getDb();
+    const afterId = typeof payload.afterId === "string" ? payload.afterId : "";
+    const limit = Math.max(1, Math.min(5_000, Math.floor(payload.limit || 1_000)));
+    const allIds = await listOpfsMediaItemDirectoryIds();
+    const start = afterId ? allIds.findIndex((id) => id > afterId) : 0;
+    const safeStart = start < 0 ? allIds.length : start;
+    const itemIds = allIds.slice(safeStart, safeStart + limit);
+    const deleted = await deleteUnreferencedOpfsItemDirectories(db, itemIds);
+    const nextCursor = itemIds.at(-1) || null;
+    return {
+      scanned: itemIds.length,
+      deleted: deleted.length,
+      nextCursor,
+      hasMore: safeStart + itemIds.length < allIds.length,
+    };
   }
 
   async update(payload: {

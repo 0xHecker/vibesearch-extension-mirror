@@ -578,7 +578,8 @@ export const GridItem = memo(({
             <Button
               variant={"ghost"}
               className="size-5 p-1"
-              aria-label="Preview tab"
+              aria-label="View archived copy"
+              title="View archived copy"
               onClick={() => setIsPreviewOpen(true)}
             >
               <EyeOpen size={20} />

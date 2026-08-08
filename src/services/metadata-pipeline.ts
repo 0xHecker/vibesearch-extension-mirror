@@ -108,7 +108,8 @@ type FetchResult = {
 const fetchMetadataEndpoint = async (
   urls: string[],
   revalidate: boolean,
-  cacheOnly = false
+  cacheOnly = false,
+  generation = pipelineGeneration,
 ): Promise<Response> => {
   const query = buildMetadataQuery(urls);
   const usePost = query.length > METADATA_API_QUERY_CHAR_BUDGET;
@@ -124,9 +125,16 @@ const fetchMetadataEndpoint = async (
     : { method: "GET" as const };
 
   const timeoutFetch = (url: string, init: RequestInit): Promise<Response> => {
+    if (generation !== pipelineGeneration) {
+      return Promise.reject(new DOMException("Metadata pipeline reset", "AbortError"));
+    }
     const controller = new AbortController();
+    activeFetchControllers.add(controller);
     const timer = setTimeout(() => controller.abort(), METADATA_FETCH_TIMEOUT_MS);
-    return fetch(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(timer));
+    return fetch(url, { ...init, signal: controller.signal }).finally(() => {
+      clearTimeout(timer);
+      activeFetchControllers.delete(controller);
+    });
   };
 
   try {
@@ -339,7 +347,8 @@ export const chunkUrlsForMetadataRequest = (urls: string[]): string[][] => {
 const fetchMetadataForUrls = async (
   urls: string[],
   revalidate = false,
-  cacheOnly = false
+  cacheOnly = false,
+  generation = pipelineGeneration,
 ): Promise<FetchResult> => {
   const result: FetchResult = {
     metadata: {},
@@ -358,8 +367,10 @@ const fetchMetadataForUrls = async (
   const batches = chunkUrlsForMetadataRequest(safeUrls);
 
   for (const group of batches) {
+    if (generation !== pipelineGeneration) break;
     try {
-      const res = await fetchMetadataEndpoint(group, revalidate, cacheOnly);
+      const res = await fetchMetadataEndpoint(group, revalidate, cacheOnly, generation);
+      if (generation !== pipelineGeneration) break;
       if (!res.ok) {
         // API returned 4xx/5xx - mark all URLs in this batch as failed and
         // honor any Retry-After the worker sent (e.g. 429/503) so we back off
@@ -378,6 +389,7 @@ const fetchMetadataForUrls = async (
       }
       const responseRetryAfterSeconds = Number(res.headers.get("Retry-After") || 0);
       const arr = (await res.json()) as any[];
+      if (generation !== pipelineGeneration) break;
       if (Array.isArray(arr)) {
         const accountedUrls = new Set<string>();
         for (let i = 0; i < arr.length; i++) {
@@ -620,6 +632,11 @@ let lastUrlStateCleanupAt = 0;
 const failedMetadataUrls = new Set<string>();
 const periodicRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const queuedPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const transientRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+const activeFetchControllers = new Set<AbortController>();
+const activeBatchPromises = new Set<Promise<void>>();
+const activeMetadataWrites = new Set<Promise<unknown>>();
+let pipelineGeneration = 0;
 
 type MetadataPipelineStats = {
   scheduledUrls: number;
@@ -655,6 +672,21 @@ const touchPipelineStats = () => {
   pipelineStats.urlStateSize = urlState.size;
   pipelineStats.failedUrls = failedMetadataUrls.size;
   pipelineStats.lastUpdatedAt = Date.now();
+};
+
+const trackMetadataWrite = <T>(work: Promise<T>): Promise<T> => {
+  activeMetadataWrites.add(work);
+  void work.finally(() => activeMetadataWrites.delete(work)).catch(() => {});
+  return work;
+};
+
+const scheduleTransientRetry = (generation: number, delay: number, callback: () => void) => {
+  const timer = setTimeout(() => {
+    transientRetryTimers.delete(timer);
+    if (generation !== pipelineGeneration) return;
+    callback();
+  }, delay);
+  transientRetryTimers.add(timer);
 };
 
 export type MetadataProgressSnapshot = {
@@ -778,8 +810,10 @@ const upsertStoredFailedMetadata = (
   periodicRetryCount: number,
   nextRetryAt: number
 ) => {
+  const generation = pipelineGeneration;
   void (async () => {
     const records = await readStoredFailedMetadata();
+    if (generation !== pipelineGeneration) return;
     if (periodicRetryCount >= MAX_PERIODIC_RETRY_RUNS) {
       records.delete(url);
     } else {
@@ -790,17 +824,19 @@ const upsertStoredFailedMetadata = (
         updatedAt: Date.now(),
       });
     }
-    await writeStoredFailedMetadata(records);
+    if (generation === pipelineGeneration) await writeStoredFailedMetadata(records);
   })().catch((error) => {
     console.warn("[MetadataPipeline] Failed to persist failed metadata URL.", error);
   });
 };
 
 const removeStoredFailedMetadata = (url: string) => {
+  const generation = pipelineGeneration;
   void (async () => {
     const records = await readStoredFailedMetadata();
+    if (generation !== pipelineGeneration) return;
     if (!records.delete(url)) return;
-    await writeStoredFailedMetadata(records);
+    if (generation === pipelineGeneration) await writeStoredFailedMetadata(records);
   })().catch((error) => {
     console.warn("[MetadataPipeline] Failed to clear failed metadata URL.", error);
   });
@@ -828,9 +864,9 @@ const markMetadataUrlsFetched = async (
 const markSkippedUrlsMetadataComplete = (urls: string[]) => {
   const uniqueUrls = Array.from(new Set(urls));
   if (uniqueUrls.length === 0) return;
-  void markMetadataUrlsFetched(
+  void trackMetadataWrite(markMetadataUrlsFetched(
     Object.fromEntries(uniqueUrls.map((url) => [url, { isMetaFetched: true }]))
-  ).catch((error) => {
+  )).catch((error) => {
     console.warn("[MetadataPipeline] Failed to mark skipped metadata URLs complete.", error);
   });
 };
@@ -877,8 +913,10 @@ const schedulePeriodicRetry = (url: string, state: UrlEntry) => {
 
   const delay = withJitter(PERIODIC_RETRY_DELAY, MAX_PERIODIC_RETRY_DELAY);
   upsertStoredFailedMetadata(url, state.periodicRetryCount, Date.now() + delay);
+  const generation = pipelineGeneration;
   const timer = setTimeout(() => {
     periodicRetryTimers.delete(url);
+    if (generation !== pipelineGeneration) return;
     const current = urlState.get(url);
     if (!current || current.status === "done") return;
     if (queueFailedMetadataRetry(url, current)) {
@@ -1026,16 +1064,21 @@ const processQueue = () => {
     inflightCount++;
     touchPipelineStats();
     const batchToProcess = takeNextBatch();
-    fetchAndProcessBatch(batchToProcess).finally(() => {
+    const generation = pipelineGeneration;
+    const running = fetchAndProcessBatch(batchToProcess, generation);
+    activeBatchPromises.add(running);
+    running.finally(() => {
+      activeBatchPromises.delete(running);
       inflightCount--;
       touchPipelineStats();
       processQueue();
-    });
+    }).catch(() => {});
   }
   notifyMetadataProgress();
 };
 
-const fetchAndProcessBatch = async (batch: QueueItem[]) => {
+const fetchAndProcessBatch = async (batch: QueueItem[], generation = pipelineGeneration) => {
+  if (generation !== pipelineGeneration) return;
   const urls = batch.map((b) => b.url);
   const safeUrls = normalizeIncomingUrls(urls);
   if (safeUrls.length === 0) return;
@@ -1076,7 +1119,13 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
 
   try {
     // Usually one request up to BATCH_SIZE; very long URLs split by encoded query budget.
-    const fetchResult = await fetchMetadataForUrls(safeUrls, shouldRevalidate, shouldCacheOnly);
+    const fetchResult = await fetchMetadataForUrls(
+      safeUrls,
+      shouldRevalidate,
+      shouldCacheOnly,
+      generation,
+    );
+    if (generation !== pipelineGeneration) return;
 
     // Apply successful metadata immediately. URLs that exhaust retries are
     // completed below with an empty patch so their cards never wait forever.
@@ -1117,6 +1166,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
         clearQueuedPollTimer(url);
         const timer = setTimeout(() => {
           queuedPollTimers.delete(url);
+          if (generation !== pipelineGeneration) return;
           const current = urlState.get(url);
           if (!current || current !== state || current.status === "done" || current.status === "failed") {
             return;
@@ -1149,7 +1199,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
         const delay = withJitter(fetchResult.failedRetryDelays.get(url) || backoff);
         console.log(`[MetadataPipeline] Scheduling retry for ${url} in ${delay}ms`);
         pipelineStats.retriesScheduled += 1;
-        setTimeout(() => {
+        scheduleTransientRetry(generation, delay, () => {
           if (state.status === "done") return;
           state.status = "queued";
           touchEntry(state);
@@ -1157,14 +1207,14 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
             cacheOnly: state.cacheOnly,
             applyForceRefresh: state.applyForceRefresh,
           });
-        }, delay);
+        });
       } else {
         markUrlFailedForNow(url, state, payloadMap);
         console.warn(`[MetadataPipeline] Permanently failed for URL:`, url);
       }
     }
 
-    if (Object.keys(payloadMap).length > 0) {
+    if (generation === pipelineGeneration && Object.keys(payloadMap).length > 0) {
       await markMetadataUrlsFetched(payloadMap, {
         forceRefresh: shouldApplyForceRefresh,
         forceRefreshUrls: Array.from(forceRefreshUrlSet),
@@ -1172,6 +1222,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
       console.log(`[MetadataPipeline] Completed metadata work for ${Object.keys(payloadMap).length} URLs`);
     }
   } catch (error) {
+    if (generation !== pipelineGeneration) return;
     // Complete failure (e.g., offscreen document issue) - retry all URLs
     console.error("[MetadataPipeline] Error in fetchAndProcessBatch:", error);
     const payloadMap: Record<string, Partial<ItemDocType>> = {};
@@ -1184,7 +1235,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
           RETRY_BACKOFF[RETRY_BACKOFF.length - 1];
         const delay = withJitter(backoff);
         pipelineStats.retriesScheduled += 1;
-        setTimeout(() => {
+        scheduleTransientRetry(generation, delay, () => {
           if (state.status === "done") return;
           state.status = "queued";
           touchEntry(state);
@@ -1192,11 +1243,12 @@ const fetchAndProcessBatch = async (batch: QueueItem[]) => {
             cacheOnly: state.cacheOnly,
             applyForceRefresh: state.applyForceRefresh,
           });
-        }, delay);
+        });
       } else {
         markUrlFailedForNow(url, state, payloadMap);
       }
     }
+    if (generation !== pipelineGeneration) return;
     await markMetadataUrlsFetched(payloadMap).catch((saveError) =>
       console.warn("[MetadataPipeline] Failed to complete failed metadata URLs.", saveError)
     );
@@ -1330,3 +1382,45 @@ export const getMetadataPipelineStats = (): MetadataPipelineStats => ({
   urlStateSize: urlState.size,
   lastUpdatedAt: Date.now(),
 });
+
+/**
+ * Cancel every queued/in-flight metadata mutation and remove its persisted
+ * retry URLs. Delete-all awaits this barrier before removing RxDB rows so an
+ * old response cannot recreate or modify data after the wipe.
+ */
+export const clearMetadataPipelineData = async (): Promise<void> => {
+  pipelineGeneration += 1;
+  if (batchTimeout) {
+    clearTimeout(batchTimeout);
+    batchTimeout = null;
+  }
+  for (const timer of transientRetryTimers) clearTimeout(timer);
+  transientRetryTimers.clear();
+  for (const timer of periodicRetryTimers.values()) clearTimeout(timer);
+  periodicRetryTimers.clear();
+  for (const timer of queuedPollTimers.values()) clearTimeout(timer);
+  queuedPollTimers.clear();
+  for (const controller of activeFetchControllers) controller.abort();
+  queue.length = 0;
+  batchBuffer.length = 0;
+  urlState.clear();
+  failedMetadataUrls.clear();
+
+  await Promise.allSettled([
+    ...Array.from(activeBatchPromises),
+    ...Array.from(activeMetadataWrites),
+  ]);
+
+  const storage = getStorageLocal();
+  if (storage) await storage.remove(FAILED_METADATA_STORAGE_KEY);
+  pipelineStats.scheduledUrls = 0;
+  pipelineStats.fetchedBatches = 0;
+  pipelineStats.successfulUrls = 0;
+  pipelineStats.failedUrls = 0;
+  pipelineStats.retriesScheduled = 0;
+  pipelineStats.queueLength = 0;
+  pipelineStats.inflightCount = 0;
+  pipelineStats.urlStateSize = 0;
+  touchPipelineStats();
+  notifyMetadataProgress();
+};

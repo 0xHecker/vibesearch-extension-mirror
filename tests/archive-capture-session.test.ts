@@ -2,7 +2,11 @@ import { expect, test } from "bun:test";
 import { ArchiveCaptureSessionManager } from "@src/services/archive-capture-session";
 import { ArchiveOutbox, type ArchiveOutboxFiles, type ArchiveOutboxJob } from "@src/services/archive-outbox";
 
-const harness = (maxHtmlBytes = 1024, failClose = false) => {
+const harness = (
+  maxHtmlBytes = 1024,
+  failClose = false,
+  closeControl?: { started: () => void; release: Promise<void> },
+) => {
   let jobs: ArchiveOutboxJob[] = [];
   const files = new Map<string, Blob>();
   let id = 0;
@@ -18,6 +22,8 @@ const harness = (maxHtmlBytes = 1024, failClose = false) => {
         },
         async close() {
           if (failClose) throw new Error("OPFS_CLOSE_FAILED");
+          closeControl?.started();
+          if (closeControl) await closeControl.release;
           settled = true;
           files.set(name, new Blob(chunks));
         },
@@ -149,4 +155,41 @@ test("a capture cannot commit after its deadline", async () => {
   );
   await sessions.abort(opened.sessionId, 4);
   expect(await outbox.list()).toEqual([]);
+});
+
+test("cancelAll waits for a finishing capture and prevents it from resurrecting the outbox", async () => {
+  let markCloseStarted!: () => void;
+  let releaseClose!: () => void;
+  const closeStarted = new Promise<void>((resolve) => {
+    markCloseStarted = resolve;
+  });
+  const closeReleased = new Promise<void>((resolve) => {
+    releaseClose = resolve;
+  });
+  const { outbox, files, sessions } = harness(1024, false, {
+    started: markCloseStarted,
+    release: closeReleased,
+  });
+  const opened = await sessions.open({
+    itemId: "item-1",
+    tabId: 4,
+    sourceUrl: "https://example.com/page",
+    deadlineAt: 1_000,
+  });
+  await sessions.append(opened.sessionId, 4, 0, "<html>snapshot payload</html>");
+
+  const finishing = sessions.finish(opened.sessionId, 4, {
+    chunkCount: 1,
+    capturedUrl: "https://example.com/page",
+  });
+  await closeStarted;
+  const cancelling = sessions.cancelAll();
+  await Promise.resolve();
+  releaseClose();
+
+  await expect(finishing).rejects.toThrow("ARCHIVE_CAPTURE_CANCELLED");
+  await cancelling;
+  expect(await outbox.list()).toEqual([]);
+  expect(files.size).toBe(0);
+  expect(sessions.isOpen(opened.sessionId)).toBe(false);
 });

@@ -6,6 +6,8 @@ interface ImportMetaEnv {
   /** Base URL for the deployed vibesearch-api Worker (archiving, sync, …). */
   readonly VITE_API_BASE?: string;
   readonly VITE_VIBESEARCH_API_BASE?: string;
+  /** Server-side OAuth broker used for Notion public integrations. */
+  readonly VITE_NOTION_OAUTH_BROKER_BASE?: string;
   readonly VITE_VIBESEARCH_AUTH_URL?: string;
   readonly VITE_VIBESEARCH_DEV_AUTH?: string;
   readonly VITE_VIBESEARCH_DEV_UID?: string;

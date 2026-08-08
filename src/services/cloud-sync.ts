@@ -78,7 +78,7 @@ export type CloudSyncDrainResult = {
   batches: number;
   queued: number;
   remaining: number;
-  reason?: "empty" | "missing-token" | "invalid-auth" | "http-error" | "network-error" | "invalid-response";
+  reason?: "empty" | "missing-token" | "invalid-auth" | "http-error" | "network-error" | "invalid-response" | "cancelled";
   error?: string;
 };
 
@@ -387,6 +387,15 @@ const storageSet = async (key: string, value: unknown): Promise<void> => {
   await chrome.storage.local.set({ [key]: value });
 };
 
+const storageRemove = async (key: string): Promise<void> => {
+  if (!storageAvailable()) return;
+  if (typeof chrome.storage.local.remove === "function") {
+    await chrome.storage.local.remove(key);
+    return;
+  }
+  await chrome.storage.local.set({ [key]: [] });
+};
+
 const readQueue = async (): Promise<CloudSyncQueueRef[]> => {
   const raw = await storageGet<unknown[]>(CLOUD_SYNC_QUEUE_KEY, []);
   return Array.isArray(raw) ? mergeCloudSyncQueue(raw as CloudSyncQueueRef[], []) : [];
@@ -512,6 +521,67 @@ const notifyCloudSyncQueueUpdated = (): void => {
 };
 
 let drainInFlight: Promise<CloudSyncDrainResult> | null = null;
+let drainController: AbortController | null = null;
+let drainGeneration = 0;
+const CLOUD_SYNC_REQUEST_TIMEOUT_MS = 30_000;
+const CLOUD_SYNC_MAX_RESPONSE_BYTES = 1024 * 1024;
+
+const readBoundedCloudSyncJson = async (
+  response: Response,
+  signal: AbortSignal,
+): Promise<unknown> => {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > CLOUD_SYNC_MAX_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error("CLOUD_SYNC_RESPONSE_TOO_LARGE");
+  }
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > CLOUD_SYNC_MAX_RESPONSE_BYTES) {
+      throw new Error("CLOUD_SYNC_RESPONSE_TOO_LARGE");
+    }
+    try {
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      return null;
+    }
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteSize = 0;
+  const cancel = () => void reader.cancel().catch(() => {});
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    while (true) {
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      const { done, value } = await reader.read();
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      if (done) break;
+      if (!value?.byteLength) continue;
+      byteSize += value.byteLength;
+      if (byteSize > CLOUD_SYNC_MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new Error("CLOUD_SYNC_RESPONSE_TOO_LARGE");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(byteSize);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+};
 
 export class CloudSyncService {
   constructor(private readonly options: CloudSyncServiceOptions = {}) {}
@@ -549,10 +619,21 @@ export class CloudSyncService {
 
   async drain(payload?: CloudSyncBatchOptions): Promise<CloudSyncDrainResult> {
     if (drainInFlight) return drainInFlight;
-    drainInFlight = this.drainInternal(payload).finally(() => {
+    const generation = drainGeneration;
+    const controller = new AbortController();
+    drainController = controller;
+    drainInFlight = this.drainInternal(payload, controller.signal, generation).finally(() => {
       drainInFlight = null;
+      if (drainController === controller) drainController = null;
     });
     return drainInFlight;
+  }
+
+  async cancelAndClear(): Promise<void> {
+    drainGeneration += 1;
+    drainController?.abort();
+    await drainInFlight?.catch(() => {});
+    await withQueueMutationLock(() => storageRemove(CLOUD_SYNC_QUEUE_KEY));
   }
 
   /** Ensure one local item reaches the API before a dependent archive upload. */
@@ -576,7 +657,11 @@ export class CloudSyncService {
       : { ready: true, push };
   }
 
-  private async drainInternal(payload?: CloudSyncBatchOptions): Promise<CloudSyncDrainResult> {
+  private async drainInternal(
+    payload: CloudSyncBatchOptions | undefined,
+    signal: AbortSignal,
+    generation: number,
+  ): Promise<CloudSyncDrainResult> {
     const credentials = this.options.getCredentials
       ? await this.options.getCredentials()
       : await getCloudAuthCredentials();
@@ -626,9 +711,21 @@ export class CloudSyncService {
     let conflicts = 0;
     let batches = 0;
 
+    const cancelled = (): CloudSyncDrainResult => ({
+      pushed,
+      skipped,
+      conflicts,
+      batches,
+      queued: initialQueued,
+      remaining: queue.length,
+      reason: "cancelled",
+    });
+
     while (queue.length > 0 && batches < maxBatches) {
+      if (signal.aborted || generation !== drainGeneration) return cancelled();
       const refs = selectCloudSyncBatch(queue, batchSize, payload?.priorityRefs);
       const changes = await buildCloudSyncChanges(refs, resolveCollection, credentials.userId);
+      if (signal.aborted || generation !== drainGeneration) return cancelled();
       const missingRefs = refs.filter((ref) => !changes.some((change) => change.collection === ref.collection && change.id === ref.id));
       if (missingRefs.length > 0) {
         skipped += missingRefs.length;
@@ -640,6 +737,15 @@ export class CloudSyncService {
       }
 
       let response: Response;
+      let responseBody: unknown = null;
+      const requestController = new AbortController();
+      let requestTimedOut = false;
+      const forwardAbort = () => requestController.abort();
+      signal.addEventListener("abort", forwardAbort, { once: true });
+      const requestTimeout = setTimeout(() => {
+        requestTimedOut = true;
+        requestController.abort();
+      }, CLOUD_SYNC_REQUEST_TIMEOUT_MS);
       try {
         response = await this.request(`${apiBase}/v1/sync/push`, {
           method: "POST",
@@ -648,8 +754,15 @@ export class CloudSyncService {
             "content-type": "application/json",
           },
           body: JSON.stringify({ clientId, changes }),
+          signal: requestController.signal,
         });
+        if (response.ok) {
+          responseBody = await readBoundedCloudSyncJson(response, requestController.signal);
+        } else {
+          await response.body?.cancel().catch(() => {});
+        }
       } catch (error) {
+        if (signal.aborted || generation !== drainGeneration) return cancelled();
         return {
           pushed,
           skipped,
@@ -658,9 +771,16 @@ export class CloudSyncService {
           queued: initialQueued,
           remaining: (await readQueue()).length,
           reason: "network-error",
-          error: error instanceof Error ? error.message : "Cloud sync failed.",
+          error: requestTimedOut
+            ? "CLOUD_SYNC_REQUEST_TIMEOUT"
+            : error instanceof Error ? error.message : "Cloud sync failed.",
         };
+      } finally {
+        clearTimeout(requestTimeout);
+        signal.removeEventListener("abort", forwardAbort);
       }
+
+      if (signal.aborted || generation !== drainGeneration) return cancelled();
 
       if (!response.ok) {
         return {
@@ -675,7 +795,7 @@ export class CloudSyncService {
         };
       }
 
-      const result = parseCloudSyncPushResult(await response.json().catch(() => null), changes);
+      const result = parseCloudSyncPushResult(responseBody, changes);
       batches += 1;
       if (!result) {
         return {

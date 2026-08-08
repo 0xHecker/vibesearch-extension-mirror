@@ -31,7 +31,11 @@ import {
 } from "@src/services/entity-mutation-lock";
 import { forEachIdKeysetPage } from "@src/services/rxdb-keyset-pagination";
 import { deleteAllMediaForItem } from "@src/services/media-storage";
-import { deleteUnreferencedOpfsItemDirectories } from "@src/services/opfs-media-lifecycle";
+import {
+  deleteUnreferencedOpfsItemDirectories,
+  requestOpfsMediaReconciliation,
+} from "@src/services/opfs-media-lifecycle";
+import { notifyArchivedItemsPurged } from "@src/services/archive-lifecycle";
 
 type SpaceAccessView = {
   isUnlocked: boolean;
@@ -79,6 +83,7 @@ type SpacesControllerOptions = {
   getDb?: typeof getDb;
   now?: () => number;
   deleteAllMediaForItem?: typeof deleteAllMediaForItem;
+  notifyArchivedItemsPurged?: typeof notifyArchivedItemsPurged;
 };
 
 const buildSpaceId = () => crypto.randomUUID?.() ?? `space_${Date.now()}_${Math.random()}`;
@@ -1065,13 +1070,19 @@ export class SpacesController {
       // Destructive OPFS cleanup is safe only after RxDB confirms that every
       // row in this page was removed. A rejected/no-progress write must leave
       // the still-live item's media untouched.
-      if (this.options.deleteAllMediaForItem) {
-        for (const itemId of itemIds) {
-          await this.options.deleteAllMediaForItem(itemId);
+      try {
+        if (this.options.deleteAllMediaForItem) {
+          for (const itemId of itemIds) {
+            await this.options.deleteAllMediaForItem(itemId);
+          }
+        } else {
+          await deleteUnreferencedOpfsItemDirectories(db, itemIds);
         }
-      } else {
-        await deleteUnreferencedOpfsItemDirectories(db, itemIds);
+      } catch (error) {
+        console.warn("[spaces] media cleanup deferred after permanent delete", error);
+        requestOpfsMediaReconciliation();
       }
+      await (this.options.notifyArchivedItemsPurged || notifyArchivedItemsPurged)(itemIds);
     }
 
     // Retain the folder tree until all child rows are durably gone. If an item

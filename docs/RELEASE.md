@@ -46,7 +46,7 @@ Apply it, then run the smoke test in §7.
 `https://meta.vibesearch.app`. Result:
 
 ```
-connect-src 'self' data: https://metadata-worker.watermelons.workers.dev https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://sheets.googleapis.com https://api.github.com
+connect-src 'self' data: https://metadata-worker.watermelons.workers.dev https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://api.github.com
 ```
 
 **`manifest.host-permissions.json`:** remove these two lines:
@@ -76,18 +76,18 @@ Google sign-in flow depends on that ID:
 
 ---
 
-## 4. Google OAuth setup (only needed for the Drive/Sheets backup feature)
+## 4. Google OAuth setup (only needed for the Drive backup feature)
 
-The backup feature uses `chrome.identity` with scopes `drive.file` + `spreadsheets`.
+The backup feature requests only `drive.file`: it can create, find, update, and restore the
+Vibesearch JSON files it created, but it cannot browse arbitrary Drive contents.
 
-- ☐ Set **`VITE_GOOGLE_OAUTH_CLIENT_ID`** (build/runtime env) to your OAuth client ID, or Google
-  connect will throw `GOOGLE_OAUTH_CLIENT_ID_MISSING`.
-- ☐ In Google Cloud Console, register the redirect URI
-  `https://<EXTENSION_ID>.chromiumapp.org/google` on that OAuth client.
-- ☐ **`spreadsheets` is a sensitive scope** → the OAuth consent screen must pass Google
-  verification, or users hit an "unverified app" warning and a 100-user cap. Plan for this, or
-  consider dropping the Sheets export (Drive JSON alone uses only `drive.file`, which is not
-  sensitive).
+- ☑ The public Chrome Extension client is present in `manifest.chrome.json` with `drive.file`.
+- ☑ The fallback web client and stable unpacked Chrome callback are configured in Google Cloud.
+- ☐ Before publishing under a different Chrome Web Store id, register that exact id/client and
+  its `https://<EXTENSION_ID>.chromiumapp.org/google` fallback callback.
+- ☐ **Firefox release blocker:** register and smoke-test the exact Firefox loopback callback
+  derived by `google-auth.firefox.ts`. The current Google web client rejects that callback with
+  `redirect_uri_mismatch`; do not advertise Firefox Drive backup until it is accepted end to end.
 
 ---
 
@@ -98,6 +98,17 @@ The backup feature uses `chrome.identity` with scopes `drive.file` + `spreadshee
   value as the metadata worker's `IMPORT_MEDIA_TOKEN`).
 - ⚠️ This token is a `VITE_` var, so it is **embedded in the shipped bundle**. Make sure it's an
   upload-only token with no broader privileges, and rotate it if it ever leaks.
+
+### Notion OAuth/export
+
+- ☑ Public OAuth connection `VibeSearch` uses callback
+  `https://vibesearch-api.watermelons.workers.dev/oauth/notion/callback`.
+- ☑ The connection is installable in any workspace and requests content read/update/insert only;
+  it does not request comments or user profile/email access.
+- ☑ `NOTION_CLIENT_ID` is a Worker variable and `NOTION_CLIENT_SECRET` is a Cloudflare secret.
+- ☑ The deployed OAuth broker allow-lists the stable unpacked and published Chrome callbacks.
+- ☐ Before shipping under another extension ID, add its exact
+  `https://<EXTENSION_ID>.chromiumapp.org/notion` callback to the broker allow-list.
 
 ---
 

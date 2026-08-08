@@ -277,6 +277,9 @@ const cloudSyncController = {
   async pushItem(payload: { itemId?: string }) {
     return cloudSyncService.pushItem(typeof payload?.itemId === "string" ? payload.itemId : "");
   },
+  async cancelAndClear() {
+    return cloudSyncService.cancelAndClear();
+  },
 };
 
 const cloudAuthController = {
@@ -297,12 +300,18 @@ router.registerService("dbManager", databaseManager, {
     "getAllFolders",
     "getImportTargets",
     "buildExportSnapshot",
+    "buildExportSnapshotFile",
+    "getNotionExportBatch",
     "importSharedSnapshot",
     "buildLocalExtensionMigrationBundle",
+    "buildLocalExtensionMigrationDownload",
     "stageLocalExtensionMigrationBundle",
+    "stageLocalExtensionMigrationFile",
     "restoreStagedLocalExtensionMigrationBundle",
     "restoreLocalExtensionMigrationBundle",
     "mergeBackupSnapshot",
+    "mergeBackupSnapshotFile",
+    "filterExistingItemIds",
     "deleteAllData",
   ],
 });
@@ -313,7 +322,7 @@ router.registerService("githubStars", githubStarsImportController, {
   methods: ["importStars"],
 });
 router.registerService("cloudSync", cloudSyncController, {
-  methods: ["status", "drain", "pushItem"],
+  methods: ["status", "drain", "pushItem", "cancelAndClear"],
 });
 router.registerService("cloudAuth", cloudAuthController, {
   methods: ["status", "connect", "disconnect"],
@@ -346,6 +355,7 @@ router.registerService("items", itemsController, {
     "listItemsWithOpfsMedia",
     "applyOpfsMediaPromotions",
     "deleteUnreferencedOpfsMedia",
+    "reconcileOrphanedOpfsItemDirectories",
   ],
 });
 router.registerService("folders", foldersController, {

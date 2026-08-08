@@ -34,6 +34,19 @@ const releaseOneShotQuery = (collection: KeysetCollection<any>, query: KeysetQue
   }
 };
 
+/** Execute a bounded ad-hoc RxDB query without pinning every unique selector in
+ * the query cache for the lifetime of the offscreen document. */
+export const execAndReleaseOneShotQuery = async <Result>(
+  collection: KeysetCollection<any>,
+  query: { exec: () => Promise<Result> },
+): Promise<Result> => {
+  try {
+    return await query.exec();
+  } finally {
+    releaseOneShotQuery(collection, query as KeysetQuery<any>);
+  }
+};
+
 export const throwIfOperationAborted = (signal?: AbortSignal): void => {
   if (!signal?.aborted) return;
   const error = new Error(

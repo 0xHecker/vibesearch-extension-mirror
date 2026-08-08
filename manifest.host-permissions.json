@@ -17,6 +17,6 @@
   "https://preview-bucket.vibesearch.app/*",
   "https://accounts.google.com/*",
   "https://www.googleapis.com/*",
-  "https://sheets.googleapis.com/*",
+  "https://api.notion.com/*",
   "https://api.github.com/*"
 ]

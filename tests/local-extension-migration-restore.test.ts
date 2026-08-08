@@ -36,7 +36,11 @@ mock.module("@src/services/media-storage", () => ({
   withOpfsMutationLock: async <T>(work: () => Promise<T>) => work(),
 }));
 
-const { restoreLocalExtensionMigrationBundle } = await import(
+const {
+  buildLocalExtensionMigrationBundle,
+  restoreLocalExtensionMigrationBundle,
+  validateLocalExtensionMigrationBundle,
+} = await import(
   "../src/services/local-extension-migration"
 );
 const { withBinMutationLock, withSpaceMutationLock } = await import(
@@ -64,7 +68,19 @@ function makeDb(
         name,
         {
           rows,
-          find: () => ({ exec: async () => rows.map(makeDoc) }),
+          find: (query?: any) => ({
+            exec: async () => {
+              const afterId = query?.selector?.id?.$gt ??
+                query?.selector?.$and?.find((clause: any) => clause?.id?.$gt)?.id?.$gt;
+              const selected = typeof afterId === "string"
+                ? rows.filter((row) => row.id > afterId)
+                : rows;
+              const ordered = query?.sort?.[0]?.id === "asc"
+                ? [...selected].sort((left, right) => left.id.localeCompare(right.id))
+                : [...selected];
+              return ordered.slice(0, query?.limit ?? ordered.length).map(makeDoc);
+            },
+          }),
           bulkUpsert: async (values: Row[]) => {
             writeOrder.push(name);
             const result = await onBulkUpsert?.(name, values);
@@ -83,7 +99,7 @@ function makeDb(
     CollectionName,
     {
       rows: Row[];
-      find: () => { exec: () => Promise<ReturnType<typeof makeDoc>[]> };
+      find: (query?: any) => { exec: () => Promise<ReturnType<typeof makeDoc>[]> };
       bulkUpsert: (rows: Row[]) => Promise<void>;
     }
   >;
@@ -120,6 +136,328 @@ const deferred = () => {
 };
 
 describe("whole-origin migration restore safety", () => {
+  test("keeps version-one backups restorable when archive files were not part of the format", () => {
+    const validated = validateLocalExtensionMigrationBundle(bundle({}));
+
+    expect(validated.version).toBe(1);
+    expect(validated.archiveFiles).toEqual([]);
+  });
+
+  test("requires the archive manifest in version-two backups", () => {
+    expect(() => validateLocalExtensionMigrationBundle({
+      ...bundle({}),
+      version: 2,
+    })).toThrow("MIGRATION_FILE_ARCHIVES_INVALID");
+  });
+
+  test("rejects malformed archive bytes before committing any database rows", async () => {
+    db = makeDb();
+    const invalid = {
+      ...bundle({
+        items: [{
+          id: "item-invalid-archive",
+          folderId: "",
+          spaceId: "space_public_default",
+          url: "https://example.com",
+        }],
+      }),
+      version: 2,
+      archiveFiles: [{
+        itemId: "item-invalid-archive",
+        mimeType: "text/html",
+        updatedAt: 1,
+        base64: "not valid base64%%%",
+      }],
+    };
+
+    await expect(restoreLocalExtensionMigrationBundle(invalid)).rejects.toThrow(
+      "MIGRATION_FILE_ARCHIVE_SIZE_INVALID",
+    );
+    expect(db.writeOrder).toEqual([]);
+  });
+
+  test("rejects malformed padded media before committing any database rows", async () => {
+    db = makeDb();
+    const invalid = {
+      ...bundle({
+        spaces: [{ id: "space-a", name: "A", spaceGroupId: "" }],
+        items: [{
+          id: "item-a",
+          folderId: "",
+          spaceId: "space-a",
+          url: "https://example.com/media",
+          media: [{
+            type: "image",
+            storageType: "opfs",
+            opfsPath: "media/item-a/file.bin",
+          }],
+        }],
+      }),
+      version: 2,
+      opfsFiles: [{
+        opfsPath: "media/item-a/file.bin",
+        mimeType: "application/octet-stream",
+        base64: "AA=",
+      }],
+      archiveFiles: [],
+    };
+
+    await expect(restoreLocalExtensionMigrationBundle(invalid)).rejects.toThrow(
+      "MIGRATION_FILE_MEDIA_SIZE_INVALID",
+    );
+    expect(db.writeOrder).toEqual([]);
+  });
+
+  test("rejects missing or unreferenced OPFS payloads before database writes", async () => {
+    const referencedPath = "media/item-media/referenced.bin";
+    const collections = {
+      items: [{
+        id: "item-media",
+        folderId: "",
+        spaceId: "space_public_default",
+        url: "https://example.com/media",
+        media: [{
+          type: "image",
+          storageType: "opfs",
+          opfsPath: referencedPath,
+        }],
+      }],
+    };
+    db = makeDb();
+    await expect(restoreLocalExtensionMigrationBundle({
+      ...bundle(collections),
+      version: 2,
+      archiveFiles: [],
+    })).rejects.toThrow("MIGRATION_FILE_REFERENCED_MEDIA_MISSING");
+    expect(db.writeOrder).toEqual([]);
+
+    await expect(restoreLocalExtensionMigrationBundle({
+      ...bundle(collections),
+      version: 2,
+      opfsFiles: [
+        { opfsPath: referencedPath, mimeType: "application/octet-stream", base64: "AA==" },
+        {
+          opfsPath: "media/item-media/unreferenced.bin",
+          mimeType: "application/octet-stream",
+          base64: "AA==",
+        },
+      ],
+      archiveFiles: [],
+    })).rejects.toThrow("MIGRATION_FILE_UNREFERENCED_MEDIA_PATH");
+    expect(db.writeOrder).toEqual([]);
+  });
+
+  test("full backup fails visibly when referenced local media bytes are missing", async () => {
+    db = makeDb({
+      items: [{
+        id: "item-missing-media",
+        folderId: "",
+        spaceId: "space_public_default",
+        url: "https://example.com/missing-media",
+        media: [{
+          type: "image",
+          storageType: "opfs",
+          opfsPath: "media/item-missing-media/missing.bin",
+        }],
+      }],
+    });
+
+    await expect(buildLocalExtensionMigrationBundle({
+      archiveCache: { listFiles: async () => [], put: async () => ({} as never) },
+      archiveOutbox: { list: async () => [], read: async () => null },
+    })).rejects.toThrow("MIGRATION_BACKUP_REFERENCED_MEDIA_MISSING");
+  });
+
+  test("oversized collection data is rejected during a bounded page scan", async () => {
+    db = makeDb({
+      items: [{
+        id: "item-too-large",
+        folderId: "",
+        spaceId: "space_public_default",
+        url: "https://example.com/large",
+        textContent: "x".repeat(16 * 1024),
+      }],
+    });
+
+    await expect(buildLocalExtensionMigrationBundle({
+      maxEstimatedJsonBytes: 4 * 1024,
+      pageSize: 1,
+      archiveCache: { listFiles: async () => [], put: async () => ({} as never) },
+      archiveOutbox: { list: async () => [], read: async () => null },
+    })).rejects.toThrow("MIGRATION_FILE_JSON_TOO_LARGE");
+  });
+
+  test("full JSON backup exports and restores durable offline archives", async () => {
+    const archiveHtml = "<html><body>offline after restore</body></html>";
+    db = makeDb({
+      items: [{
+        id: "item-archive",
+        folderId: "",
+        spaceId: "space_public_default",
+        url: "https://example.com/archive",
+      }],
+    });
+    const archiveCache = {
+      listFiles: async () => [{
+        entry: {
+          itemId: "item-archive",
+          fileName: "cached.html",
+          byteSize: archiveHtml.length,
+          mimeType: "text/html",
+          updatedAt: 123,
+        },
+        file: new Blob([archiveHtml], { type: "text/html" }),
+      }],
+      put: async () => {
+        throw new Error("restore cache not configured");
+      },
+    };
+
+    const exported = await buildLocalExtensionMigrationBundle({ archiveCache });
+    expect(exported.version).toBe(2);
+    expect(exported.archiveFiles).toHaveLength(1);
+
+    const restored: Array<{ itemId: string; html: string; updatedAt?: number }> = [];
+    const result = await restoreLocalExtensionMigrationBundle(exported, {
+      archiveCache: {
+        listFiles: async () => [],
+        put: async (itemId: string, body: Blob, updatedAt?: number) => {
+          restored.push({ itemId, html: await body.text(), updatedAt });
+          return {} as never;
+        },
+      },
+    });
+
+    expect(restored).toEqual([{ itemId: "item-archive", html: archiveHtml, updatedAt: 123 }]);
+    expect(result.restoredArchiveFileCount).toBe(1);
+  });
+
+  test("full JSON backup includes an authoritative pending outbox archive", async () => {
+    const archiveHtml = "<html><body>pending offline upload</body></html>";
+    const pendingFile = new Blob([archiveHtml], { type: "text/html" });
+    db = makeDb({
+      items: [{
+        id: "item-pending-archive",
+        folderId: "",
+        spaceId: "space_public_default",
+        url: "https://example.com/pending",
+      }],
+    });
+
+    const exported = await buildLocalExtensionMigrationBundle({
+      archiveCache: {
+        listFiles: async () => [],
+        put: async () => ({} as never),
+      },
+      archiveOutbox: {
+        list: async () => [{
+          id: "job-1",
+          itemId: "item-pending-archive",
+          mode: "upload" as const,
+          sourceUrl: "https://example.com/pending",
+          fileName: "pending.html",
+          byteSize: pendingFile.size,
+          createdAt: 100,
+          updatedAt: 456,
+          attempts: 0,
+          nextAttemptAt: 100,
+        }],
+        read: async (fileName) => fileName === "pending.html" ? pendingFile : null,
+      },
+    });
+
+    expect(exported.archiveFiles).toHaveLength(1);
+    expect(exported.archiveFiles[0]).toMatchObject({
+      itemId: "item-pending-archive",
+      updatedAt: 456,
+    });
+    expect(atob(exported.archiveFiles[0].base64)).toBe(archiveHtml);
+  });
+
+  test("unencrypted JSON backups exclude private-space credentials and folder keys", async () => {
+    db = makeDb({
+      spaces: [{
+        id: "space-private",
+        name: "Private",
+        isPrivate: true,
+        passwordSalt: "secret-salt",
+        passwordHash: "secret-password-hash",
+        recoveryQuestion1: "secret recovery question",
+        recoveryHash1: "secret-recovery-hash",
+      }],
+      folders: [{
+        id: "folder-private",
+        name: "Locked",
+        spaceId: "space-private",
+        isLocked: true,
+        encryptionKey: "secret-folder-key",
+      }],
+    });
+
+    const exported = await buildLocalExtensionMigrationBundle({
+      archiveCache: {
+        listFiles: async () => [],
+        put: async () => ({} as never),
+      },
+      archiveOutbox: { list: async () => [], read: async () => null },
+    });
+    const serialized = JSON.stringify(exported);
+
+    expect(serialized).not.toContain("secret-salt");
+    expect(serialized).not.toContain("secret-password-hash");
+    expect(serialized).not.toContain("secret recovery question");
+    expect(serialized).not.toContain("secret-recovery-hash");
+    expect(serialized).not.toContain("secret-folder-key");
+    expect(exported.collections.spaces[0].isPrivate).toBe(false);
+    expect(exported.collections.folders[0]).toMatchObject({ isLocked: false });
+    expect(exported.warnings.some((warning) => warning.includes("credentials"))).toBe(true);
+  });
+
+  test("restoring redacted rows cannot unlock existing private spaces or folders", async () => {
+    db = makeDb({
+      spaces: [{
+        id: "space-private",
+        name: "Existing private",
+        isPrivate: true,
+        passwordSalt: "keep-salt",
+        passwordHash: "keep-hash",
+      }],
+      folders: [{
+        id: "folder-private",
+        name: "Existing locked",
+        spaceId: "space-private",
+        isLocked: true,
+        encryptionKey: "keep-folder-key",
+      }],
+    });
+
+    await restoreLocalExtensionMigrationBundle(bundle({
+      spaces: [{ id: "space-private", name: "Restored name", isPrivate: false }],
+      folders: [{
+        id: "folder-private",
+        name: "Restored folder name",
+        spaceId: "space-private",
+        isLocked: false,
+      }],
+      deleted_items: [{ id: "source-vector-tombstone", vector_index: 5, deletedAt: 10 }],
+    }));
+
+    expect(db.spaces.rows[0]).toMatchObject({
+      id: "space-private",
+      name: "Restored name",
+      isPrivate: true,
+      passwordSalt: "keep-salt",
+      passwordHash: "keep-hash",
+    });
+    expect(db.folders.rows[0]).toMatchObject({
+      id: "folder-private",
+      name: "Restored folder name",
+      isLocked: true,
+      encryptionKey: "keep-folder-key",
+    });
+    expect(db.deleted_items.rows).toEqual([]);
+  });
+
   test("serializes all ordered collection writes against Bin lifecycle work", async () => {
     const writeStarted = deferred();
     const releaseWrite = deferred();

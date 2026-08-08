@@ -66,6 +66,9 @@ const createHarness = (options: {
   fetcher?: typeof fetch;
   maxDiskBytes?: number;
   maxJobs?: number;
+  requestTimeoutMs?: number;
+  retainUploadedArchive?: (itemId: string, body: Blob) => Promise<void>;
+  isUploadedArchiveRetained?: (itemId: string, updatedAt: number, byteSize: number) => Promise<boolean>;
 } = {}) => {
   const storage = new MemoryStorage();
   const files = new MemoryFiles();
@@ -79,12 +82,16 @@ const createHarness = (options: {
     randomId: () => `id-${++id}`,
     maxDiskBytes: options.maxDiskBytes,
     maxJobs: options.maxJobs,
+    requestTimeoutMs: options.requestTimeoutMs,
     getConnection: async () => ({ token: options.token ?? "token", apiBase: "https://api.example" }),
     ensureItem: async (itemId) => {
       ensured.push(itemId);
       return options.ensureReady === false ? { ready: false, reason: "still-queued" } : { ready: true };
     },
     fetcher: options.fetcher ?? (async () => Response.json({ ok: true })),
+    retainUploadedArchive: options.retainUploadedArchive,
+    isUploadedArchiveRetained: options.isUploadedArchiveRetained ??
+      (options.retainUploadedArchive ? async () => true : undefined),
   });
   return { storage, files, outbox, ensured, get now() { return now; }, set now(value: number) { now = value; } };
 };
@@ -132,6 +139,15 @@ test("archive outbox capacity still permits a newer capture for the same item", 
   expect(jobs.find((job) => job.itemId === "first")?.sourceUrl).toBe("https://example.com/first-new");
 });
 
+test("same-millisecond replacements still receive a strictly newer item version", async () => {
+  const harness = createHarness({ now: 1_000 });
+  const first = await harness.outbox.enqueueServerCapture("item-1", "https://example.com/old");
+  const second = await harness.outbox.enqueueServerCapture("item-1", "https://example.com/new");
+
+  expect(second.updatedAt).toBeGreaterThan(first.updatedAt);
+  expect((await harness.outbox.list())[0].sourceUrl).toBe("https://example.com/new");
+});
+
 test("a delayed server fallback survives until a live capture replaces it", async () => {
   let fetchCalls = 0;
   const harness = createHarness({
@@ -166,8 +182,9 @@ test("archive retry backoff is bounded and respects Retry-After", () => {
   expect(archiveRetryDelayMs(0, 120_000)).toBe(120_000);
 });
 
-test("archive upload ensures its item first, uploads once, and deletes local bytes", async () => {
+test("archive upload retains offline bytes before deleting its outbox file", async () => {
   const methods: string[] = [];
+  const retained: Array<{ itemId: string; html: string }> = [];
   const harness = createHarness({
     fetcher: async (_input, init) => {
       methods.push(init?.method || "GET");
@@ -179,6 +196,36 @@ test("archive upload ensures its item first, uploads once, and deletes local byt
       expect(init?.body).toBeInstanceOf(Blob);
       return Response.json({ blob: { key: "archive/key" } });
     },
+    retainUploadedArchive: async (itemId, body) => {
+      retained.push({ itemId, html: await body.text() });
+    },
+  });
+  await harness.files.put("page.html", "<html><body>saved snapshot</body></html>");
+  await harness.outbox.enqueueUpload({
+    itemId: "item-1",
+    sourceUrl: "https://example.com/page",
+    fileName: "page.html",
+    byteSize: 40,
+  });
+  expect(retained).toEqual([
+    { itemId: "item-1", html: "<html><body>saved snapshot</body></html>" },
+  ]);
+
+  const result = await harness.outbox.drain(1);
+  expect(result).toMatchObject({ attempted: 1, uploaded: 1, remaining: 0 });
+  expect(harness.ensured).toEqual(["item-1"]);
+  expect(methods).toEqual(["PUT"]);
+  expect(retained).toEqual([
+    { itemId: "item-1", html: "<html><body>saved snapshot</body></html>" },
+  ]);
+  expect(harness.files.files.has("page.html")).toBe(false);
+});
+
+test("archive upload stays queued when the durable offline copy cannot be written", async () => {
+  const harness = createHarness({
+    retainUploadedArchive: async () => {
+      throw new Error("OPFS quota exceeded");
+    },
   });
   await harness.files.put("page.html", "<html><body>saved snapshot</body></html>");
   await harness.outbox.enqueueUpload({
@@ -189,10 +236,33 @@ test("archive upload ensures its item first, uploads once, and deletes local byt
   });
 
   const result = await harness.outbox.drain(1);
-  expect(result).toMatchObject({ attempted: 1, uploaded: 1, remaining: 0 });
-  expect(harness.ensured).toEqual(["item-1"]);
-  expect(methods).toEqual(["PUT"]);
-  expect(harness.files.files.has("page.html")).toBe(false);
+
+  expect(result).toMatchObject({ uploaded: 0, deferred: 1, remaining: 1 });
+  expect(harness.files.files.has("page.html")).toBe(true);
+});
+
+test("an evicted retained copy is rechecked before its authoritative source is deleted", async () => {
+  let retainCalls = 0;
+  const harness = createHarness({
+    retainUploadedArchive: async () => {
+      retainCalls += 1;
+      if (retainCalls > 1) throw new Error("ARCHIVE_CACHE_CAPACITY");
+    },
+    isUploadedArchiveRetained: async () => false,
+  });
+  await harness.files.put("page.html", "<html><body>saved snapshot payload</body></html>");
+  await harness.outbox.enqueueUpload({
+    itemId: "item-1",
+    sourceUrl: "https://example.com/page",
+    fileName: "page.html",
+    byteSize: 48,
+  });
+
+  const result = await harness.outbox.drain(1);
+
+  expect(result).toMatchObject({ uploaded: 0, deferred: 1, remaining: 1 });
+  expect(harness.files.files.has("page.html")).toBe(true);
+  expect(retainCalls).toBe(2);
 });
 
 test("archive upload remains durable when item sync is not ready", async () => {
@@ -240,6 +310,38 @@ test("404 keeps an upload for retry instead of losing it", async () => {
   expect(job.mode).toBe("upload");
   expect(job.attempts).toBe(1);
   expect(harness.files.files.has("page.html")).toBe(true);
+});
+
+test("a stalled error body times out without losing the queued archive", async () => {
+  const harness = createHarness({
+    requestTimeoutMs: 20,
+    fetcher: async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"error":"partial'));
+      },
+    }), { status: 500, headers: { "content-type": "application/json" } }),
+  });
+  await harness.outbox.enqueueServerCapture("item-1", "https://example.com/page");
+
+  const result = await harness.outbox.drain(1);
+  const [job] = await harness.outbox.list();
+
+  expect(result).toMatchObject({ deferred: 1, remaining: 1 });
+  expect(job.lastError).toBe("ARCHIVE_REQUEST_TIMEOUT");
+});
+
+test("an oversized archive error response is bounded and remains retryable", async () => {
+  const harness = createHarness({
+    fetcher: async () => new Response("x", {
+      status: 500,
+      headers: { "content-length": String(70 * 1024) },
+    }),
+  });
+  await harness.outbox.enqueueServerCapture("item-1", "https://example.com/page");
+
+  await harness.outbox.drain(1);
+
+  expect((await harness.outbox.list())[0].lastError).toBe("ARCHIVE_ERROR_RESPONSE_TOO_LARGE");
 });
 
 test("invalid or oversized client archive automatically falls back to server capture", async () => {
@@ -321,6 +423,105 @@ test("an old in-flight success cannot clear a newer archive for the same item", 
   expect(jobs).toHaveLength(1);
   expect(jobs[0].fileName).toBe("new.html");
   expect(harness.files.files.has("new.html")).toBe(true);
+});
+
+test("clearing during an in-flight upload cannot resurrect cached or queued bytes", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let retainCalls = 0;
+  const harness = createHarness({
+    fetcher: async () => {
+      await gate;
+      return Response.json({ ok: true });
+    },
+    retainUploadedArchive: async () => {
+      retainCalls += 1;
+      if (retainCalls === 1) throw new Error("initial cache unavailable");
+    },
+  });
+  await harness.files.put("page.html", "<html><body>saved snapshot payload</body></html>");
+  await harness.outbox.enqueueUpload({
+    itemId: "item-1",
+    sourceUrl: "https://example.com/page",
+    fileName: "page.html",
+    byteSize: 48,
+  });
+  const draining = harness.outbox.drain(1);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await harness.outbox.clear();
+  release();
+  await draining;
+
+  expect(await harness.outbox.list()).toEqual([]);
+  expect(harness.files.files.size).toBe(0);
+  expect(retainCalls).toBe(1);
+});
+
+test("clearing aborts an archive request that is already on the wire", async () => {
+  let markFetchStarted!: () => void;
+  const fetchStarted = new Promise<void>((resolve) => {
+    markFetchStarted = resolve;
+  });
+  let requestAborted = false;
+  const harness = createHarness({
+    fetcher: async (_input, init) => {
+      markFetchStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          requestAborted = true;
+          reject(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      });
+    },
+  });
+  await harness.outbox.enqueueServerCapture("item-1", "https://example.com/page");
+
+  const draining = harness.outbox.drain(1);
+  await fetchStarted;
+  await harness.outbox.clear();
+  await draining;
+
+  expect(requestAborted).toBe(true);
+  expect(await harness.outbox.list()).toEqual([]);
+  expect(harness.files.files.size).toBe(0);
+});
+
+test("permanently discarding an item aborts its in-flight archive upload", async () => {
+  let markFetchStarted!: () => void;
+  const fetchStarted = new Promise<void>((resolve) => {
+    markFetchStarted = resolve;
+  });
+  let requestAborted = false;
+  const harness = createHarness({
+    fetcher: async (_input, init) => {
+      markFetchStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          requestAborted = true;
+          reject(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      });
+    },
+  });
+  await harness.files.put("page.html", "<html><body>private archived page</body></html>");
+  await harness.outbox.enqueueUpload({
+    itemId: "item-1",
+    sourceUrl: "https://example.com/page",
+    fileName: "page.html",
+    byteSize: 48,
+  });
+
+  const draining = harness.outbox.drain(1);
+  await fetchStarted;
+  await harness.outbox.discardItem("item-1");
+  await draining;
+
+  expect(requestAborted).toBe(true);
+  expect(await harness.outbox.list()).toEqual([]);
+  expect(harness.files.files.has("page.html")).toBe(false);
 });
 
 test("disk pressure downgrades oldest local HTML to a lightweight server-capture intent", async () => {

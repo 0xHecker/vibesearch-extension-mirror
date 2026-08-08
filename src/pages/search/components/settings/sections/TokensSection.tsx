@@ -3,16 +3,32 @@ import { Check, Cloud, KeyRound, Loader2, Plug, Unplug } from "lucide-react";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
 import { showErrorToast, showSuccessToast } from "@src/utils/toast-feedback";
-import { getGoogleAccessToken, clearGoogleAccessToken } from "@src/services/google-auth";
 import { SectionHeading, SettingGroup, SettingRow } from "../SettingsPrimitives";
-import { GitHubIcon, GoogleIcon } from "../BrandIcons";
+import { GitHubIcon, GoogleIcon, NotionIcon } from "../BrandIcons";
 import { SocialConnectors } from "./SocialConnectors";
 import type { CloudAuthStatus } from "@src/services/cloud-auth";
+import type { NotionConnectionStatus } from "@src/services/notion-auth";
 
 /** chrome.storage.local key for the persisted GitHub personal access token. */
 export const GITHUB_TOKEN_STORAGE_KEY = "vibesearch:githubToken";
 
 type RuntimeResponse<T> = { success?: boolean; payload?: T; error?: string };
+
+type GoogleConnection = { connected: true; accountId: string };
+
+const callGoogleAuth = async (type: "GOOGLE_AUTH_STATUS" | "GOOGLE_AUTH_CONNECT") => {
+  const response = await chrome.runtime.sendMessage({ target: "background", type }) as RuntimeResponse<GoogleConnection>;
+  if (!response?.success) throw new Error(response?.error || "Google account connection failed.");
+  return response.payload as GoogleConnection;
+};
+
+const callNotionAuth = async (
+  type: "NOTION_AUTH_STATUS" | "NOTION_AUTH_CONNECT" | "NOTION_AUTH_DISCONNECT",
+): Promise<NotionConnectionStatus> => {
+  const response = await chrome.runtime.sendMessage({ target: "background", type }) as RuntimeResponse<NotionConnectionStatus>;
+  if (!response?.success) throw new Error(response?.error || "Notion account connection failed.");
+  return response.payload || { connected: false };
+};
 
 const callCloudAuth = async <T,>(type: "status" | "connect" | "disconnect", payload?: unknown): Promise<T> => {
   const response = await chrome.runtime.sendMessage({
@@ -41,6 +57,8 @@ export function TokensSection() {
     "unknown"
   );
   const [googleBusy, setGoogleBusy] = React.useState(false);
+  const [notionState, setNotionState] = React.useState<NotionConnectionStatus | null>(null);
+  const [notionBusy, setNotionBusy] = React.useState(false);
   const [cloudState, setCloudState] = React.useState<CloudAuthStatus | null>(null);
   const [cloudBusy, setCloudBusy] = React.useState(false);
 
@@ -53,9 +71,12 @@ export function TokensSection() {
       setStoredToken(value || null);
       setEditing(!value);
     });
-    void getGoogleAccessToken(false)
+    void callGoogleAuth("GOOGLE_AUTH_STATUS")
       .then(() => active && setGoogleState("connected"))
       .catch(() => active && setGoogleState("disconnected"));
+    void callNotionAuth("NOTION_AUTH_STATUS")
+      .then((status) => active && setNotionState(status))
+      .catch(() => active && setNotionState({ connected: false }));
     void callCloudAuth<CloudAuthStatus>("status", { refresh: true })
       .then((status) => active && setCloudState(status))
       .catch(() => active && setCloudState({
@@ -102,7 +123,7 @@ export function TokensSection() {
   const connectGoogle = async () => {
     setGoogleBusy(true);
     try {
-      await getGoogleAccessToken(true);
+      await callGoogleAuth("GOOGLE_AUTH_CONNECT");
       setGoogleState("connected");
       showSuccessToast("Google account connected.");
     } catch (cause) {
@@ -115,13 +136,43 @@ export function TokensSection() {
   const disconnectGoogle = async () => {
     setGoogleBusy(true);
     try {
-      await clearGoogleAccessToken();
+      const response = await chrome.runtime.sendMessage({
+        target: "background",
+        type: "GOOGLE_SYNC_CLEAR_AUTH",
+      }) as RuntimeResponse<{ cleared: boolean }>;
+      if (!response?.success) throw new Error(response?.error || "Could not disconnect.");
       setGoogleState("disconnected");
       showSuccessToast("Google account disconnected.");
     } catch {
       showErrorToast("Could not disconnect.");
     } finally {
       setGoogleBusy(false);
+    }
+  };
+
+  const connectNotion = async () => {
+    setNotionBusy(true);
+    try {
+      const status = await callNotionAuth("NOTION_AUTH_CONNECT");
+      setNotionState(status);
+      showSuccessToast(`Notion connected${status.workspaceName ? ` to ${status.workspaceName}` : ""}.`);
+    } catch (cause) {
+      showErrorToast(cause instanceof Error ? cause.message : "Could not connect to Notion.");
+    } finally {
+      setNotionBusy(false);
+    }
+  };
+
+  const disconnectNotion = async () => {
+    setNotionBusy(true);
+    try {
+      await callNotionAuth("NOTION_AUTH_DISCONNECT");
+      setNotionState({ connected: false });
+      showSuccessToast("Notion disconnected.");
+    } catch (cause) {
+      showErrorToast(cause instanceof Error ? cause.message : "Could not disconnect from Notion.");
+    } finally {
+      setNotionBusy(false);
     }
   };
 
@@ -154,7 +205,7 @@ export function TokensSection() {
     <div>
       <SectionHeading
         title="Data connectors"
-        description="Connect the services VibeSearch imports from and syncs with. Credentials are stored locally on this device and only ever sent to the service you connect."
+        description="Connect the services VibeSearch imports from and syncs with. Connection credentials stay on this device; Notion OAuth is brokered without sending your library through VibeSearch."
       />
 
       <SettingGroup label="Vibesearch">
@@ -306,6 +357,58 @@ export function TokensSection() {
           ) : (
             <Button type="button" variant="outline" size="sm" onClick={() => void connectGoogle()} disabled={googleBusy} static={googleBusy}>
               {googleBusy ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
+              Connect
+            </Button>
+          )}
+        </SettingRow>
+      </SettingGroup>
+
+      <SettingGroup label="Notion">
+        <SettingRow
+          title={
+            <span className="flex items-center gap-2">
+              <NotionIcon className="size-4" />
+              Notion workspace
+            </span>
+          }
+          description={
+            notionState?.workspaceName
+              ? `Export a readable VibeSearch catalog to ${notionState.workspaceName}. Library content goes directly to Notion.`
+              : "Export a readable VibeSearch catalog to a private page in your Notion workspace."
+          }
+        >
+          <span
+            className={
+              notionState?.connected
+                ? "inline-flex items-center gap-1 rounded-full bg-background-positive-faded px-2 py-0.5 text-xs font-medium text-foreground-positive"
+                : "inline-flex items-center gap-1 rounded-full bg-background-page-secondary px-2 py-0.5 text-xs font-medium text-foreground-tertiary"
+            }
+          >
+            {notionState?.connected ? <Check className="size-3" /> : <span className="size-1.5 rounded-full bg-foreground-tertiary" />}
+            {notionState === null ? "Checking…" : notionState.connected ? "Connected" : "Not connected"}
+          </span>
+          {notionState?.connected ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => void disconnectNotion()}
+              disabled={notionBusy}
+              className="text-foreground-tertiary hover:text-foreground-danger"
+            >
+              {notionBusy ? <Loader2 className="size-4 animate-spin" /> : <Unplug className="size-4" />}
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void connectNotion()}
+              disabled={notionBusy || notionState === null}
+              static={notionBusy}
+            >
+              {notionBusy ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
               Connect
             </Button>
           )}

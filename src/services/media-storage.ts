@@ -12,6 +12,9 @@ const OPFS_IDENTITY_EDGE_BYTES = 64 * 1024;
 const OPFS_MUTATION_LOCK_NAME = "vibesearch:opfs-media-mutation:v1";
 let opfsMutationTail: Promise<void> = Promise.resolve();
 
+const isNotFoundError = (error: unknown): boolean =>
+  error instanceof DOMException && error.name === "NotFoundError";
+
 /**
  * Serializes DB-reference changes with OPFS overwrites/deletes. Web Locks also
  * coordinate the background worker and offscreen document when both are alive;
@@ -39,6 +42,25 @@ export const withOpfsMutationLock = async <T>(work: () => Promise<T>): Promise<T
 const getMediaDir = async () => {
   const root = await navigator.storage.getDirectory();
   return root.getDirectoryHandle(MEDIA_DIR, { create: true });
+};
+
+export const listOpfsMediaItemDirectoryIds = async (): Promise<string[]> => {
+  let mediaDir: FileSystemDirectoryHandle;
+  try {
+    const root = await navigator.storage.getDirectory();
+    mediaDir = await root.getDirectoryHandle(MEDIA_DIR);
+  } catch (error) {
+    if (isNotFoundError(error)) return [];
+    throw error;
+  }
+  const ids: string[] = [];
+  const entries = (mediaDir as FileSystemDirectoryHandle & {
+    entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
+  }).entries();
+  for await (const [name, handle] of entries) {
+    if (handle.kind === "directory" && name) ids.push(name);
+  }
+  return ids.sort();
 };
 
 const getItemDir = async (itemId: string) => {
@@ -155,9 +177,9 @@ export const deleteMediaFromOpfs = async (
     }
     await dir.removeEntry(fileName);
     return true;
-  } catch {
-    // File may not exist; ignore
-    return false;
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    throw error;
   }
 };
 
@@ -165,8 +187,8 @@ export const deleteAllMediaForItem = async (itemId: string): Promise<void> => {
   try {
     const mediaDir = await getMediaDir();
     await mediaDir.removeEntry(itemId, { recursive: true });
-  } catch {
-    // Directory may not exist; ignore
+  } catch (error) {
+    if (!isNotFoundError(error)) throw error;
   }
 };
 
@@ -337,8 +359,9 @@ export const readOpfsFile = async (opfsPath: string): Promise<File | null> => {
     const fileHandle = await getFileHandleFromOpfsPath(opfsPath);
     if (!fileHandle) return null;
     return await fileHandle.getFile();
-  } catch {
-    return null;
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
   }
 };
 

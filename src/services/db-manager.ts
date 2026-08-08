@@ -28,6 +28,7 @@ import {
 } from "@src/services/share-snapshot";
 import {
   buildLocalExtensionMigrationBundle,
+  LOCAL_MIGRATION_MAX_JSON_BYTES,
   restoreLocalExtensionMigrationBundle as restoreLocalExtensionMigration,
   summarizeLocalExtensionMigrationBundle,
   validateLocalExtensionMigrationBundle,
@@ -43,6 +44,23 @@ import {
   withEntityMutationLock,
   withSpaceMutationLocks,
 } from "@src/services/entity-mutation-lock";
+import { getArchiveCache } from "@src/services/archive-cache";
+import {
+  ARCHIVE_OUTBOX_DIRECTORY,
+  ARCHIVE_OUTBOX_STORAGE_KEY,
+} from "@src/services/archive-outbox";
+import { createLocalMigrationJsonBlob } from "@src/services/local-extension-migration-json";
+import {
+  clearStagedPayloads,
+  deleteStagedPayloadFile,
+  readStagedPayloadFile,
+  stagePayloadFile,
+} from "@src/services/large-payload-staging";
+import { GOOGLE_BACKUP_MAX_BYTES } from "@src/services/google-backup-limits";
+import { vectorStoreService } from "@src/services/vector-store.service";
+import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordinator";
+import { vectorMaintenanceJournalService } from "@src/services/vector-maintenance-journal.service";
+import { loadNotionExportBatch } from "@src/services/notion-export-source";
 import {
   requireLiveFolderDestination,
   withLiveFolderDestination,
@@ -516,6 +534,25 @@ class DatabaseManager {
     return buildLocalExportSnapshot(payload);
   }
 
+  async buildExportSnapshotFile(payload?: BuildExportSnapshotPayload): Promise<{
+    fileName: string;
+    itemCount: number;
+    folderCount: number;
+  }> {
+    const snapshot = await buildLocalExportSnapshot(payload);
+    const blob = new Blob([JSON.stringify(snapshot)], { type: "application/json" });
+    if (blob.size > GOOGLE_BACKUP_MAX_BYTES) throw new Error("GOOGLE_BACKUP_TOO_LARGE");
+    return {
+      fileName: await stagePayloadFile(blob, "drive-export"),
+      itemCount: snapshot.items.length,
+      folderCount: snapshot.folders.length,
+    };
+  }
+
+  async getNotionExportBatch(payload?: { afterId?: string; limit?: number }) {
+    return loadNotionExportBatch(payload);
+  }
+
   async importSharedSnapshot(payload: ImportSharedSnapshotPayload): Promise<ImportSharedSnapshotResult> {
     return importSharedSnapshot(payload);
   }
@@ -530,9 +567,32 @@ class DatabaseManager {
     return buildLocalExtensionMigrationBundle();
   }
 
+  async buildLocalExtensionMigrationDownload(): Promise<{
+    fileName: string;
+    createdAt: number;
+    summary: LocalExtensionMigrationSummary;
+    warnings: string[];
+  }> {
+    const bundle = await buildLocalExtensionMigrationBundle();
+    const blob = createLocalMigrationJsonBlob(bundle);
+    if (blob.size > LOCAL_MIGRATION_MAX_JSON_BYTES) {
+      throw new Error("MIGRATION_FILE_JSON_TOO_LARGE");
+    }
+    const fileName = await stagePayloadFile(blob, "local-export");
+    return {
+      fileName,
+      createdAt: bundle.createdAt,
+      summary: summarizeLocalExtensionMigrationBundle(bundle),
+      warnings: bundle.warnings.slice(0, 100),
+    };
+  }
+
   async stageLocalExtensionMigrationBundle(payload: {
     json: string;
   }): Promise<{ stageId: string; summary: LocalExtensionMigrationSummary }> {
+    if (payload.json.length > LOCAL_MIGRATION_MAX_JSON_BYTES) {
+      throw new Error("MIGRATION_FILE_JSON_TOO_LARGE");
+    }
     // Only one restore file needs to be retained in the offscreen document.
     // Clearing stale staged files prevents large JSON blobs from accumulating.
     this.stagedLocalRestoreBundles.clear();
@@ -543,6 +603,20 @@ class DatabaseManager {
       this.stagedLocalRestoreBundles.delete(stageId);
     }, STAGED_RESTORE_TTL_MS);
     return { stageId, summary: summarizeLocalExtensionMigrationBundle(bundle) };
+  }
+
+  async stageLocalExtensionMigrationFile(payload: {
+    fileName: string;
+  }): Promise<{ stageId: string; summary: LocalExtensionMigrationSummary }> {
+    try {
+      const file = await readStagedPayloadFile(payload.fileName);
+      if (file.size <= 0 || file.size > LOCAL_MIGRATION_MAX_JSON_BYTES) {
+        throw new Error("MIGRATION_FILE_JSON_TOO_LARGE");
+      }
+      return await this.stageLocalExtensionMigrationBundle({ json: await file.text() });
+    } finally {
+      await deleteStagedPayloadFile(payload.fileName).catch(() => {});
+    }
   }
 
   async restoreStagedLocalExtensionMigrationBundle(payload: {
@@ -559,13 +633,41 @@ class DatabaseManager {
     return mergeBackupSnapshot(payload.snapshot);
   }
 
+  async mergeBackupSnapshotFile(payload: { fileName: string }): Promise<MergeBackupSnapshotResult> {
+    try {
+      const file = await readStagedPayloadFile(payload.fileName);
+      if (file.size <= 0 || file.size > GOOGLE_BACKUP_MAX_BYTES) {
+        throw new Error("GOOGLE_BACKUP_TOO_LARGE");
+      }
+      return await mergeBackupSnapshot(JSON.parse(await file.text()));
+    } finally {
+      await deleteStagedPayloadFile(payload.fileName).catch(() => {});
+    }
+  }
+
+  async filterExistingItemIds(payload: { itemIds?: string[] }): Promise<string[]> {
+    const itemIds = Array.from(
+      new Set((payload.itemIds || []).filter((itemId) => typeof itemId === "string" && itemId)),
+    ).slice(0, 2_000);
+    if (itemIds.length === 0) return [];
+    const db = await getDb();
+    const docs = await db.items.findByIds(itemIds).exec();
+    return itemIds.filter((itemId) => docs.has(itemId));
+  }
+
   /**
-   * Permanently wipe every local collection and all OPFS media. Destructive
+   * Permanently wipe every local collection and all OPFS payloads. Destructive
    * and irreversible — the caller (Settings → Data → Delete all data) confirms
    * first. Clears document data rather than removing the database so the live
    * RxDB instance stays valid for the running page.
    */
   async deleteAllData(): Promise<{ deletedCollections: number }> {
+    return vectorPipelineCoordinator.runResetExclusive(() => this.deleteAllDataLocked());
+  }
+
+  private async deleteAllDataLocked(): Promise<{ deletedCollections: number }> {
+    this.stagedLocalRestoreBundles.clear();
+    spaceSessionService.lockAll();
     const db = await getDb();
     const collections = [
       db.items,
@@ -579,20 +681,68 @@ class DatabaseManager {
       db.deleted_items,
     ];
     let deletedCollections = 0;
+    const failures: unknown[] = [];
     for (const collection of collections) {
       try {
         await collection.find().remove();
         deletedCollections += 1;
       } catch (error) {
         console.error("[db-manager] failed to clear collection", collection?.name, error);
+        failures.push(error);
       }
     }
-    // Best-effort wipe of OPFS media so deleted tabs don't leave blobs behind.
+    // Never erase payloads that may still be referenced by rows whose
+    // collection deletion failed. Report the partial failure instead of
+    // presenting a false-success toast.
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `DELETE_ALL_COLLECTIONS_FAILED:${deletedCollections}/${collections.length}`,
+      );
+    }
+
+    const ignoreMissingDirectory = (error: unknown): boolean =>
+      error instanceof DOMException && error.name === "NotFoundError";
+
     try {
       const root = await navigator.storage.getDirectory();
       await root.removeEntry("media", { recursive: true });
-    } catch {
-      /* media dir may not exist */
+    } catch (error) {
+      if (!ignoreMissingDirectory(error)) failures.push(error);
+    }
+    try {
+      await getArchiveCache().clear();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry(ARCHIVE_OUTBOX_DIRECTORY, { recursive: true });
+    } catch (error) {
+      if (!ignoreMissingDirectory(error)) failures.push(error);
+    }
+    try {
+      await chrome.storage.local.remove(ARCHIVE_OUTBOX_STORAGE_KEY);
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await clearStagedPayloads();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await vectorStoreService.deleteAllStorageFiles();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await vectorMaintenanceJournalService.remove();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "DELETE_ALL_PAYLOAD_CLEANUP_FAILED");
     }
     for (const scope of ["items", "folders", "spaces"] as const) {
       try {

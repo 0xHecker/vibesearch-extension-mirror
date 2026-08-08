@@ -1,4 +1,5 @@
 import {
+  clearMetadataPipelineData,
   retryStoredFailedMetadataUrls,
   scheduleForProcessing,
   setMetadataProgressListener,
@@ -39,10 +40,14 @@ import {
 import { OCR_MODEL_VERSION } from "@src/services/ocr-model-config";
 import {
   syncSnapshotToGoogleWorkspace,
+  syncSnapshotFileToGoogleWorkspace,
   getGoogleWorkspaceSyncState,
+  connectGoogleWorkspace,
   clearGoogleWorkspaceAuth,
-  downloadGoogleWorkspaceBackup,
+  downloadGoogleWorkspaceBackupBlob,
+  fetchWithTimeout,
   listGoogleWorkspaceBackups,
+  readBoundedResponseText,
 } from "@src/services/google-workspace-sync";
 import type { ShareSnapshotV1 } from "@src/services/share-snapshot";
 import type {
@@ -66,6 +71,7 @@ import {
   createOpfsArchiveOutboxFiles,
 } from "@src/services/archive-outbox";
 import { ArchiveCaptureSessionManager } from "@src/services/archive-capture-session";
+import { getArchiveCache } from "@src/services/archive-cache";
 import {
   PAGE_ARCHIVE_ABORT_MESSAGE,
   PAGE_ARCHIVE_CAPTURE_MESSAGE,
@@ -94,6 +100,33 @@ import {
   type ConnectorSyncOutcome,
 } from "@src/services/connectors/registry";
 import type { ConnectorPlatform } from "@src/services/connectors/types";
+import {
+  cleanupStagedPayloads,
+  deleteStagedPayloadFile,
+  LOCAL_DATA_RESET_EPOCH_STORAGE_KEY,
+  LOCAL_DATA_RESET_STORAGE_KEY,
+  stagePayloadFile,
+  takeStagedPayloadFile,
+} from "@src/services/large-payload-staging";
+import {
+  isInternalOnlyOffscreenCall,
+  isSearchOnlyOffscreenCall,
+} from "@src/services/offscreen-routing-policy";
+import {
+  connectNotion,
+  disconnectNotion,
+  getNotionAccessToken,
+  getNotionConnectionStatus,
+} from "@src/services/notion-auth";
+import {
+  appendNotionExportItems,
+  createNotionExportPage,
+} from "@src/services/notion-export";
+import {
+  NOTION_EXPORT_BATCH_SIZE,
+  NOTION_EXPORT_MAX_ITEMS,
+  type NotionExportBatch,
+} from "@src/services/notion-export-source";
 
 const SYNC_ALARM_NAME = "vector-sync-alarm";
 const CLOUD_SYNC_ALARM_NAME = "cloud-sync-alarm";
@@ -101,6 +134,10 @@ const CLOUD_SYNC_CONTINUATION_ALARM_NAME = "cloud-sync-continuation";
 const ARCHIVE_OUTBOX_RETRY_ALARM_NAME = "archive-outbox-retry";
 const EMBEDDING_ALARM_NAME = "embedding-alarm";
 const METADATA_RETRY_ALARM_NAME = "metadata-retry-alarm";
+const OPFS_MEDIA_RECONCILE_CONTINUATION_ALARM_NAME = "opfs-media-reconcile-continuation";
+const OPFS_MEDIA_RECONCILE_CURSOR_KEY = "vibesearch:opfsMediaReconcileCursor:v1";
+const SHARE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024;
+const SHARE_SNAPSHOT_FETCH_TIMEOUT_MS = 60_000;
 const CONNECTOR_MESSAGE_TYPES = new Set([
   "RUN_CONNECTOR_SYNC",
   "CANCEL_CONNECTOR_SYNC",
@@ -108,6 +145,26 @@ const CONNECTOR_MESSAGE_TYPES = new Set([
   "CONNECTOR_CONNECT",
   "CONNECTOR_DISCONNECT",
   "CONNECTOR_SET_AUTOSYNC",
+]);
+const GOOGLE_WORKSPACE_MESSAGE_TYPES = new Set([
+  "GOOGLE_AUTH_STATUS",
+  "GOOGLE_AUTH_CONNECT",
+  "GOOGLE_SYNC_STATUS",
+  "GOOGLE_SYNC_CLEAR_AUTH",
+  "GOOGLE_BACKUP_LIST",
+  "GOOGLE_BACKUP_RESTORE",
+  "GOOGLE_SYNC_EXPORT_ALL",
+]);
+const LOCAL_BACKUP_MESSAGE_TYPES = new Set([
+  "LOCAL_BACKUP_BUILD_DOWNLOAD",
+  "LOCAL_BACKUP_STAGE_FILE",
+  "LOCAL_BACKUP_RESTORE_STAGED",
+]);
+const NOTION_MESSAGE_TYPES = new Set([
+  "NOTION_AUTH_STATUS",
+  "NOTION_AUTH_CONNECT",
+  "NOTION_AUTH_DISCONNECT",
+  "NOTION_EXPORT_ALL",
 ]);
 const CONNECTOR_LABELS: Record<ConnectorPlatform, string> = {
   x: "X (Twitter)",
@@ -138,22 +195,6 @@ const describeConnectorOutcome = (
 const FORCE_DEV_OFFSCREEN_RESET =
   import.meta.env.VITE_FORCE_DEV_OFFSCREEN_RESET === "1";
 const SEARCH_PAGE_PATH = "/src/pages/search/index.html";
-const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
-  "items:getByIds",
-  "items:moveToSpace",
-  "spaces:listSpaces",
-  "spaces:createSpace",
-  "spaces:renameSpace",
-  "spaces:setPrivatePassword",
-  "spaces:unlockSpace",
-  "spaces:changePrivatePassword",
-  "spaces:recoverPrivatePassword",
-  "spaces:lockSpace",
-  "spaces:touchSpaceActivity",
-  "spaces:getSpaceAccessState",
-]);
-const INTERNAL_ONLY_OFFSCREEN_METHODS = new Set<string>(["items:saveFetchedMetadata"]);
-
 const IMPORT_SETTINGS_KEY = "vs_import_settings_v1";
 const IMPORT_DRAFTS_KEY = "vs_import_drafts_v1";
 const IMPORT_LRU_FOLDERS_KEY = "vs_import_lru_folders_v1";
@@ -746,6 +787,33 @@ const rememberFailedImportAttempt = (statusId: string, attempt: FailedImportAtte
 const getFailedImportAttempt = (statusId: string): FailedImportAttempt | null => {
   return failedImportAttempts.get(statusId) || null;
 };
+
+let localDataResetInProgress = false;
+// Start closed until the persisted reset journal has been checked. This keeps
+// an MV3 worker restart from accepting imports in the small window before an
+// interrupted wipe is detected and resumed.
+let localDataResetRecoveryRequired = true;
+const activeBackgroundDataJobs = new Set<Promise<unknown>>();
+const activeOffscreenRequests = new Set<Promise<unknown>>();
+
+const trackBackgroundDataJob = <T>(work: Promise<T>): Promise<T> => {
+  activeBackgroundDataJobs.add(work);
+  void work.finally(() => activeBackgroundDataJobs.delete(work)).catch(() => {});
+  return work;
+};
+
+const runBackgroundDataJob = <T>(work: () => Promise<T>): Promise<T> => {
+  if (localDataResetInProgress || localDataResetRecoveryRequired) {
+    return Promise.reject(new Error("LOCAL_DATA_RESET_IN_PROGRESS"));
+  }
+  return trackBackgroundDataJob(work());
+};
+
+const trackOffscreenRequest = <T>(work: Promise<T>): Promise<T> => {
+  activeOffscreenRequests.add(work);
+  void work.finally(() => activeOffscreenRequests.delete(work)).catch(() => {});
+  return work;
+};
 const resolveRetryTab = async (snapshot?: TabSnapshot): Promise<chrome.tabs.Tab | undefined> => {
   if (!snapshot) return undefined;
   if (typeof snapshot.id === "number") {
@@ -762,14 +830,22 @@ const sendForwardedToOffscreen = async <T = unknown>(request: {
   type: string;
   payload?: unknown;
 }): Promise<T> => {
-  await setupOffscreenDocument();
-  const response = (await chrome.runtime.sendMessage({
-    ...request,
-    target: "offscreen",
-    isForwarded: true,
-  })) as OffscreenResponse<T>;
-  if (!response?.success) throw new Error(response?.error || `${request.service}.${request.type} failed`);
-  return response.payload as T;
+  const isResetControlRequest =
+    (request.service === "dbManager" && request.type === "deleteAllData") ||
+    (request.service === "cloudSync" && request.type === "cancelAndClear");
+  if ((localDataResetInProgress || localDataResetRecoveryRequired) && !isResetControlRequest) {
+    throw new Error("LOCAL_DATA_RESET_IN_PROGRESS");
+  }
+  return trackOffscreenRequest((async () => {
+    await setupOffscreenDocument();
+    const response = (await chrome.runtime.sendMessage({
+      ...request,
+      target: "offscreen",
+      isForwarded: true,
+    })) as OffscreenResponse<T>;
+    if (!response?.success) throw new Error(response?.error || `${request.service}.${request.type} failed`);
+    return response.payload as T;
+  })());
 };
 
 const refreshConnectorCloudAuth = async (): Promise<CloudAuthStatus | null> => {
@@ -790,6 +866,7 @@ type CloudSyncPushItemResponse = {
 };
 
 const archiveOutboxFiles = createOpfsArchiveOutboxFiles();
+const archiveCache = getArchiveCache();
 const archiveOutbox = new ArchiveOutbox({
   storage: createChromeArchiveOutboxStorage(),
   files: archiveOutboxFiles,
@@ -810,20 +887,64 @@ const archiveOutbox = new ArchiveOutbox({
           retryAfterMs: result?.reason === "missing-local-item" ? 5 * 60_000 : 30_000,
         };
   },
+  retainUploadedArchive: (itemId, body, updatedAt) =>
+    archiveCache.put(itemId, body, updatedAt).then(() => undefined),
+  retainUploadedArchiveWithinMutationLock: (itemId, body, updatedAt) =>
+    archiveCache.putWithinMutationLock(itemId, body, updatedAt, {
+      source: "local",
+      replaceCloudNewer: true,
+    }).then(() => undefined),
+  isUploadedArchiveRetained: async (itemId, updatedAt, byteSize) => {
+    const entry = (await archiveCache.list()).find((candidate) => candidate.itemId === itemId);
+    if (!entry || entry.updatedAt !== updatedAt || entry.byteSize !== byteSize) return false;
+    return (await archiveCache.get(itemId))?.size === byteSize;
+  },
 });
 const archiveCaptureSessions = new ArchiveCaptureSessionManager({
   outbox: archiveOutbox,
 });
 const cancelledArchiveItems = new Map<string, number>();
+let archiveWritesSuspended = false;
+
+const purgeArchivedItems = async (itemIdsRaw: Iterable<string>): Promise<void> => {
+  const itemIds = Array.from(
+    new Set(Array.from(itemIdsRaw, (itemId) => itemId.trim()).filter(Boolean)),
+  );
+  if (itemIds.length === 0) return;
+  const cancelledAt = Date.now();
+  for (const itemId of itemIds) cancelledArchiveItems.set(itemId, cancelledAt);
+  for (const [id, markedAt] of cancelledArchiveItems) {
+    if (Date.now() - markedAt > 60 * 60 * 1000) cancelledArchiveItems.delete(id);
+  }
+  await Promise.all(itemIds.map((itemId) => archiveCaptureSessions.cancelItem(itemId)));
+  await archiveOutbox.discardItems(itemIds);
+  await archiveCache.deleteMany(itemIds);
+};
+
+const reconcileArchivedItemsWithDatabase = async (): Promise<void> => {
+  const [cached, queued] = await Promise.all([archiveCache.list(), archiveOutbox.list()]);
+  const candidateIds = Array.from(new Set([
+    ...cached.map((entry) => entry.itemId),
+    ...queued.map((job) => job.itemId),
+  ]));
+  if (candidateIds.length === 0) return;
+
+  const existing = new Set<string>();
+  for (let offset = 0; offset < candidateIds.length; offset += 2_000) {
+    const itemIds = candidateIds.slice(offset, offset + 2_000);
+    const found = await sendForwardedToOffscreen<string[]>({
+      service: "dbManager",
+      type: "filterExistingItemIds",
+      payload: { itemIds },
+    });
+    for (const itemId of found || []) existing.add(itemId);
+  }
+  await purgeArchivedItems(candidateIds.filter((itemId) => !existing.has(itemId)));
+};
 
 const markArchiveItemCancelled = async (itemId: string): Promise<void> => {
   if (!itemId) return;
-  cancelledArchiveItems.set(itemId, Date.now());
-  for (const [id, cancelledAt] of cancelledArchiveItems) {
-    if (Date.now() - cancelledAt > 60 * 60 * 1000) cancelledArchiveItems.delete(id);
-  }
-  await archiveCaptureSessions.cancelItem(itemId);
-  await archiveOutbox.discardItem(itemId);
+  await purgeArchivedItems([itemId]);
 };
 
 const scheduleArchiveOutboxRetry = async (): Promise<void> => {
@@ -839,6 +960,7 @@ const scheduleArchiveOutboxRetry = async (): Promise<void> => {
 };
 
 const triggerArchiveOutboxDrain = async (): Promise<void> => {
+  if (archiveWritesSuspended) return;
   if (typeof navigator !== "undefined" && navigator.onLine === false) return;
   try {
     const result = await archiveOutbox.drain(ARCHIVE_OUTBOX_DRAIN_LIMIT);
@@ -850,7 +972,7 @@ const triggerArchiveOutboxDrain = async (): Promise<void> => {
 };
 
 const queueServerArchive = async (itemId: string, archiveUrl: string): Promise<void> => {
-  if (cancelledArchiveItems.has(itemId)) return;
+  if (archiveWritesSuspended || cancelledArchiveItems.has(itemId)) return;
   await archiveOutbox.enqueueServerCapture(itemId, archiveUrl);
   sendProcessStatus(`archive-${itemId}`, "Offline preview", "processing", "Queued for capture.");
   void triggerArchiveOutboxDrain();
@@ -862,6 +984,7 @@ const capturePageArchiveForItem = async (input: {
   liveArchiveUrl?: string;
   tab?: chrome.tabs.Tab;
 }): Promise<void> => {
+  if (archiveWritesSuspended) return;
   cancelledArchiveItems.delete(input.itemId);
   const tabId = input.tab?.id;
   const liveUrl = normalizeHttpUrl(input.liveArchiveUrl || null);
@@ -916,7 +1039,7 @@ const capturePageArchiveForItem = async (input: {
     }
     if (!response?.success) throw new Error(response?.error || "ARCHIVE_CAPTURE_FAILED");
     if (archiveCaptureSessions.isOpen(sessionId)) throw new Error("ARCHIVE_CAPTURE_INCOMPLETE");
-    if (cancelledArchiveItems.has(input.itemId)) {
+    if (archiveWritesSuspended || cancelledArchiveItems.has(input.itemId)) {
       await archiveOutbox.discardItem(input.itemId);
       return;
     }
@@ -924,10 +1047,129 @@ const capturePageArchiveForItem = async (input: {
     void triggerArchiveOutboxDrain();
   } catch (error) {
     if (sessionId) await archiveCaptureSessions.abort(sessionId, tabId).catch(() => {});
-    if (cancelledArchiveItems.has(input.itemId)) return;
+    if (archiveWritesSuspended || cancelledArchiveItems.has(input.itemId)) return;
     console.warn("[archive] live page capture fell back to server capture", error);
     await queueServerArchive(input.itemId, input.archiveUrl);
   }
+};
+
+const deleteAllLocalDataOrchestrated = async (): Promise<{ deletedCollections: number }> => {
+  if (localDataResetInProgress) throw new Error("LOCAL_DATA_RESET_IN_PROGRESS");
+  localDataResetInProgress = true;
+  archiveWritesSuspended = true;
+  archiveOutbox.invalidateInFlight();
+  let result: { deletedCollections: number } | undefined;
+  let operationError: unknown;
+  let resetMarkerPersisted = false;
+  try {
+    await chrome.storage.local.set({
+      [LOCAL_DATA_RESET_STORAGE_KEY]: true,
+      [LOCAL_DATA_RESET_EPOCH_STORAGE_KEY]: Date.now(),
+    });
+    resetMarkerPersisted = true;
+    cloudSyncRequestVersion += 1;
+    await sendForwardedToOffscreen({
+      service: "cloudSync",
+      type: "cancelAndClear",
+      payload: {},
+    });
+    await chrome.alarms.clear(CLOUD_SYNC_CONTINUATION_ALARM_NAME);
+    await chrome.alarms.clear(OPFS_MEDIA_RECONCILE_CONTINUATION_ALARM_NAME);
+    await chrome.storage.local.remove(OPFS_MEDIA_RECONCILE_CURSOR_KEY);
+    await clearMetadataPipelineData();
+    await archiveCaptureSessions.cancelAll();
+    browserBookmarkAutoSyncEnabled = false;
+    browserBookmarkAutoSyncEnabledLoad = null;
+    await chrome.storage.local.set({ [BROWSER_BOOKMARK_AUTO_SYNC_ENABLED_KEY]: false });
+    await browserBookmarkResyncScheduler.reset();
+    await Promise.allSettled([
+      ...Array.from(activeBackgroundDataJobs),
+      ...Array.from(activeOffscreenRequests),
+    ]);
+    // Jobs already unwinding when cancellation started may have queued a final
+    // cloud reference. Clear once more after every tracked writer is settled.
+    await sendForwardedToOffscreen({
+      service: "cloudSync",
+      type: "cancelAndClear",
+      payload: {},
+    });
+    await chrome.storage.local.remove([IMPORT_DRAFTS_KEY, IMPORT_LRU_FOLDERS_KEY]);
+    failedImportAttempts.clear();
+    pendingScreenshots.clear();
+    hoverSaveTargetsByTab.clear();
+    recentProcessStatuses.clear();
+    const payload = await sendForwardedToOffscreen<{ deletedCollections: number }>({
+      service: "dbManager",
+      type: "deleteAllData",
+      payload: {},
+    });
+    // The offscreen operation clears persisted bytes after its collection
+    // deletes commit. Repeat through the live background owners so a stale
+    // in-memory drain/session cannot recreate state after the wipe.
+    await archiveOutbox.clear();
+    await archiveCache.clear();
+    await chrome.alarms.clear(ARCHIVE_OUTBOX_RETRY_ALARM_NAME);
+    cancelledArchiveItems.clear();
+    // Repeat volatile/persisted cleanup after the durable wipe. Any job that
+    // was already unwinding when reset began has now settled and cannot
+    // repopulate these stores.
+    await clearMetadataPipelineData();
+    await chrome.storage.local.remove([IMPORT_DRAFTS_KEY, IMPORT_LRU_FOLDERS_KEY]);
+    failedImportAttempts.clear();
+    pendingScreenshots.clear();
+    hoverSaveTargetsByTab.clear();
+    result = payload;
+  } catch (error) {
+    operationError = error;
+  } finally {
+    let cleanupError: unknown;
+    const completed = operationError === undefined && result !== undefined;
+    // A failed, partially completed wipe intentionally keeps its durable
+    // marker. The next worker startup (or an explicit retry) resumes the wipe
+    // rather than silently accepting the partial state as complete.
+    if (completed || !resetMarkerPersisted) {
+      try {
+        await chrome.storage.local.remove(LOCAL_DATA_RESET_STORAGE_KEY);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    localDataResetRecoveryRequired = (!completed && resetMarkerPersisted) || cleanupError !== undefined;
+    archiveWritesSuspended = localDataResetRecoveryRequired;
+    localDataResetInProgress = false;
+    if (cleanupError !== undefined) {
+      if (operationError !== undefined) {
+        throw new AggregateError(
+          [operationError, cleanupError],
+          "LOCAL_DATA_RESET_AND_MARKER_CLEANUP_FAILED",
+        );
+      }
+      throw cleanupError;
+    }
+  }
+  if (operationError !== undefined) throw operationError;
+  if (!result) throw new Error("LOCAL_DATA_RESET_RESULT_MISSING");
+  return result;
+};
+
+let localDataResetRecoveryInFlight: Promise<boolean> | null = null;
+const recoverInterruptedLocalDataReset = (): Promise<boolean> => {
+  if (localDataResetRecoveryInFlight) return localDataResetRecoveryInFlight;
+  const recovery = (async () => {
+    const resetState = await chrome.storage.local.get(LOCAL_DATA_RESET_STORAGE_KEY);
+    if (resetState[LOCAL_DATA_RESET_STORAGE_KEY] !== true) {
+      localDataResetRecoveryRequired = false;
+      archiveWritesSuspended = false;
+      return false;
+    }
+    console.warn("[storage] completing an interrupted local-data reset");
+    await deleteAllLocalDataOrchestrated();
+    return true;
+  })().finally(() => {
+    localDataResetRecoveryInFlight = null;
+  });
+  localDataResetRecoveryInFlight = recovery;
+  return recovery;
 };
 
 const retryPendingLocalMetadataUrls = async (): Promise<number> => {
@@ -1105,7 +1347,7 @@ const importBrowserBookmarks = async (
 const browserBookmarkResyncScheduler = new BrowserBookmarkResyncScheduler({
   isEnabled: isBrowserBookmarkAutoSyncEnabled,
   runSync: async () => {
-    await importBrowserBookmarks({ silent: true, afterInFlight: true });
+    await runBackgroundDataJob(() => importBrowserBookmarks({ silent: true, afterInFlight: true }));
   },
   createFallbackAlarm: async (when) => {
     await chrome.alarms.create(BROWSER_BOOKMARK_RESYNC_ALARM_NAME, { when });
@@ -3307,7 +3549,7 @@ const openDraftEditor = async (draftId: string) => {
   await chrome.windows.create({ url: url.toString(), type: "popup", width: 500, height: 760, focused: true });
 };
 
-const runImportAction = async (
+const runImportActionImpl = async (
   target: ImportTarget,
   context: ImportClickContext,
   tab?: chrome.tabs.Tab
@@ -3416,6 +3658,12 @@ const runImportAction = async (
   });
 };
 
+const runImportAction = (
+  target: ImportTarget,
+  context: ImportClickContext,
+  tab?: chrome.tabs.Tab,
+) => runBackgroundDataJob(() => runImportActionImpl(target, context, tab));
+
 // Re-file an already-saved item into a folder chosen from the post-save picker.
 // The item was saved immediately, so this is an optional correction — it never
 // blocks the original one-click save.
@@ -3460,7 +3708,7 @@ const scheduleScreenshotPostImportWork = (itemId: string, pageUrl: string): void
   })();
 };
 
-const runExtractTextAction = async (
+const runExtractTextActionImpl = async (
   target: ImportTarget,
   context: ImportClickContext,
   tab?: chrome.tabs.Tab
@@ -3513,6 +3761,12 @@ const runExtractTextAction = async (
   );
 };
 
+const runExtractTextAction = (
+  target: ImportTarget,
+  context: ImportClickContext,
+  tab?: chrome.tabs.Tab,
+) => runBackgroundDataJob(() => runExtractTextActionImpl(target, context, tab));
+
 type PendingScreenshot = {
   pendingId: string;
   context: ImportClickContext;
@@ -3553,7 +3807,7 @@ const buildDestinationPickerSpaces = async (): Promise<DestinationPickerSpace[]>
     .sort((a, b) => (lruSpaceRank.get(b.spaceId) ?? 0) - (lruSpaceRank.get(a.spaceId) ?? 0));
 };
 
-const runScreenshotAction = async (
+const runScreenshotActionImpl = async (
   target: ImportTarget,
   context: ImportClickContext,
   tab?: chrome.tabs.Tab
@@ -3639,6 +3893,12 @@ const runScreenshotAction = async (
     }
   );
 };
+
+const runScreenshotAction = (
+  target: ImportTarget,
+  context: ImportClickContext,
+  tab?: chrome.tabs.Tab,
+) => runBackgroundDataJob(() => runScreenshotActionImpl(target, context, tab));
 
 const finalizeScreenshotSave = async (
   pendingId: string,
@@ -3812,16 +4072,39 @@ const fetchShareSnapshot = async (url: string): Promise<ShareSnapshotV1> => {
   // endpoint instead of the viewer's HTML page.
   const pair = sharePairFromShareUrl(normalized);
   const fetchUrl = pair ? `${SHARE_WORKER_JSON_BASE}/s/${pair}.json` : normalized;
-  const response = await fetch(fetchUrl, {
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) throw new Error(`SHARE_FETCH_FAILED_${response.status}`);
-  const body = (await response.json()) as PublicShareResponse | ShareSnapshotV1;
-  if ((body as ShareSnapshotV1).schemaVersion === 1) return body as ShareSnapshotV1;
-  if ((body as PublicShareResponse).snapshot?.schemaVersion === 1) {
-    return (body as PublicShareResponse).snapshot as ShareSnapshotV1;
-  }
-  throw new Error("SHARE_SNAPSHOT_MISSING");
+  return fetchWithTimeout(
+    fetchUrl,
+    {
+      headers: { Accept: "application/json" },
+      credentials: "omit",
+      cache: "no-store",
+    },
+    SHARE_SNAPSHOT_FETCH_TIMEOUT_MS,
+    "SHARE_FETCH_TIMEOUT",
+    async (response, signal) => {
+      if (!response.ok) throw new Error(`SHARE_FETCH_FAILED_${response.status}`);
+      let text: string;
+      try {
+        text = await readBoundedResponseText(response, signal, SHARE_SNAPSHOT_MAX_BYTES);
+      } catch (error) {
+        if (error instanceof Error && error.message === "GOOGLE_API_RESPONSE_TOO_LARGE") {
+          throw new Error("SHARE_SNAPSHOT_TOO_LARGE");
+        }
+        throw error;
+      }
+      let body: PublicShareResponse | ShareSnapshotV1;
+      try {
+        body = JSON.parse(text) as PublicShareResponse | ShareSnapshotV1;
+      } catch {
+        throw new Error("SHARE_SNAPSHOT_INVALID_JSON");
+      }
+      if ((body as ShareSnapshotV1).schemaVersion === 1) return body as ShareSnapshotV1;
+      if ((body as PublicShareResponse).snapshot?.schemaVersion === 1) {
+        return (body as PublicShareResponse).snapshot as ShareSnapshotV1;
+      }
+      throw new Error("SHARE_SNAPSHOT_MISSING");
+    },
+  );
 };
 const importSharedLink = async (url: string, targetSpaceId = PUBLIC_SPACE_ID) => {
   const jobId = `share-import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3861,10 +4144,6 @@ const isTrustedExtensionSender = (sender: chrome.runtime.MessageSender) => {
     return false;
   }
 };
-const isSearchOnlyOffscreenCall = (message: any) =>
-  SEARCH_ONLY_OFFSCREEN_METHODS.has(`${message?.service || ""}:${message?.type || ""}`);
-const isInternalOnlyOffscreenCall = (message: any) =>
-  INTERNAL_ONLY_OFFSCREEN_METHODS.has(`${message?.service || ""}:${message?.type || ""}`);
 const isSpaceUnlocked = async (spaceId: string): Promise<boolean> => {
   if (!spaceId || spaceId !== PRIVATE_SPACE_ID) return true;
   try {
@@ -4094,7 +4373,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     if (menuId === MENU_IMPORT_SHARED_ID) {
       const sharedUrl = pickSharedUrl(context);
       if (!sharedUrl) throw new Error("No VibeSearch shared link found.");
-      await importSharedLink(sharedUrl, PUBLIC_SPACE_ID);
+      await runBackgroundDataJob(() => importSharedLink(sharedUrl, PUBLIC_SPACE_ID));
       return;
     }
 
@@ -4173,6 +4452,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 
 chrome.runtime.onStartup.addListener(() => {
   void (async () => {
+    if (await recoverInterruptedLocalDataReset()) return;
     await setupOffscreenDocument();
     await chrome.runtime.sendMessage({
       type: "TRIGGER_EMBEDDING",
@@ -4183,6 +4463,8 @@ chrome.runtime.onStartup.addListener(() => {
     await retryPendingLocalMetadataUrls();
     await triggerCloudSync();
     await archiveOutbox.cleanup();
+    await reconcileOrphanedOpfsMedia();
+    await reconcileArchivedItemsWithDatabase();
     await triggerArchiveOutboxDrain();
     requestBrowserBookmarkResync();
   })().catch(() => {});
@@ -4231,12 +4513,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       await retryStoredFailedMetadataUrls();
       await retryPendingLocalMetadataUrls();
     } else if (alarm.name === ARCHIVE_OUTBOX_ALARM_NAME || alarm.name === ARCHIVE_OUTBOX_RETRY_ALARM_NAME) {
+      await reconcileArchivedItemsWithDatabase();
       await triggerArchiveOutboxDrain();
     } else if (alarm.name === CONNECTOR_SYNC_ALARM || alarm.name === CONNECTOR_CONTINUATION_ALARM) {
       await refreshConnectorCloudAuth();
       await onConnectorAlarm();
     } else if (alarm.name === "opfs-promote-alarm") {
-      triggerOpfsPromotion();
+      await Promise.allSettled([triggerOpfsPromotion(), reconcileOrphanedOpfsMedia()]);
+    } else if (alarm.name === OPFS_MEDIA_RECONCILE_CONTINUATION_ALARM_NAME) {
+      await reconcileOrphanedOpfsMedia();
     }
   })().catch(() => {});
 });
@@ -4436,6 +4721,42 @@ const triggerOpfsPromotion = (): Promise<void> => {
   return promotion;
 };
 
+let opfsMediaReconcileInFlight: Promise<void> | null = null;
+const reconcileOrphanedOpfsMedia = (): Promise<void> => {
+  if (opfsMediaReconcileInFlight) return opfsMediaReconcileInFlight;
+  const run = (async () => {
+    const cursorState = await chrome.storage.local.get(OPFS_MEDIA_RECONCILE_CURSOR_KEY);
+    const afterId = typeof cursorState[OPFS_MEDIA_RECONCILE_CURSOR_KEY] === "string"
+      ? cursorState[OPFS_MEDIA_RECONCILE_CURSOR_KEY]
+      : "";
+    const result = await sendForwardedToOffscreen<{
+      scanned: number;
+      deleted: number;
+      nextCursor: string | null;
+      hasMore: boolean;
+    }>({
+      service: "items",
+      type: "reconcileOrphanedOpfsItemDirectories",
+      payload: { afterId, limit: 5_000 },
+    });
+    if (result.hasMore && result.nextCursor && result.nextCursor > afterId) {
+      await chrome.storage.local.set({
+        [OPFS_MEDIA_RECONCILE_CURSOR_KEY]: result.nextCursor,
+      });
+      await chrome.alarms.create(OPFS_MEDIA_RECONCILE_CONTINUATION_ALARM_NAME, {
+        when: Date.now() + 1_000,
+      });
+      return;
+    }
+    await chrome.storage.local.remove(OPFS_MEDIA_RECONCILE_CURSOR_KEY);
+    await chrome.alarms.clear(OPFS_MEDIA_RECONCILE_CONTINUATION_ALARM_NAME);
+  })().finally(() => {
+    opfsMediaReconcileInFlight = null;
+  });
+  opfsMediaReconcileInFlight = run;
+  return run;
+};
+
 type ProcessingTriggerType = "TRIGGER_EMBEDDING" | "TRIGGER_OCR";
 
 const isProcessingTrigger = (type: unknown): type is ProcessingTriggerType =>
@@ -4455,10 +4776,25 @@ const forwardProcessingTriggerToOffscreen = async (
   if (!response?.success) throw new Error(response?.error || `${type} failed`);
 };
 
-// Attempt promotion on startup
-void triggerOpfsPromotion();
-void triggerCloudSync();
-void archiveOutbox.cleanup().then(() => triggerArchiveOutboxDrain()).catch(() => {});
+// Attempt repair and promotion on startup. An interrupted user-requested wipe
+// takes precedence over every sync/import path and is completed before any of
+// them are allowed to start.
+void (async () => {
+  if (await recoverInterruptedLocalDataReset()) return;
+  void triggerOpfsPromotion();
+  void triggerCloudSync();
+  await setupOffscreenDocument();
+  // Staged files can contain a full library, so do not let unrelated cache
+  // repair failures prevent their expiry cleanup.
+  await cleanupStagedPayloads();
+  await Promise.allSettled([
+    archiveCache.cleanup(),
+    archiveOutbox.cleanup(),
+    reconcileOrphanedOpfsMedia(),
+  ]);
+  await reconcileArchivedItemsWithDatabase();
+  await triggerArchiveOutboxDrain();
+})().catch(() => {});
 
 // Listen for connectivity regain (service worker context: self)
 if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
@@ -4529,6 +4865,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: false, error: "UNAUTHORIZED_CONTEXT" });
     return true;
   }
+  if (
+    message?.target === "background" &&
+    GOOGLE_WORKSPACE_MESSAGE_TYPES.has(String(message?.type || "")) &&
+    (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender))
+  ) {
+    sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+    return true;
+  }
+  if (
+    message?.target === "background" &&
+    LOCAL_BACKUP_MESSAGE_TYPES.has(String(message?.type || "")) &&
+    (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender))
+  ) {
+    sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+    return true;
+  }
+  if (
+    message?.target === "background" &&
+    NOTION_MESSAGE_TYPES.has(String(message?.type || "")) &&
+    (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender))
+  ) {
+    sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+    return true;
+  }
 
   if (message?.target === "background" && message?.type === PAGE_ARCHIVE_CHUNK_MESSAGE) {
     if (archiveSenderTabId === null) {
@@ -4592,6 +4952,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.target === "background" && message?.type === "ARCHIVE_ITEMS_PURGED") {
+    if (!isTrustedExtensionSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    const itemIds = Array.isArray(message?.payload?.itemIds)
+      ? message.payload.itemIds
+          .filter((itemId: unknown): itemId is string => typeof itemId === "string")
+          .slice(0, 2_000)
+      : [];
+    void purgeArchivedItems(itemIds)
+      .then(() => sendResponse({ success: true }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Archive cleanup failed",
+      }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "OPFS_MEDIA_RECONCILE_REQUESTED") {
+    if (!isTrustedExtensionSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void reconcileOrphanedOpfsMedia()
+      .then(() => sendResponse({ success: true }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "OPFS media reconciliation failed",
+      }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "DELETE_ALL_LOCAL_DATA") {
+    if (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void deleteAllLocalDataOrchestrated()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Delete all data failed",
+      }));
+    return true;
+  }
+
   if (message?.target === "background" && message?.type === "CLOUD_SYNC_QUEUED") {
     if (isTrustedExtensionSender(sender)) {
       void triggerCloudSync().then(() => triggerArchiveOutboxDrain());
@@ -4624,7 +5031,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: false, error: "UNAUTHORIZED_SHARE_IMPORT" });
       return true;
     }
-    void importSharedLink(senderUrl, PUBLIC_SPACE_ID)
+    void runBackgroundDataJob(() => importSharedLink(senderUrl, PUBLIC_SPACE_ID))
       .then(() => sendResponse({ success: true }))
       .catch((error) =>
         sendResponse({ success: false, error: error instanceof Error ? error.message : "Share import failed." })
@@ -4637,7 +5044,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
       return true;
     }
-    void importBrowserBookmarks()
+    void runBackgroundDataJob(() => importBrowserBookmarks())
       .then((payload) => sendResponse({ success: true, payload }))
       .catch((error) =>
         sendResponse({ success: false, error: error instanceof Error ? error.message : "Browser bookmark import failed." })
@@ -4651,7 +5058,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
     const accessToken = typeof message?.payload?.accessToken === "string" ? message.payload.accessToken : "";
-    void importGitHubStars(accessToken)
+    void runBackgroundDataJob(() => importGitHubStars(accessToken))
       .then((payload) => sendResponse({ success: true, payload }))
       .catch((error) =>
         sendResponse({ success: false, error: error instanceof Error ? error.message : "GitHub stars import failed." })
@@ -4883,16 +5290,58 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.target === "background" && message?.type === "SHARE_IMPORT_FROM_URL") {
-    void (async () => {
+    void runBackgroundDataJob(async () => {
       const url = normalizeHttpUrl(typeof message?.payload?.url === "string" ? message.payload.url : "");
       if (!url) throw new Error("INVALID_SHARE_URL");
       const targetSpaceId =
         typeof message?.payload?.targetSpaceId === "string" ? message.payload.targetSpaceId : PUBLIC_SPACE_ID;
       const result = await importSharedLink(url, targetSpaceId);
       sendResponse({ success: true, payload: result });
-    })().catch((error) =>
+    }).catch((error) =>
       sendResponse({ success: false, error: error instanceof Error ? error.message : "Share import failed" })
     );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "LOCAL_BACKUP_BUILD_DOWNLOAD") {
+    void runBackgroundDataJob(() => sendForwardedToOffscreen({
+      service: "dbManager",
+      type: "buildLocalExtensionMigrationDownload",
+      payload: {},
+    }))
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Local backup export failed",
+      }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "LOCAL_BACKUP_STAGE_FILE") {
+    void runBackgroundDataJob(() => sendForwardedToOffscreen({
+      service: "dbManager",
+      type: "stageLocalExtensionMigrationFile",
+      payload: { fileName: message?.payload?.fileName },
+    }))
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Local backup validation failed",
+      }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "LOCAL_BACKUP_RESTORE_STAGED") {
+    void runBackgroundDataJob(() => sendForwardedToOffscreen({
+      service: "dbManager",
+      type: "restoreStagedLocalExtensionMigrationBundle",
+      payload: { stageId: message?.payload?.stageId },
+    }))
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Local backup restore failed",
+      }));
     return true;
   }
 
@@ -4901,6 +5350,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then((payload) => sendResponse({ success: true, payload }))
       .catch((error) =>
         sendResponse({ success: false, error: error instanceof Error ? error.message : "Google sync status failed" })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "GOOGLE_AUTH_STATUS") {
+    void connectGoogleWorkspace({ interactive: false })
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "Google auth status failed" })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "GOOGLE_AUTH_CONNECT") {
+    void connectGoogleWorkspace({ interactive: true })
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "Google connection failed" })
       );
     return true;
   }
@@ -4924,26 +5391,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.target === "background" && message?.type === "GOOGLE_BACKUP_RESTORE") {
-    void (async () => {
+    void runBackgroundDataJob(async () => {
       const fileId = typeof message?.payload?.fileId === "string" ? message.payload.fileId : "";
       if (!fileId) throw new Error("GOOGLE_BACKUP_FILE_ID_MISSING");
       sendProcessStatus("google-backup-restore", "Google backup", "processing", "Downloading backup...");
-      const snapshot = await downloadGoogleWorkspaceBackup(fileId);
+      const backupBlob = await downloadGoogleWorkspaceBackupBlob(fileId);
+      const stagedFileName = await stagePayloadFile(backupBlob, "drive-import");
       sendProcessStatus(
         "google-backup-restore",
         "Google backup",
         "processing",
-        `Merging ${snapshot.items.length.toLocaleString()} items...`
+        "Validating and merging the downloaded backup..."
       );
-      const payload = await sendForwardedToOffscreen({
-        service: "dbManager",
-        type: "mergeBackupSnapshot",
-        payload: { snapshot },
-      });
+      let payload: unknown;
+      try {
+        payload = await sendForwardedToOffscreen({
+          service: "dbManager",
+          type: "mergeBackupSnapshotFile",
+          payload: { fileName: stagedFileName },
+        });
+      } finally {
+        await deleteStagedPayloadFile(stagedFileName).catch(() => {});
+      }
       scheduleContextMenuRefresh("high");
       sendProcessStatus("google-backup-restore", "Google backup", "success", "Backup merged.");
       sendResponse({ success: true, payload });
-    })().catch((error) => {
+    }).catch((error) => {
       const detail = error instanceof Error ? error.message : "Google backup restore failed";
       sendProcessStatus("google-backup-restore", "Google backup", "error", detail);
       sendResponse({ success: false, error: detail });
@@ -4952,18 +5425,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.target === "background" && message?.type === "GOOGLE_SYNC_EXPORT_ALL") {
-    void (async () => {
+    void runBackgroundDataJob(async () => {
       sendProcessStatus("google-sync", "Google sync", "processing", "Building local export...");
-      const snapshot = await sendForwardedToOffscreen<ShareSnapshotV1>({
+      const staged = await sendForwardedToOffscreen<{
+        fileName: string;
+        itemCount: number;
+        folderCount: number;
+      }>({
         service: "dbManager",
-        type: "buildExportSnapshot",
+        type: "buildExportSnapshotFile",
         payload: { title: "VibeSearch export" },
       });
-      sendProcessStatus("google-sync", "Google sync", "processing", `Syncing ${snapshot.items.length} items...`);
-      const payload = await syncSnapshotToGoogleWorkspace(snapshot, { interactive: true });
-      sendProcessStatus("google-sync", "Google sync", "success", `Synced ${snapshot.items.length} items.`);
+      const snapshotFile = await takeStagedPayloadFile(staged.fileName);
+      sendProcessStatus("google-sync", "Google sync", "processing", `Syncing ${staged.itemCount} items...`);
+      const payload = await syncSnapshotFileToGoogleWorkspace(
+        snapshotFile,
+        { itemCount: staged.itemCount, folderCount: staged.folderCount },
+        { interactive: true },
+      );
+      sendProcessStatus(
+        "google-sync",
+        "Google backup",
+        "success",
+        `Backed up ${staged.itemCount} items to Drive.`,
+      );
       sendResponse({ success: true, payload });
-    })().catch((error) => {
+    }).catch((error) => {
       const detail = error instanceof Error ? error.message : "Google sync failed";
       sendProcessStatus("google-sync", "Google sync", "error", detail);
       sendResponse({ success: false, error: detail });
@@ -4971,8 +5458,87 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.target === "background" && message?.type === "NOTION_AUTH_STATUS") {
+    void getNotionConnectionStatus()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Notion auth status failed",
+      }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "NOTION_AUTH_CONNECT") {
+    void connectNotion()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Notion connection failed",
+      }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "NOTION_AUTH_DISCONNECT") {
+    void disconnectNotion()
+      .then(() => sendResponse({ success: true, payload: { disconnected: true } }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Notion disconnect failed",
+      }));
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "NOTION_EXPORT_ALL") {
+    void runBackgroundDataJob(async () => {
+      sendProcessStatus("notion-export", "Notion export", "processing", "Connecting to Notion...");
+      const token = await getNotionAccessToken({ interactive: true });
+      const page = await createNotionExportPage(token);
+      let itemCount = 0;
+      let afterId = "";
+      try {
+        while (true) {
+          const batch = await sendForwardedToOffscreen<NotionExportBatch>({
+            service: "dbManager",
+            type: "getNotionExportBatch",
+            payload: { afterId, limit: NOTION_EXPORT_BATCH_SIZE },
+          });
+          if (batch.items.length === 0) break;
+          if (itemCount + batch.items.length > NOTION_EXPORT_MAX_ITEMS) {
+            throw new Error("NOTION_EXPORT_ITEM_LIMIT");
+          }
+          await appendNotionExportItems(token, page.id, batch.items);
+          itemCount += batch.items.length;
+          sendProcessStatus(
+            "notion-export",
+            "Notion export",
+            "processing",
+            `Exported ${itemCount.toLocaleString()} items...`,
+          );
+          if (!batch.hasMore || !batch.nextCursor) break;
+          afterId = batch.nextCursor;
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Notion export failed";
+        throw new Error(`${detail}. Partial page: ${page.url}`);
+      }
+      const payload = { pageId: page.id, pageUrl: page.url, itemCount };
+      sendProcessStatus(
+        "notion-export",
+        "Notion export",
+        "success",
+        `Exported ${itemCount.toLocaleString()} items.`,
+      );
+      sendResponse({ success: true, payload });
+    }).catch((error) => {
+      const detail = error instanceof Error ? error.message : "Notion export failed";
+      sendProcessStatus("notion-export", "Notion export", "error", detail);
+      sendResponse({ success: false, error: detail });
+    });
+    return true;
+  }
+
   if (message?.target === "background" && typeof message?.type === "string" && message.type.startsWith("IMPORT_")) {
-    void handleImportControlMessage(message, sender)
+    void runBackgroundDataJob(() => handleImportControlMessage(message, sender))
       .then((result) => sendResponse(result))
       .catch((error) =>
         sendResponse({ success: false, error: error instanceof Error ? error.message : "Unknown error" })
@@ -5007,7 +5573,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  void (async () => {
+  if (localDataResetInProgress || localDataResetRecoveryRequired) {
+    sendResponse({ success: false, error: "LOCAL_DATA_RESET_IN_PROGRESS" });
+    return true;
+  }
+
+  const forwardedRequest = trackOffscreenRequest((async () => {
     try {
       if (import.meta.env.MODE === "development" && FORCE_DEV_OFFSCREEN_RESET) {
         try {
@@ -5025,7 +5596,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  })();
+  })());
+  void forwardedRequest;
 
   return true;
 });

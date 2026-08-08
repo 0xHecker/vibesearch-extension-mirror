@@ -38,6 +38,10 @@ class SpaceSessionService {
     this.sessions.delete(spaceId);
   }
 
+  lockAll(): void {
+    this.sessions.clear();
+  }
+
   touchSpace(spaceId: string): boolean {
     this.expireIdleSessions();
     const entry = this.sessions.get(spaceId);

@@ -13,7 +13,8 @@ one governing rule.
 
 Implementation: `share-snapshot.ts`, `share.service.ts`, `content/share-bridge.ts`,
 `sync.service.ts`, `vector-maintenance-journal.service.ts`, `google-workspace-sync.ts`,
-`google-auth.ts`, `local-extension-migration.ts`, plus `db-manager.ts` snapshot glue.
+`google-auth.ts`, `notion-auth.ts`, `notion-export.ts`, `local-extension-migration.ts`, plus
+`db-manager.ts` snapshot glue.
 
 ## The snapshot — one portable format
 
@@ -23,11 +24,11 @@ A `ShareSnapshotV1` is the common currency for sharing and backup. It's a plain 
 ShareSnapshotV1
 ├─ schemaVersion: 1
 ├─ source        { kind: "folder"|"folders"|"items", ids[] }
-├─ spaceGroups[] { id, name, sortOrder, isCollapsed }
+├─ spaceGroups[] { id, name, parentGroupId?, sortOrder, isCollapsed }
 ├─ spaces[]      { id, name, slug?, spaceGroupId?, isPrivate? }      ← no password material
-├─ folders[]     { id, name, spaceId?, parentId?, type }
-├─ items[]       { id, title, textContent, ocrText, url, source, media?, … }   ← no vectors
-├─ tags[]        { id, name, color? }
+├─ folders[]     { id, name, spaceId?, parentId?, type, pin/collapse state }
+├─ items[]       { id, title, textContent, ocrText, url, source, media?, hierarchy, … } ← no vectors
+├─ tags[]        { id, name, color?, isFavorite? }
 ├─ itemTags[]    { itemId, tagId }
 └─ warnings[]    { code, itemId?, detail? }
 ```
@@ -113,31 +114,44 @@ live in `share.service.ts` against `/v1/shares`.
 `buildExportSnapshot` (→ `buildLocalExportSnapshot`) produces a whole-library `ShareSnapshotV1`;
 importing it runs through `mergeBackupSnapshot`. Simple, portable, no account.
 
-### Google Drive (+ Sheets)
+### Google Drive
 
 Opt-in, via Settings → Connectors → Google. OAuth uses `chrome.identity.getAuthToken` with a
-`launchWebAuthFlow` fallback (`drive.file` + `spreadsheets` scopes). `syncSnapshotToGoogleWorkspace`
-writes the same snapshot to **two** destinations:
+`launchWebAuthFlow` fallback and requests only `drive.file`. The backup is one owned,
+app-marked JSON file:
 
 ```mermaid
 flowchart LR
-    SNAP["library snapshot"] --> SHEETS["Google Sheets 'VibeSearch Export'<br/>tabs: Items · Folders · Spaces · Tags · Item Tags · Media"]
-    SNAP --> DRIVE["Drive: vibesearch-export.json<br/>(multipart upload)"]
+    SNAP["library snapshot"] --> DRIVE["Drive: vibesearch-export.json<br/>(multipart or resumable upload)"]
     DRIVE --> LIST["list backups (Drive query)"]
     LIST --> REST["download → mergeBackupSnapshot"]
 ```
 
-State (spreadsheet id, drive file id, last sync) is kept in `chrome.storage.local`
-(`vs_google_workspace_sync_v1`); a stale id that 404s triggers recreate. Restore lists the JSON
-backups in Drive and merges the chosen one.
+Drive target ids are kept in a bounded, account-keyed map in `chrome.storage.local`
+(`vs_google_workspace_sync_v1`). Before updating or restoring, the extension verifies that a
+file is live, JSON, and owned by the connected account. App properties let a retry rediscover a
+file if Drive committed a create but the response or local state write was interrupted.
+
+### Notion export
+
+Notion is an explicit readable export, not a restorable backup. Settings → Connectors starts a
+public OAuth flow; the Cloudflare API exchanges/refreshes the token because Notion requires a
+server-side client secret, but the actual library rows go directly from the extension to
+`api.notion.com`. The extension creates one private workspace-level page and streams at most 80
+live items per DB/API batch. Each bullet retains the link, space/folder path, tags, favorite state,
+timestamp, and a bounded summary/text excerpt. Rate limits and transient 5xx responses honor
+`Retry-After`; bodies and responses have hard byte limits. Full fidelity and restore remain the
+responsibility of local JSON or Drive backups.
 
 ### Migrating from an older local extension
 
 `local-extension-migration.ts` handles a **full** transfer (distinct from the portable snapshot):
-a self-contained bundle with **every** RxDB collection dump **plus the OPFS media bytes
-base64-encoded**. On restore, collections are bulk-upserted in batches, media is rehydrated into
-OPFS, and — per the portability rule — items are reset to re-embed. Large bundles are staged in
-memory by `stageId` with a TTL so a giant JSON blob isn't retained longer than the restore.
+a self-contained bundle with **every** RxDB collection dump, referenced OPFS media, and retained
+offline archive HTML (including authoritative pending uploads), with binary bytes base64-encoded.
+Private-space password material and folder encryption keys are excluded. Collection reads use
+bounded keyset pages with a running JSON budget; cross-context handoff uses temporary OPFS files
+instead of extension messages. On restore, collections and files are restored in bounded batches,
+items are reset to re-embed, and temporary payload files are deleted after use or startup expiry.
 
 ### The restore-metadata queue
 

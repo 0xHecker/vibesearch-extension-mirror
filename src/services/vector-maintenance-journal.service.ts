@@ -115,6 +115,12 @@ class VectorMaintenanceJournalService {
       detail,
     });
   }
+
+  public async remove(): Promise<void> {
+    const db = await getDb();
+    const doc = await db.getLocal<VectorMaintenanceJournal>(JOURNAL_ID);
+    await doc?.remove();
+  }
 }
 
 export const vectorMaintenanceJournalService = new VectorMaintenanceJournalService();

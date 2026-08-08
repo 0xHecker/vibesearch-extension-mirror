@@ -464,7 +464,8 @@ export const FlatItem = memo(({
                 <button
                   type="button"
                   className="cursor-pointer hover:text-foreground-secondary transition-colors duration-300"
-                  aria-label="Preview"
+                  aria-label="View archived copy"
+                  title="View archived copy"
                   onClick={() => setIsPreviewOpen(true)}
                 >
                   <EyeOpen size={20} />

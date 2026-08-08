@@ -851,6 +851,30 @@ export class VectorStoreService {
     );
   };
 
+  /** Remove every vector artifact without recreating an empty main file. */
+  public deleteAllStorageFiles = async (): Promise<void> => {
+    await this.runWithSearchesPaused(async () => {
+      await this.withMemoryActivity(() =>
+        this.withLock(async () => {
+          await this.waitForVectorReaders();
+          this.opfsHandler.close();
+          const root = await navigator.storage.getDirectory();
+          for (const fileName of ["vectors.bin", "vectors.tmp", "vectors.bak"]) {
+            try {
+              await root.removeEntry(fileName);
+            } catch (error) {
+              if (!(error instanceof DOMException) || error.name !== "NotFoundError") throw error;
+            }
+          }
+          this.isInitialized = false;
+          this.initializePromise = null;
+          this.vectorCount = 0;
+          this.queryEmbeddingCache.clear();
+        })
+      );
+    });
+  };
+
   public generateAndStoreEmbeddings = async (payload: {
     sentences: string[];
     priority?: "interactive" | "background";

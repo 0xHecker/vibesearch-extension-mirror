@@ -42,6 +42,7 @@ WHAT YOU CAN DO
 • Import — your browser bookmarks and your GitHub stars, with previews fetched automatically.
 • Share — send a space, folder, or selection as a link (optional PIN, revocable).
 • Back up & restore — to a JSON file or your own Google Drive.
+• Export to Notion — create a private, readable catalog page in your workspace.
 
 PRIVACY
 • Your search index and AI vectors stay on your device; synced library records and page previews
@@ -50,7 +51,7 @@ PRIVACY
 • No ads, no third-party tracking, no account needed.
 • When you save a link, its URL is sent to Vibesearch's metadata service to fetch a title and
   preview image. Saved images are stored in Vibesearch media storage so they're durable and
-  shareable. Sharing, Google Drive backup, and GitHub import are opt-in.
+  shareable. Sharing, Google Drive backup, Notion export, and GitHub import are opt-in.
 See the full privacy policy: 〈hosted PRIVACY.md URL〉
 ```
 
@@ -85,9 +86,10 @@ Paste each next to its permission in the dashboard.
 | `contextMenus` | Provide right-click "Save to Vibesearch" / "Extract text" / "Screenshot" actions. |
 | `alarms` | Schedule background indexing, embedding, and periodic vector maintenance. |
 | `offscreen` | Run the database, search index, and AI (embedding/OCR) pipelines in a persistent offscreen document; the service worker can't hold this state or file handles. |
-| `identity` | Sign in to the user's Google account (only when they connect Google) to back up/restore to their own Drive. |
+| `identity` | Run user-initiated Google Drive and Notion OAuth connection flows. |
 | **Host: Vibesearch services** (`metadata-worker.watermelons.workers.dev`, `share-worker.watermelons.workers.dev`, `share.vibesearch.app`, `bucket.vibesearch.app`, `preview-bucket.vibesearch.app`) | Fetch link previews, download the AI models, store saved media, and create/import shares. |
-| **Host: Google** (`accounts.google.com`, `www.googleapis.com`, `sheets.googleapis.com`) | Optional backup/restore to the user's own Google Drive/Sheets. |
+| **Host: Google** (`accounts.google.com`, `www.googleapis.com`) | Optional backup/restore of one app-created JSON file in the user's own Google Drive. |
+| **Host: Notion** (`api.notion.com`) | Optional, user-initiated export of a readable private catalog page to the user's own Notion workspace. |
 | **Host: GitHub** (`api.github.com`) | Optional, user-initiated import of the user's GitHub stars. |
 | **Site access** (`http://*/*`, `https://*/*`) | The lightweight content script supports right-click/hover save. Full rendered DOM capture starts only after the user saves that page. The archive feature adds no new broad host permission or `pageCapture`. |
 
@@ -111,8 +113,8 @@ OCR runtime, inside a sandboxed page). No remote JS is fetched or eval'd.
 Answer the certification form as follows (verify against your final build):
 
 - **Personally identifiable information:** No (no name/email/account collected).
-- **Authentication information:** Yes — a GitHub token and Google sign-in, **stored locally on
-  the device**, used only to talk to those services on the user's behalf.
+- **Authentication information:** Yes — a GitHub token plus Google and Notion sign-in tokens,
+  **stored locally on the device**, used only to talk to those services on the user's behalf.
 - **Web history:** Collected in the sense that **saved** URLs are sent to metadata and sync
   services. Browsing history at large is not collected.
 - **User-generated content:** Yes — synced saved items, rendered offline page snapshots, and

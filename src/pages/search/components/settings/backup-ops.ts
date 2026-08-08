@@ -3,7 +3,16 @@ import type {
   LocalExtensionMigrationSummary,
   RestoreLocalExtensionMigrationResult,
 } from "@src/services/local-extension-migration";
-import type { GoogleDriveBackup } from "@src/services/google-workspace-sync";
+import { LOCAL_MIGRATION_MAX_JSON_BYTES } from "@src/services/local-extension-migration";
+import { createLocalMigrationJsonBlob } from "@src/services/local-extension-migration-json";
+import {
+  stagePayloadFile,
+  takeStagedPayloadFile,
+} from "@src/services/large-payload-staging";
+import type {
+  GoogleDriveBackup,
+  GoogleWorkspaceSyncResult,
+} from "@src/services/google-workspace-sync";
 import type { MergeBackupSnapshotResult } from "@src/services/share-snapshot";
 
 /**
@@ -17,18 +26,19 @@ export type StagedLocalMigration = {
   summary: LocalExtensionMigrationSummary;
 };
 
+export type StagedLocalMigrationDownload = {
+  fileName: string;
+  createdAt: number;
+  summary: LocalExtensionMigrationSummary;
+  warnings: string[];
+};
+
 export type {
   LocalExtensionMigrationBundle,
   LocalExtensionMigrationSummary,
   RestoreLocalExtensionMigrationResult,
   GoogleDriveBackup,
   MergeBackupSnapshotResult,
-};
-
-const callOffscreen = async <T,>(service: string, type: string, payload: unknown): Promise<T> => {
-  const response = await chrome.runtime.sendMessage({ service, type, target: "offscreen", payload });
-  if (!response?.success) throw new Error(response?.error || `${type} failed`);
-  return response.payload as T;
 };
 
 const callBackground = async <T,>(type: string, payload?: unknown): Promise<T> => {
@@ -41,22 +51,44 @@ export const formatDateForFile = (value: number) =>
   new Date(value).toISOString().replace(/[:.]/g, "-");
 
 export const formatMigrationSummary = (summary: LocalExtensionMigrationSummary) =>
-  `${summary.collections.items} items, ${summary.collections.folders} folders, ${summary.collections.spaces} spaces, ${summary.opfsFileCount} local media files`;
+  `${summary.collections.items} items, ${summary.collections.folders} folders, ${summary.collections.spaces} spaces, ${summary.opfsFileCount} local media files, ${summary.archiveFileCount} offline archives`;
 
-export const buildBackupBundle = () =>
-  callOffscreen<LocalExtensionMigrationBundle>("dbManager", "buildLocalExtensionMigrationBundle", {});
+export const buildBackupDownload = () =>
+  callBackground<StagedLocalMigrationDownload>("LOCAL_BACKUP_BUILD_DOWNLOAD");
 
-export const stageBackupBundle = (json: string) =>
-  callOffscreen<StagedLocalMigration>("dbManager", "stageLocalExtensionMigrationBundle", { json });
+export const stageBackupFile = async (file: File): Promise<StagedLocalMigration> => {
+  assertBackupFileSize(file.size);
+  const fileName = await stagePayloadFile(file, "local-import");
+  return callBackground<StagedLocalMigration>("LOCAL_BACKUP_STAGE_FILE", { fileName });
+};
+
+export const assertBackupFileSize = (byteSize: number): void => {
+  if (!Number.isSafeInteger(byteSize) || byteSize <= 0) {
+    throw new Error("That backup file is empty or invalid.");
+  }
+  if (byteSize > LOCAL_MIGRATION_MAX_JSON_BYTES) {
+    throw new Error(
+      `That backup is larger than the safe ${(LOCAL_MIGRATION_MAX_JSON_BYTES / (1024 * 1024)).toFixed(0)} MB restore limit.`,
+    );
+  }
+};
 
 export const restoreStagedBundle = (stageId: string) =>
-  callOffscreen<RestoreLocalExtensionMigrationResult>(
-    "dbManager",
-    "restoreStagedLocalExtensionMigrationBundle",
-    { stageId }
-  );
+  callBackground<RestoreLocalExtensionMigrationResult>("LOCAL_BACKUP_RESTORE_STAGED", { stageId });
 
 export const listDriveBackups = () => callBackground<GoogleDriveBackup[]>("GOOGLE_BACKUP_LIST");
+
+export const createDriveBackup = () =>
+  callBackground<GoogleWorkspaceSyncResult>("GOOGLE_SYNC_EXPORT_ALL");
+
+export type NotionExportResult = {
+  pageId: string;
+  pageUrl: string;
+  itemCount: number;
+};
+
+export const exportToNotion = () =>
+  callBackground<NotionExportResult>("NOTION_EXPORT_ALL");
 
 export const restoreDriveBackup = (fileId: string) =>
   callBackground<MergeBackupSnapshotResult>("GOOGLE_BACKUP_RESTORE", { fileId });
@@ -71,9 +103,9 @@ export const rebuildVectorIndex = async () => {
   if (!response?.success) throw new Error(response?.error || "Vector indexing failed");
 };
 
-/** Wipe every local collection + OPFS media. Destructive and irreversible. */
+/** Wipe every local collection + OPFS media/archive payload. Destructive and irreversible. */
 export const deleteAllLocalData = () =>
-  callOffscreen<{ deletedCollections: number }>("dbManager", "deleteAllData", {});
+  callBackground<{ deletedCollections: number }>("DELETE_ALL_LOCAL_DATA");
 
 export const summarizeBundle = (
   bundle: LocalExtensionMigrationBundle
@@ -82,16 +114,27 @@ export const summarizeBundle = (
     Object.entries(bundle.collections).map(([name, rows]) => [name, rows.length])
   ) as LocalExtensionMigrationSummary["collections"],
   opfsFileCount: bundle.opfsFiles.length,
+  archiveFileCount: bundle.archiveFiles.length,
   warningCount: bundle.warnings.length,
 });
 
+/**
+ * Build a valid backup payload without creating a second library-sized string.
+ * Binary fields are already base64 strings, so keeping each file as its own
+ * Blob part prevents the browser from retaining both one giant JSON string and
+ * the final Blob at the same time.
+ */
+export const createBackupJsonBlob = createLocalMigrationJsonBlob;
+
 /** Trigger a browser download of the migration bundle as JSON. */
-export const downloadBackupBundle = (bundle: LocalExtensionMigrationBundle) => {
-  const blob = new Blob([JSON.stringify(bundle)], { type: "application/json" });
-  const href = URL.createObjectURL(blob);
+export const downloadStagedBackup = async (
+  staged: StagedLocalMigrationDownload,
+): Promise<void> => {
+  const file = await takeStagedPayloadFile(staged.fileName);
+  const href = URL.createObjectURL(file);
   const anchor = document.createElement("a");
   anchor.href = href;
-  anchor.download = `vibesearch-extension-migration-${formatDateForFile(bundle.createdAt)}.json`;
+  anchor.download = `vibesearch-extension-migration-${formatDateForFile(staged.createdAt)}.json`;
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();

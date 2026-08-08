@@ -9,6 +9,15 @@ import { forEachIdKeysetPage } from "@src/services/rxdb-keyset-pagination";
 
 const REFERENCE_SCAN_PAGE_SIZE = 200;
 
+export const requestOpfsMediaReconciliation = (): void => {
+  try {
+    void chrome.runtime.sendMessage({
+      target: "background",
+      type: "OPFS_MEDIA_RECONCILE_REQUESTED",
+    })?.catch?.(() => {});
+  } catch {}
+};
+
 type OpfsFileDeletion = {
   opfsPath: string;
   expectedIdentity?: OpfsFileIdentity;

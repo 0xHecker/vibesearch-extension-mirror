@@ -14,6 +14,8 @@ import {
   withLiveSpaceDestination,
 } from "@src/services/live-destination";
 import { checkedRxBulkWrite } from "@src/services/rxdb-bulk-write";
+import { forEachIdKeysetPage } from "@src/services/rxdb-keyset-pagination";
+import { GOOGLE_BACKUP_MAX_BYTES } from "@src/services/google-backup-limits";
 
 export type ShareSourceKind = "folder" | "folders" | "items";
 
@@ -55,6 +57,16 @@ export type SharedItem = {
   displayImageUrl?: string;
   createdAt?: number;
   updatedAt?: number;
+  /** Present only in the user's private portable backup, never public shares. */
+  isFavorite?: boolean;
+  type?: ItemDocType["type"];
+  fields?: ItemDocType["fields"];
+  blocks?: ItemDocType["blocks"];
+  blobs?: ItemDocType["blobs"];
+  summary?: ItemDocType["summary"];
+  ai?: ItemDocType["ai"];
+  parentId?: string | null;
+  chunkOrder?: number;
 };
 
 export type SharedFolder = {
@@ -64,6 +76,10 @@ export type SharedFolder = {
   parentId?: string | null;
   type?: "folder" | "tab_group";
   sortOrder?: number;
+  isPinned?: boolean;
+  isCollapsed?: boolean;
+  createdAt?: number;
+  updatedAt?: number;
 };
 
 export type SharedSpace = {
@@ -73,14 +89,22 @@ export type SharedSpace = {
   spaceGroupId?: string | null;
   sortOrder?: number;
   isPrivate?: boolean;
+  createdAt?: number;
+  updatedAt?: number;
 };
 
-export type SharedSpaceGroup = Pick<SpaceGroupDocType, "id" | "name" | "sortOrder" | "isCollapsed">;
+export type SharedSpaceGroup = Pick<
+  SpaceGroupDocType,
+  "id" | "name" | "sortOrder" | "isCollapsed" | "parentGroupId" | "createdAt" | "updatedAt"
+>;
 
 export type SharedTag = {
   id: string;
   name: string;
   color?: string | null;
+  isFavorite?: boolean;
+  createdAt?: number;
+  updatedAt?: number;
 };
 
 export type SharedItemTag = {
@@ -96,6 +120,8 @@ export type ShareSnapshotWarning = {
 
 export type ShareSnapshotV1 = {
   schemaVersion: 1;
+  /** Marks snapshots built by the private backup exporter with rich metadata semantics. */
+  backupMetadataVersion?: 1;
   title: string;
   description?: string;
   createdAt: number;
@@ -119,6 +145,12 @@ export type BuildExportSnapshotPayload = {
     kind?: ShareSourceKind;
     ids?: string[];
   };
+};
+
+export type BuildLocalExportSnapshotOptions = {
+  /** Test/diagnostic override; production never exceeds the Drive file limit. */
+  maxEstimatedJsonBytes?: number;
+  pageSize?: number;
 };
 
 export type ImportSharedSnapshotPayload = {
@@ -288,9 +320,9 @@ export async function buildShareSnapshotFromMixed(
   for (const spaceId of input.selection.spaceIds) {
     targetSpaceIds.add(spaceId);
   }
-  for (const groupId of input.selection.spaceGroupIds) {
-    for (const space of allSpaces) {
-      if (space.raw.spaceGroupId === groupId) targetSpaceIds.add(space.raw.id);
+  for (const space of allSpaces) {
+    if (space.raw.spaceGroupId && input.selection.spaceGroupIds.has(space.raw.spaceGroupId)) {
+      targetSpaceIds.add(space.raw.id);
     }
   }
 
@@ -300,18 +332,19 @@ export async function buildShareSnapshotFromMixed(
   for (const folder of allFolders) {
     if (targetSpaceIds.has(folder.raw.spaceId)) contentFolderIds.add(folder.raw.id);
   }
-  let expandedFolderSet = true;
-  while (expandedFolderSet) {
-    expandedFolderSet = false;
-    for (const folder of allFolders) {
-      if (
-        folder.raw.parentId &&
-        contentFolderIds.has(folder.raw.parentId) &&
-        !contentFolderIds.has(folder.raw.id)
-      ) {
-        contentFolderIds.add(folder.raw.id);
-        expandedFolderSet = true;
-      }
+  const childrenByParentId = new Map<string, string[]>();
+  for (const folder of allFolders) {
+    if (!folder.raw.parentId) continue;
+    const children = childrenByParentId.get(folder.raw.parentId) || [];
+    children.push(folder.raw.id);
+    childrenByParentId.set(folder.raw.parentId, children);
+  }
+  const folderExpansionQueue = Array.from(contentFolderIds);
+  for (let index = 0; index < folderExpansionQueue.length; index += 1) {
+    for (const childId of childrenByParentId.get(folderExpansionQueue[index]) || []) {
+      if (contentFolderIds.has(childId)) continue;
+      contentFolderIds.add(childId);
+      folderExpansionQueue.push(childId);
     }
   }
 
@@ -335,8 +368,7 @@ export async function buildShareSnapshotFromMixed(
   const includedSpaceIds = new Set<string>();
   const includedFolders = allFolders.filter((folder) => {
     if (!targetFolderIds.has(folder.raw.id)) return false;
-    const spaceExists = allSpaces.some((space) => space.raw.id === folder.raw.spaceId);
-    if (!spaceExists) return false;
+    if (!liveSpaceIds.has(folder.raw.spaceId)) return false;
     includedSpaceIds.add(folder.raw.spaceId);
     return true;
   });
@@ -348,8 +380,17 @@ export async function buildShareSnapshotFromMixed(
       // Item selected but its folder wasn't resolved — keep it anyway with undefined folderId.
       return true;
     }
+    const owningSpaceId =
+      liveFolderSpaceById.get(item.raw.folderId) || item.raw.spaceId || PUBLIC_SPACE_ID;
+    if (targetSpaceIds.has(owningSpaceId)) return true;
     return item.raw.folderId ? contentFolderIds.has(item.raw.folderId) : false;
   });
+
+  for (const item of includedItems) {
+    const owningSpaceId =
+      liveFolderSpaceById.get(item.raw.folderId) || item.raw.spaceId || PUBLIC_SPACE_ID;
+    if (liveSpaceIds.has(owningSpaceId)) includedSpaceIds.add(owningSpaceId);
+  }
 
   // Spaces: any space that owns an included folder.
   const includedSpaces = allSpaces.filter((space) => includedSpaceIds.has(space.raw.id));
@@ -365,17 +406,17 @@ export async function buildShareSnapshotFromMixed(
 
   // Tags + itemTags: only for included items.
   const includedItemIds = new Set(includedItems.map((item) => item.raw.id));
+  const liveItemTagRows = itemTagDocs.map((doc) => doc.toMutableJSON() as ItemTagDocType);
+  const referencedTagIds = new Set(
+    liveItemTagRows
+      .filter((join) => includedItemIds.has(join.itemId))
+      .map((join) => join.tagId),
+  );
   const includedTagsRaw = tagDocs
     .map((doc) => doc.toMutableJSON() as TagDocType)
-    .filter((tag) =>
-      itemTagDocs.some((join) => {
-        const joinData = join.toMutableJSON() as ItemTagDocType;
-        return joinData.tagId === tag.id && includedItemIds.has(joinData.itemId);
-      })
-    );
+    .filter((tag) => referencedTagIds.has(tag.id));
   const includedTagIds = new Set(includedTagsRaw.map((tag) => tag.id));
-  const includedItemTags = itemTagDocs
-    .map((doc) => doc.toMutableJSON() as ItemTagDocType)
+  const includedItemTags = liveItemTagRows
     .filter((join) => includedItemIds.has(join.itemId) && includedTagIds.has(join.tagId));
 
   // Derive source kind + source ids for the share record.
@@ -410,52 +451,103 @@ export async function buildShareSnapshotFromMixed(
     items: includedItems.map((item) => item.sanitized),
     tags: includedTagsRaw.map((tag) => sanitizeTag(tag)),
     itemTags: includedItemTags.map((join) => sanitizeItemTag(join)),
-warnings,
+    warnings,
   };
 }
 
 export async function buildLocalExportSnapshot(
-  payload: BuildExportSnapshotPayload = {}
+  payload: BuildExportSnapshotPayload = {},
+  options: BuildLocalExportSnapshotOptions = {},
 ): Promise<ShareSnapshotV1> {
   const db = await getDb();
-  const [spaceGroupDocs, spaceDocs, folderDocs, itemDocs, tagDocs, itemTagDocs] = await Promise.all([
-    db.space_groups.find().exec(),
-    db.spaces.find({ selector: { ...LIVE_SPACE_SELECTOR } }).exec(),
-    db.folders.find().exec(),
-    db.items.find({ selector: { deletedAt: { $eq: 0 } } }).exec(),
-    db.tags.find().exec(),
-    db.item_tags.find().exec(),
-  ]);
-
-  const spaceGroups = spaceGroupDocs.map((doc) =>
-    sanitizeSpaceGroup(doc.toMutableJSON() as SpaceGroupDocType)
+  const maxEstimatedJsonBytes = Math.max(
+    1_024,
+    Math.min(
+      GOOGLE_BACKUP_MAX_BYTES,
+      Math.floor(options.maxEstimatedJsonBytes ?? GOOGLE_BACKUP_MAX_BYTES),
+    ),
   );
-  const spaces = spaceDocs
-    .map((doc) => doc.toMutableJSON() as SpaceDocType)
-    .filter((space) => (space.deletedAt || 0) === 0 && space.isArchived !== true)
-    .map((space) => sanitizeSpace(space));
+  const pageSize = Math.max(1, Math.min(1_000, Math.floor(options.pageSize ?? 400)));
+  const encoder = new TextEncoder();
+  let estimatedJsonBytes = Math.min(64 * 1024, Math.floor(maxEstimatedJsonBytes / 4));
+  const reserveRow = (row: unknown): void => {
+    estimatedJsonBytes += encoder.encode(JSON.stringify(row)).byteLength + 1;
+    if (estimatedJsonBytes > maxEstimatedJsonBytes) {
+      throw new Error("GOOGLE_BACKUP_TOO_LARGE");
+    }
+  };
+  const readPages = async (
+    collection: any,
+    selector: Record<string, unknown>,
+    onRow: (row: any) => void,
+  ): Promise<void> => {
+    await forEachIdKeysetPage({
+      collection,
+      selector,
+      pageSize,
+      onPage: (documents) => {
+        for (const document of documents) {
+          onRow((document as { toMutableJSON(): unknown }).toMutableJSON());
+        }
+      },
+    });
+  };
+
+  // Keep only one bounded RxDB page alive at a time. Each sanitized row is
+  // charged against the final Drive JSON budget before it joins the retained
+  // snapshot, preventing a post-materialization OOM on oversized libraries.
+  const spaceGroups: SharedSpaceGroup[] = [];
+  await readPages(db.space_groups, {}, (row: SpaceGroupDocType) => {
+    const sanitized = sanitizeSpaceGroup(row);
+    reserveRow(sanitized);
+    spaceGroups.push(sanitized);
+  });
+
+  const spaces: SharedSpace[] = [];
+  await readPages(db.spaces, { ...LIVE_SPACE_SELECTOR }, (row: SpaceDocType) => {
+    if ((row.deletedAt || 0) !== 0 || row.isArchived === true) return;
+    const sanitized = sanitizeSpace(row);
+    reserveRow(sanitized);
+    spaces.push(sanitized);
+  });
   const spaceIds = new Set(spaces.map((space) => space.id));
-  const folders = folderDocs
-    .map((doc) => doc.toMutableJSON() as FolderDocType)
-    .filter((folder) => (folder.deletedAt || 0) === 0)
-    .map((folder) => sanitizeFolder(folder))
-    .filter((folder) => !folder.spaceId || spaceIds.has(folder.spaceId));
+
+  const folders: SharedFolder[] = [];
+  await readPages(db.folders, {}, (row: FolderDocType) => {
+    if ((row.deletedAt || 0) !== 0) return;
+    const sanitized = sanitizeFolder(row);
+    if (sanitized.spaceId && !spaceIds.has(sanitized.spaceId)) return;
+    reserveRow(sanitized);
+    folders.push(sanitized);
+  });
   const folderIds = new Set(folders.map((folder) => folder.id));
 
   const warnings: ShareSnapshotWarning[] = [];
-  const items = itemDocs
-    .map((doc) => doc.toMutableJSON() as ItemDocType)
-    .filter((item) =>
-      item.folderId ? folderIds.has(item.folderId) : spaceIds.has(item.spaceId || PUBLIC_SPACE_ID)
-    )
-    .map((item) => sanitizeItem(item, warnings));
+  const items: SharedItem[] = [];
+  await readPages(db.items, { deletedAt: { $eq: 0 } }, (row: ItemDocType) => {
+    if (row.folderId ? !folderIds.has(row.folderId) : !spaceIds.has(row.spaceId || PUBLIC_SPACE_ID)) {
+      return;
+    }
+    const sanitized = sanitizeItem(row, warnings, { includeBackupMetadata: true });
+    reserveRow(sanitized);
+    items.push(sanitized);
+  });
   const itemIds = new Set(items.map((item) => item.id));
 
-  const tags = tagDocs.map((doc) => sanitizeTag(doc.toMutableJSON() as TagDocType));
+  const tags: SharedTag[] = [];
+  await readPages(db.tags, {}, (row: TagDocType) => {
+    const sanitized = sanitizeTag(row);
+    reserveRow(sanitized);
+    tags.push(sanitized);
+  });
   const tagIds = new Set(tags.map((tag) => tag.id));
-  const itemTags = itemTagDocs
-    .map((doc) => sanitizeItemTag(doc.toMutableJSON() as ItemTagDocType))
-    .filter((join) => itemIds.has(join.itemId) && tagIds.has(join.tagId));
+  const itemTags: SharedItemTag[] = [];
+  await readPages(db.item_tags, {}, (row: ItemTagDocType) => {
+    const sanitized = sanitizeItemTag(row);
+    if (!itemIds.has(sanitized.itemId) || !tagIds.has(sanitized.tagId)) return;
+    reserveRow(sanitized);
+    itemTags.push(sanitized);
+  });
 
   const sourceIds = normalizeSourceIds(payload.source?.ids);
   const fallbackSourceIds = folders.length > 0 ? folders.map((folder) => folder.id) : items.map((item) => item.id);
@@ -463,6 +555,7 @@ export async function buildLocalExportSnapshot(
 
   return {
     schemaVersion: 1,
+    backupMetadataVersion: 1,
     title: normalizeTitle(payload.title, "VibeSearch export"),
     description: normalizeText(payload.description, 1000),
     createdAt: Date.now(),
@@ -551,7 +644,7 @@ export async function importSharedSnapshot(
   const tagIdMap = new Map<string, string>();
   const importedTags: TagDocType[] = [];
   for (const tag of snapshot.tags) {
-    const name = normalizeTitle(tag.name, "");
+    const name = normalizeEntityName(tag.name, "", 100);
     if (!name) continue;
     const existing = await db.tags.findOne({ selector: { name: { $eq: name }, userId: { $eq: "user1" } } }).exec();
     const tagId = existing ? (existing.get("id") as string) : crypto.randomUUID();
@@ -652,14 +745,21 @@ async function mergeBackupSnapshotLocked(
     .map((warning) => warning.detail)
     .filter((detail): detail is string => typeof detail === "string" && detail.length > 0);
 
-  const [existingSpaceDocs, existingFolderDocs, existingItemDocs, existingTagDocs] =
+  const [existingSpaceGroupDocs, existingSpaceDocs, existingFolderDocs, existingItemDocs, existingTagDocs] =
     await Promise.all([
+      db.space_groups.find().exec(),
       db.spaces.find().exec(),
       db.folders.find().exec(),
       db.items.find().exec(),
       db.tags.find().exec(),
     ]);
 
+  const existingSpaceGroups = new Map(
+    existingSpaceGroupDocs.map((doc) => [
+      doc.get("id") as string,
+      doc.toMutableJSON() as SpaceGroupDocType,
+    ])
+  );
   const existingSpaces = new Map(
     existingSpaceDocs.map((doc) => [doc.get("id") as string, doc.toMutableJSON() as SpaceDocType])
   );
@@ -676,20 +776,98 @@ async function mergeBackupSnapshotLocked(
     Array.from(existingTags.values()).map((tag) => [tag.name.trim().toLowerCase(), tag])
   );
 
+  const snapshotTimestamp = normalizeNumber(snapshot.createdAt) ?? now;
+  const sourceTimestamp = (updatedAt: unknown): number =>
+    normalizeNumber(updatedAt) ?? snapshotTimestamp;
+  const authoritativeBackupMetadata = snapshot.backupMetadataVersion === 1;
+  const useSourceField = (row: object, field: string): boolean =>
+    authoritativeBackupMetadata || Object.prototype.hasOwnProperty.call(row, field);
+
+  const spaceGroups: SpaceGroupDocType[] = [];
+  const requestedParentByGroupId = new Map<string, string | null>();
+  const seenSpaceGroupIds = new Set<string>();
+  for (const source of snapshot.spaceGroups || []) {
+    if (seenSpaceGroupIds.has(source.id)) {
+      warnings.push(`Skipped duplicate space group id "${source.id}" in the backup.`);
+      continue;
+    }
+    seenSpaceGroupIds.add(source.id);
+    const existing = existingSpaceGroups.get(source.id);
+    const incomingUpdatedAt = sourceTimestamp(source.updatedAt);
+    if (existing && existing.updatedAt > incomingUpdatedAt) continue;
+    requestedParentByGroupId.set(
+      source.id,
+      useSourceField(source, "parentGroupId")
+        ? source.parentGroupId || null
+        : existing?.parentGroupId || null,
+    );
+    spaceGroups.push({
+      id: source.id,
+      name: normalizeEntityName(source.name, existing?.name || "Imported group", 80),
+      sortOrder: normalizeNumber(source.sortOrder) ?? existing?.sortOrder ?? now,
+      isCollapsed: useSourceField(source, "isCollapsed")
+        ? source.isCollapsed === true
+        : existing?.isCollapsed === true,
+      parentGroupId: null,
+      createdAt: existing?.createdAt || normalizeNumber(source.createdAt) || incomingUpdatedAt,
+      updatedAt: incomingUpdatedAt,
+    });
+  }
+  const prospectiveSpaceGroups = new Map(existingSpaceGroups);
+  for (const group of spaceGroups) prospectiveSpaceGroups.set(group.id, group);
+  for (const group of spaceGroups) {
+    const parentId = requestedParentByGroupId.get(group.id) || null;
+    group.parentGroupId = parentId && parentId !== group.id && prospectiveSpaceGroups.has(parentId)
+      ? parentId
+      : null;
+    if (parentId && !group.parentGroupId) {
+      warnings.push(`Restored space group "${group.name}" at the root because its parent is unavailable.`);
+    }
+  }
+  for (const group of spaceGroups) {
+    const seen = new Set([group.id]);
+    let cursor = group.parentGroupId || null;
+    while (cursor) {
+      if (seen.has(cursor)) {
+        group.parentGroupId = null;
+        warnings.push(`Restored space group "${group.name}" at the root to break a parent cycle.`);
+        break;
+      }
+      seen.add(cursor);
+      cursor = prospectiveSpaceGroups.get(cursor)?.parentGroupId || null;
+    }
+  }
+  await checkedRxBulkWrite(
+    "backup-restore.space-groups",
+    spaceGroups,
+    (rows) => db.space_groups.bulkUpsert(rows),
+  );
+
   const spaces: SpaceDocType[] = [];
   for (const source of snapshot.spaces) {
     const existing = existingSpaces.get(source.id);
+    const incomingUpdatedAt = sourceTimestamp(source.updatedAt);
+    if (existing && existing.updatedAt > incomingUpdatedAt) continue;
+    const requestedGroupId = useSourceField(source, "spaceGroupId")
+      ? source.spaceGroupId || UNGROUPED_SPACE_GROUP_ID
+      : existing?.spaceGroupId || UNGROUPED_SPACE_GROUP_ID;
+    const spaceGroupId = requestedGroupId && prospectiveSpaceGroups.has(requestedGroupId)
+      ? requestedGroupId
+      : UNGROUPED_SPACE_GROUP_ID;
+    if (requestedGroupId && !spaceGroupId) {
+      warnings.push(`Restored space "${source.name}" without its missing group.`);
+    }
     if (existing) {
       spaces.push({
         ...existing,
-        name: normalizeTitle(source.name, existing.name),
+        name: normalizeEntityName(source.name, existing.name, 80),
         slug: normalizeText(source.slug, 120) || existing.slug,
-        spaceGroupId: UNGROUPED_SPACE_GROUP_ID,
+        spaceGroupId,
         sortOrder: normalizeNumber(source.sortOrder) ?? existing.sortOrder,
         isArchived: false,
         deletedAt: 0,
         purgeAt: 0,
-        updatedAt: Math.max(existing.updatedAt, normalizeNumber(snapshot.createdAt) || now),
+        updatedAt: incomingUpdatedAt,
       });
       continue;
     }
@@ -701,17 +879,17 @@ async function mergeBackupSnapshotLocked(
     }
     spaces.push({
       id: source.id,
-      name: normalizeTitle(source.name, "Imported space"),
+      name: normalizeEntityName(source.name, "Imported space", 80),
       slug: normalizeText(source.slug, 120) || `imported-${source.id.slice(0, 24)}`,
-      spaceGroupId: UNGROUPED_SPACE_GROUP_ID,
+      spaceGroupId,
       isPrivate: false,
       autoLockMs: 15 * 60 * 1000,
       sortOrder: normalizeNumber(source.sortOrder) ?? now,
       isArchived: false,
       deletedAt: 0,
       purgeAt: 0,
-      createdAt: now,
-      updatedAt: now,
+      createdAt: normalizeNumber(source.createdAt) || incomingUpdatedAt,
+      updatedAt: incomingUpdatedAt,
     });
   }
   await checkedRxBulkWrite(
@@ -737,6 +915,8 @@ async function mergeBackupSnapshotLocked(
       continue;
     }
     const existing = existingFolders.get(source.id);
+    const incomingUpdatedAt = sourceTimestamp(source.updatedAt);
+    if (existing && existing.updatedAt > incomingUpdatedAt) continue;
     const requestedSpaceId = source.spaceId || existing?.spaceId || PUBLIC_SPACE_ID;
     const spaceId = liveSpaceIds.has(requestedSpaceId)
       ? requestedSpaceId
@@ -754,7 +934,12 @@ async function mergeBackupSnapshotLocked(
     }
 
     restoredFolderIds.add(source.id);
-    requestedParentByFolderId.set(source.id, source.parentId || null);
+    requestedParentByFolderId.set(
+      source.id,
+      useSourceField(source, "parentId")
+        ? source.parentId || null
+        : existing?.parentId || null,
+    );
     folders.push(
       existing
         ? {
@@ -762,12 +947,16 @@ async function mergeBackupSnapshotLocked(
             name: normalizeTitle(source.name, existing.name),
             spaceId,
             parentId: null,
-            type: source.type === "tab_group" ? "tab_group" : "folder",
+            type: useSourceField(source, "type")
+              ? source.type === "tab_group" ? "tab_group" : "folder"
+              : existing.type,
             sortOrder: normalizeNumber(source.sortOrder) ?? existing.sortOrder,
+            isPinned: useSourceField(source, "isPinned") ? source.isPinned === true : existing.isPinned,
+            isCollapsed: useSourceField(source, "isCollapsed") ? source.isCollapsed === true : existing.isCollapsed,
             deletedAt: 0,
             purgeAt: 0,
             isDirty: true,
-            updatedAt: Math.max(existing.updatedAt, normalizeNumber(snapshot.createdAt) || now),
+            updatedAt: incomingUpdatedAt,
           }
         : {
             id: source.id,
@@ -778,24 +967,30 @@ async function mergeBackupSnapshotLocked(
             type: source.type === "tab_group" ? "tab_group" : "folder",
             sortOrder: normalizeNumber(source.sortOrder) ?? now,
             isLocked: false,
-            isPinned: false,
-            isCollapsed: false,
+            isPinned: source.isPinned === true,
+            isCollapsed: source.isCollapsed === true,
             deletedAt: 0,
             purgeAt: 0,
             isDirty: true,
             serverVersion: 0,
-            createdAt: now,
-            updatedAt: now,
+            createdAt: normalizeNumber(source.createdAt) || incomingUpdatedAt,
+            updatedAt: incomingUpdatedAt,
           }
     );
   }
 
-  const restoredFolderById = new Map(folders.map((folder) => [folder.id, folder]));
+  const prospectiveFolders = new Map(existingFolders);
+  for (const folder of folders) prospectiveFolders.set(folder.id, folder);
   const parentByFolderId = new Map<string, string | null>();
   for (const folder of folders) {
     const parentId = requestedParentByFolderId.get(folder.id) || null;
-    const parent = parentId ? restoredFolderById.get(parentId) : undefined;
-    if (parent && parent.id !== folder.id && parent.spaceId === folder.spaceId) {
+    const parent = parentId ? prospectiveFolders.get(parentId) : undefined;
+    if (
+      parent &&
+      parent.id !== folder.id &&
+      parent.spaceId === folder.spaceId &&
+      (parent.deletedAt || 0) === 0
+    ) {
       parentByFolderId.set(folder.id, parent.id);
     } else {
       if (parentId) {
@@ -816,7 +1011,9 @@ async function mergeBackupSnapshotLocked(
         break;
       }
       seen.add(cursor);
-      cursor = parentByFolderId.get(cursor) || null;
+      cursor = parentByFolderId.has(cursor)
+        ? parentByFolderId.get(cursor) || null
+        : prospectiveFolders.get(cursor)?.parentId || null;
     }
     if (cyclic) {
       parentByFolderId.set(folder.id, null);
@@ -831,7 +1028,6 @@ async function mergeBackupSnapshotLocked(
     (rows) => db.folders.bulkUpsert(rows)
   );
 
-  const prospectiveFolders = new Map(existingFolders);
   for (const folder of folders) prospectiveFolders.set(folder.id, folder);
   const liveFolderCache = new Map<string, boolean>();
   const isLiveFolderDestination = (folderId: string): boolean => {
@@ -873,37 +1069,54 @@ async function mergeBackupSnapshotLocked(
 
   const items: ItemDocType[] = [];
   const restoredOrRetainedItemIds = new Set<string>();
+  const isLiveItemDestination = (item: ItemDocType): boolean =>
+    item.folderId
+      ? isLiveFolderDestination(item.folderId)
+      : liveSpaceIds.has(item.spaceId || PUBLIC_SPACE_ID);
   for (const source of snapshot.items) {
     const existing = existingItems.get(source.id);
-    const requestedFolderId = source.folderId || existing?.folderId || "";
+    const requestedFolderId = source.folderId ?? existing?.folderId ?? "";
     const folderId =
       requestedFolderId && isLiveFolderDestination(requestedFolderId)
         ? requestedFolderId
         : "";
-    if (!folderId) {
+    const requestedSpaceId = folderId
+      ? (prospectiveFolders.get(folderId) as FolderDocType).spaceId
+      : source.spaceId || existing?.spaceId || PUBLIC_SPACE_ID;
+    const spaceId = folderId
+      ? requestedSpaceId
+      : liveSpaceIds.has(requestedSpaceId)
+        ? requestedSpaceId
+        : fallbackSpaceId;
+    if (!spaceId) {
       warnings.push(
-        `Skipped item "${source.title}" because its folder or destination space is not live.`
+        `Skipped item "${source.title}" because its destination space is not live.`
       );
       continue;
     }
-    const destinationFolder = prospectiveFolders.get(folderId) as FolderDocType;
-    const spaceId = destinationFolder.spaceId;
+    if (requestedFolderId && !folderId) {
+      warnings.push(`Restored item "${source.title}" at the space root because its folder is unavailable.`);
+    }
     const incoming = toImportedItem(source, source.id, folderId, spaceId, now);
-    const sourceUpdatedAt = normalizeNumber(source.updatedAt) || now;
-    if (
-      existing &&
-      existing.updatedAt > sourceUpdatedAt &&
-      (existing.deletedAt || 0) === 0 &&
-      isLiveFolderDestination(existing.folderId)
-    ) {
-      restoredOrRetainedItemIds.add(existing.id);
+    const sourceUpdatedAt = sourceTimestamp(source.updatedAt);
+    if (existing && existing.updatedAt > sourceUpdatedAt) {
+      if ((existing.deletedAt || 0) === 0 && isLiveItemDestination(existing)) {
+        restoredOrRetainedItemIds.add(existing.id);
+      }
       continue;
     }
     items.push({
       ...incoming,
       userId: existing?.userId || incoming.userId,
-      isFavorite: existing?.isFavorite || false,
-      parentId: existing?.parentId || null,
+      ...(!existing || useSourceField(source, "isFavorite") ? {} : { isFavorite: existing.isFavorite }),
+      ...(!existing || useSourceField(source, "type") ? {} : { type: existing.type }),
+      ...(!existing || useSourceField(source, "fields") ? {} : { fields: existing.fields }),
+      ...(!existing || useSourceField(source, "blocks") ? {} : { blocks: existing.blocks }),
+      ...(!existing || useSourceField(source, "blobs") ? {} : { blobs: existing.blobs }),
+      ...(!existing || useSourceField(source, "summary") ? {} : { summary: existing.summary }),
+      ...(!existing || useSourceField(source, "ai") ? {} : { ai: existing.ai }),
+      ...(!existing || useSourceField(source, "parentId") ? {} : { parentId: existing.parentId }),
+      ...(!existing || useSourceField(source, "chunkOrder") ? {} : { chunkOrder: existing.chunkOrder }),
       createdAt: existing?.createdAt || incoming.createdAt,
       updatedAt: sourceUpdatedAt,
       vector_index: -1,
@@ -921,41 +1134,55 @@ async function mergeBackupSnapshotLocked(
   );
 
   const tagIdMap = new Map<string, string>();
-  const tags: TagDocType[] = [];
+  const tagsByTargetId = new Map<string, TagDocType>();
   for (const source of snapshot.tags) {
-    const name = normalizeTitle(source.name, "");
+    const name = normalizeEntityName(source.name, "", 100);
     if (!name) continue;
     const existing = existingTags.get(source.id) || existingTagsByName.get(name.toLowerCase());
     const tagId = existing?.id || source.id;
     tagIdMap.set(source.id, tagId);
-    tags.push({
+    const incomingUpdatedAt = sourceTimestamp(source.updatedAt);
+    if (existing && existing.updatedAt > incomingUpdatedAt) continue;
+    const restoredTag: TagDocType = {
       id: tagId,
       name,
       userId: existing?.userId || "user1",
       isDirty: true,
       serverVersion: existing?.serverVersion || 0,
-      createdAt: existing?.createdAt || now,
-      updatedAt: now,
-    });
+      color: useSourceField(source, "color")
+        ? normalizeText(source.color, 32) || null
+        : existing?.color || null,
+      isFavorite: useSourceField(source, "isFavorite")
+        ? source.isFavorite === true
+        : existing?.isFavorite === true,
+      createdAt: existing?.createdAt || normalizeNumber(source.createdAt) || incomingUpdatedAt,
+      updatedAt: incomingUpdatedAt,
+    };
+    const previous = tagsByTargetId.get(tagId);
+    if (!previous || restoredTag.updatedAt > previous.updatedAt) {
+      tagsByTargetId.set(tagId, restoredTag);
+    }
   }
+  const tags = Array.from(tagsByTargetId.values());
   await checkedRxBulkWrite(
     "backup-restore.tags",
     tags,
     (rows) => db.tags.bulkUpsert(rows)
   );
 
-  const itemTags = snapshot.itemTags
-    .map((source) => {
+  const itemTagsById = new Map<string, ItemTagDocType>();
+  for (const source of snapshot.itemTags) {
       const tagId = tagIdMap.get(source.tagId);
-      if (!restoredOrRetainedItemIds.has(source.itemId) || !tagId) return null;
-      return {
+      if (!restoredOrRetainedItemIds.has(source.itemId) || !tagId) continue;
+      const row = {
         id: `${source.itemId}|${tagId}`,
         itemId: source.itemId,
         tagId,
         userId: "user1",
       } as ItemTagDocType;
-    })
-    .filter((row): row is ItemTagDocType => row !== null);
+      itemTagsById.set(row.id, row);
+  }
+  const itemTags = Array.from(itemTagsById.values());
   await checkedRxBulkWrite(
     "backup-restore.item-tags",
     itemTags,
@@ -979,20 +1206,25 @@ async function mergeBackupSnapshotLocked(
 function sanitizeSpace(space: SpaceDocType): SharedSpace {
   return {
     id: space.id,
-    name: normalizeTitle(space.name, "Space"),
+    name: normalizeEntityName(space.name, "Space", 80),
     slug: normalizeText(space.slug, 120),
     spaceGroupId: space.spaceGroupId || null,
     sortOrder: normalizeNumber(space.sortOrder),
     isPrivate: space.isPrivate === true,
+    createdAt: normalizeNumber(space.createdAt),
+    updatedAt: normalizeNumber(space.updatedAt),
   };
 }
 
 function sanitizeSpaceGroup(group: SpaceGroupDocType): SharedSpaceGroup {
   return {
     id: group.id,
-    name: normalizeTitle(group.name, "Space group"),
+    name: normalizeEntityName(group.name, "Space group", 80),
     sortOrder: normalizeNumber(group.sortOrder) || 0,
     isCollapsed: group.isCollapsed === true,
+    parentGroupId: group.parentGroupId || null,
+    createdAt: normalizeNumber(group.createdAt) || 0,
+    updatedAt: normalizeNumber(group.updatedAt) || 0,
   };
 }
 
@@ -1004,10 +1236,18 @@ function sanitizeFolder(folder: FolderDocType): SharedFolder {
     parentId: folder.parentId || null,
     type: folder.type === "tab_group" ? "tab_group" : "folder",
     sortOrder: normalizeNumber(folder.sortOrder),
+    isPinned: folder.isPinned === true,
+    isCollapsed: folder.isCollapsed === true,
+    createdAt: normalizeNumber(folder.createdAt),
+    updatedAt: normalizeNumber(folder.updatedAt),
   };
 }
 
-function sanitizeItem(item: ItemDocType, warnings: ShareSnapshotWarning[]): SharedItem {
+function sanitizeItem(
+  item: ItemDocType,
+  warnings: ShareSnapshotWarning[],
+  options: { includeBackupMetadata?: boolean } = {},
+): SharedItem {
   const media = sanitizeMedia(item, warnings);
   return {
     id: item.id,
@@ -1026,6 +1266,19 @@ function sanitizeItem(item: ItemDocType, warnings: ShareSnapshotWarning[]): Shar
     displayImageUrl: normalizeUrl(item.displayImageUrl) || undefined,
     createdAt: normalizeNumber(item.createdAt),
     updatedAt: normalizeNumber(item.updatedAt),
+    ...(options.includeBackupMetadata
+      ? {
+          isFavorite: item.isFavorite === true,
+          type: normalizeText(item.type, 120) || undefined,
+          fields: item.fields ? structuredClone(item.fields) : undefined,
+          blocks: item.blocks ? structuredClone(item.blocks) : undefined,
+          blobs: item.blobs ? structuredClone(item.blobs) : undefined,
+          summary: normalizeText(item.summary, 20_000),
+          ai: item.ai ? structuredClone(item.ai) : undefined,
+          parentId: item.parentId || null,
+          chunkOrder: normalizeNumber(item.chunkOrder),
+        }
+      : {}),
   };
 }
 
@@ -1082,8 +1335,11 @@ function sanitizeOcr(value: MediaOcrMetadata | undefined): SharedMedia["ocr"] | 
 function sanitizeTag(tag: TagDocType): SharedTag {
   return {
     id: tag.id,
-    name: normalizeTitle(tag.name, "tag"),
+    name: normalizeEntityName(tag.name, "tag", 100),
     color: tag.color ?? null,
+    isFavorite: tag.isFavorite === true,
+    createdAt: normalizeNumber(tag.createdAt),
+    updatedAt: normalizeNumber(tag.updatedAt),
   };
 }
 
@@ -1098,11 +1354,286 @@ function validateSnapshot(value: unknown): ShareSnapshotV1 {
   if (!value || typeof value !== "object") throw new Error("SHARE_SNAPSHOT_INVALID");
   const snapshot = value as ShareSnapshotV1;
   if (snapshot.schemaVersion !== 1) throw new Error("SHARE_SNAPSHOT_VERSION_UNSUPPORTED");
-  if (!Array.isArray(snapshot.items)) throw new Error("SHARE_SNAPSHOT_ITEMS_INVALID");
-  if (!Array.isArray(snapshot.folders)) throw new Error("SHARE_SNAPSHOT_FOLDERS_INVALID");
-  if (!Array.isArray(snapshot.tags)) throw new Error("SHARE_SNAPSHOT_TAGS_INVALID");
-  if (!Array.isArray(snapshot.itemTags)) throw new Error("SHARE_SNAPSHOT_ITEM_TAGS_INVALID");
-  return snapshot;
+  if (snapshot.backupMetadataVersion !== undefined && snapshot.backupMetadataVersion !== 1) {
+    throw new Error("SHARE_SNAPSHOT_BACKUP_METADATA_VERSION_INVALID");
+  }
+  if (typeof snapshot.title !== "string" || !Number.isSafeInteger(snapshot.createdAt) || snapshot.createdAt < 0) {
+    throw new Error("SHARE_SNAPSHOT_INVALID");
+  }
+  if (
+    !snapshot.source ||
+    !["folder", "folders", "items"].includes(String(snapshot.source.kind)) ||
+    !Array.isArray(snapshot.source.ids) ||
+    snapshot.source.ids.length > SNAPSHOT_MAX_RECORDS_PER_COLLECTION
+  ) {
+    throw new Error("SHARE_SNAPSHOT_SOURCE_INVALID");
+  }
+  for (const id of snapshot.source.ids) assertSnapshotId(id, "SHARE_SNAPSHOT_SOURCE_INVALID");
+  const spaceGroups = snapshot.spaceGroups ?? [];
+  assertSnapshotRecordArray(spaceGroups, "SHARE_SNAPSHOT_SPACE_GROUPS_INVALID", (row) => {
+    assertSnapshotId(row.id, "SHARE_SNAPSHOT_SPACE_GROUP_INVALID");
+    if (typeof row.name !== "string") throw new Error("SHARE_SNAPSHOT_SPACE_GROUP_INVALID");
+    assertOptionalSnapshotReference(row.parentGroupId, 100, "SHARE_SNAPSHOT_SPACE_GROUP_INVALID");
+    assertOptionalSnapshotBoolean(row.isCollapsed, "SHARE_SNAPSHOT_SPACE_GROUP_INVALID");
+    assertOptionalSnapshotInteger(row.sortOrder, "SHARE_SNAPSHOT_SPACE_GROUP_INVALID");
+    assertOptionalSnapshotInteger(row.createdAt, "SHARE_SNAPSHOT_SPACE_GROUP_INVALID");
+    assertOptionalSnapshotInteger(row.updatedAt, "SHARE_SNAPSHOT_SPACE_GROUP_INVALID");
+  });
+  assertUniqueSnapshotKeys(
+    spaceGroups,
+    (row) => row.id,
+    "SHARE_SNAPSHOT_DUPLICATE_SPACE_GROUP_ID",
+  );
+  assertSnapshotRecordArray(snapshot.spaces, "SHARE_SNAPSHOT_SPACES_INVALID", (row) => {
+    assertSnapshotId(row.id, "SHARE_SNAPSHOT_SPACE_INVALID");
+    if (typeof row.name !== "string") throw new Error("SHARE_SNAPSHOT_SPACE_INVALID");
+    assertOptionalSnapshotString(row.slug, 120, "SHARE_SNAPSHOT_SPACE_INVALID");
+    assertOptionalSnapshotReference(row.spaceGroupId, 100, "SHARE_SNAPSHOT_SPACE_INVALID");
+    assertOptionalSnapshotBoolean(row.isPrivate, "SHARE_SNAPSHOT_SPACE_INVALID");
+    assertOptionalSnapshotInteger(row.sortOrder, "SHARE_SNAPSHOT_SPACE_INVALID");
+    assertOptionalSnapshotInteger(row.createdAt, "SHARE_SNAPSHOT_SPACE_INVALID");
+    assertOptionalSnapshotInteger(row.updatedAt, "SHARE_SNAPSHOT_SPACE_INVALID");
+  });
+  assertUniqueSnapshotKeys(
+    snapshot.spaces,
+    (row) => row.id,
+    "SHARE_SNAPSHOT_DUPLICATE_SPACE_ID",
+  );
+  assertSnapshotRecordArray(snapshot.folders, "SHARE_SNAPSHOT_FOLDERS_INVALID", (row) => {
+    assertSnapshotId(row.id, "SHARE_SNAPSHOT_FOLDER_INVALID");
+    if (typeof row.name !== "string") throw new Error("SHARE_SNAPSHOT_FOLDER_INVALID");
+    assertOptionalSnapshotReference(row.spaceId, 1_000, "SHARE_SNAPSHOT_FOLDER_INVALID");
+    assertOptionalSnapshotReference(row.parentId, 1_000, "SHARE_SNAPSHOT_FOLDER_INVALID");
+    if (row.type !== undefined && !["folder", "tab_group"].includes(String(row.type))) {
+      throw new Error("SHARE_SNAPSHOT_FOLDER_INVALID");
+    }
+    assertOptionalSnapshotBoolean(row.isPinned, "SHARE_SNAPSHOT_FOLDER_INVALID");
+    assertOptionalSnapshotBoolean(row.isCollapsed, "SHARE_SNAPSHOT_FOLDER_INVALID");
+    assertOptionalSnapshotInteger(row.sortOrder, "SHARE_SNAPSHOT_FOLDER_INVALID");
+    assertOptionalSnapshotInteger(row.createdAt, "SHARE_SNAPSHOT_FOLDER_INVALID");
+    assertOptionalSnapshotInteger(row.updatedAt, "SHARE_SNAPSHOT_FOLDER_INVALID");
+  });
+  assertUniqueSnapshotKeys(
+    snapshot.folders,
+    (row) => row.id,
+    "SHARE_SNAPSHOT_DUPLICATE_FOLDER_ID",
+  );
+  assertSnapshotRecordArray(snapshot.items, "SHARE_SNAPSHOT_ITEMS_INVALID", (row) => {
+    assertSnapshotId(row.id, "SHARE_SNAPSHOT_ITEM_INVALID");
+    if (typeof row.title !== "string" || typeof row.url !== "string") {
+      throw new Error("SHARE_SNAPSHOT_ITEM_INVALID");
+    }
+    assertOptionalSnapshotReference(row.folderId, 1_000, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotReference(row.spaceId, 1_000, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotReference(row.parentId, 100, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotBoolean(row.isFavorite, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotString(row.type, 200, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotNumber(row.chunkOrder, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotInteger(row.createdAt, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotInteger(row.updatedAt, "SHARE_SNAPSHOT_ITEM_INVALID");
+    assertOptionalSnapshotRecord(row.fields, "SHARE_SNAPSHOT_ITEM_FIELDS_INVALID");
+    assertOptionalSnapshotRecord(row.ai, "SHARE_SNAPSHOT_ITEM_AI_INVALID");
+    if (row.media !== undefined) {
+      assertSnapshotRecordArray(row.media, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID", (media) => {
+        if (
+          !["image", "video", "audio"].includes(String(media.type)) ||
+          !["hotlink", "s3"].includes(String(media.storageType))
+        ) {
+          throw new Error("SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        }
+        assertOptionalSnapshotNumber(media.width, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotNumber(media.height, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotInteger(media.capturedAt, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotRecord(media.ocr, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        if (media.ocr && typeof media.ocr === "object" && !Array.isArray(media.ocr)) {
+          const ocr = media.ocr as Record<string, unknown>;
+          if (
+            ocr.status !== undefined &&
+            !["pending", "processing", "done", "error", "skipped"].includes(String(ocr.status))
+          ) {
+            throw new Error("SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+          }
+          if (
+            ocr.confidence !== undefined &&
+            ocr.confidence !== null &&
+            (typeof ocr.confidence !== "number" || !Number.isFinite(ocr.confidence) || ocr.confidence < 0 || ocr.confidence > 1)
+          ) {
+            throw new Error("SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+          }
+          assertOptionalSnapshotInteger(ocr.lineCount, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+          assertOptionalSnapshotInteger(ocr.extractedAt, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+          assertOptionalSnapshotString(ocr.text, undefined, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+          assertOptionalSnapshotString(ocr.language, undefined, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+          assertOptionalSnapshotString(ocr.engine, undefined, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        }
+      });
+    }
+    if (row.blocks !== undefined) {
+      assertSnapshotRecordArray(row.blocks, "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID", (block) => {
+        assertNoUnexpectedSnapshotKeys(
+          block,
+          SHARED_BLOCK_KEYS,
+          "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID",
+        );
+        if (
+          typeof block.id !== "string" ||
+          !block.id ||
+          block.id.length > 200 ||
+          !["text", "markdown", "html", "code", "quote", "richtext"].includes(String(block.kind))
+        ) {
+          throw new Error("SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID");
+        }
+        assertOptionalSnapshotString(block.label, undefined, "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID");
+        assertOptionalSnapshotString(block.text, undefined, "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID");
+        assertOptionalSnapshotString(block.r2Key, undefined, "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID");
+        assertOptionalSnapshotString(block.language, 200, "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID");
+        assertOptionalSnapshotBoolean(block.searchable, "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID");
+        assertOptionalSnapshotInteger(block.createdAt, "SHARE_SNAPSHOT_ITEM_BLOCKS_INVALID");
+      });
+    }
+    if (row.blobs !== undefined) {
+      assertSnapshotRecordArray(row.blobs, "SHARE_SNAPSHOT_ITEM_BLOBS_INVALID", (blob) => {
+        assertNoUnexpectedSnapshotKeys(
+          blob,
+          SHARED_BLOB_KEYS,
+          "SHARE_SNAPSHOT_ITEM_BLOBS_INVALID",
+        );
+        if (
+          typeof blob.key !== "string" ||
+          !blob.key ||
+          !["html", "pdf", "json", "text", "archive", "other"].includes(String(blob.kind))
+        ) {
+          throw new Error("SHARE_SNAPSHOT_ITEM_BLOBS_INVALID");
+        }
+        assertOptionalSnapshotString(blob.contentType, 500, "SHARE_SNAPSHOT_ITEM_BLOBS_INVALID");
+        assertOptionalSnapshotInteger(blob.byteSize, "SHARE_SNAPSHOT_ITEM_BLOBS_INVALID");
+        assertOptionalSnapshotString(blob.label, undefined, "SHARE_SNAPSHOT_ITEM_BLOBS_INVALID");
+        assertOptionalSnapshotString(blob.hash, 256, "SHARE_SNAPSHOT_ITEM_BLOBS_INVALID");
+        assertOptionalSnapshotInteger(blob.capturedAt, "SHARE_SNAPSHOT_ITEM_BLOBS_INVALID");
+      });
+    }
+  });
+  assertUniqueSnapshotKeys(
+    snapshot.items,
+    (row) => row.id,
+    "SHARE_SNAPSHOT_DUPLICATE_ITEM_ID",
+  );
+  assertSnapshotRecordArray(snapshot.tags, "SHARE_SNAPSHOT_TAGS_INVALID", (row) => {
+    assertSnapshotId(row.id, "SHARE_SNAPSHOT_TAG_INVALID");
+    if (typeof row.name !== "string") throw new Error("SHARE_SNAPSHOT_TAG_INVALID");
+    assertOptionalSnapshotString(row.color, 32, "SHARE_SNAPSHOT_TAG_INVALID", true);
+    assertOptionalSnapshotBoolean(row.isFavorite, "SHARE_SNAPSHOT_TAG_INVALID");
+    assertOptionalSnapshotInteger(row.createdAt, "SHARE_SNAPSHOT_TAG_INVALID");
+    assertOptionalSnapshotInteger(row.updatedAt, "SHARE_SNAPSHOT_TAG_INVALID");
+  });
+  assertUniqueSnapshotKeys(
+    snapshot.tags,
+    (row) => row.id,
+    "SHARE_SNAPSHOT_DUPLICATE_TAG_ID",
+  );
+  assertSnapshotRecordArray(snapshot.itemTags, "SHARE_SNAPSHOT_ITEM_TAGS_INVALID", (row) => {
+    assertSnapshotId(row.itemId, "SHARE_SNAPSHOT_ITEM_TAG_INVALID");
+    assertSnapshotId(row.tagId, "SHARE_SNAPSHOT_ITEM_TAG_INVALID");
+  });
+  assertUniqueSnapshotKeys(
+    snapshot.itemTags,
+    (row) => `${row.itemId}\u0000${row.tagId}`,
+    "SHARE_SNAPSHOT_DUPLICATE_ITEM_TAG",
+  );
+  if (snapshot.warnings !== undefined) {
+    assertSnapshotRecordArray(snapshot.warnings, "SHARE_SNAPSHOT_WARNINGS_INVALID", () => {});
+  }
+  return { ...snapshot, spaceGroups };
+}
+
+const SNAPSHOT_MAX_RECORDS_PER_COLLECTION = 500_000;
+const SHARED_BLOCK_KEYS = new Set([
+  "id", "kind", "label", "text", "json", "r2Key", "language", "searchable", "createdAt",
+]);
+const SHARED_BLOB_KEYS = new Set([
+  "key", "kind", "contentType", "byteSize", "label", "hash", "capturedAt",
+]);
+
+function assertSnapshotRecordArray(
+  value: unknown,
+  code: string,
+  validate: (row: Record<string, unknown>) => void,
+): asserts value is Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length > SNAPSHOT_MAX_RECORDS_PER_COLLECTION) {
+    throw new Error(code);
+  }
+  for (const row of value) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error(code);
+    validate(row as Record<string, unknown>);
+  }
+}
+
+function assertUniqueSnapshotKeys<T>(
+  rows: readonly T[],
+  getKey: (row: T) => string,
+  code: string,
+): void {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const key = getKey(row);
+    if (seen.has(key)) throw new Error(code);
+    seen.add(key);
+  }
+}
+
+function assertSnapshotId(value: unknown, code: string): asserts value is string {
+  if (typeof value !== "string" || !value.trim() || value.length > 100) throw new Error(code);
+}
+
+function assertOptionalSnapshotReference(value: unknown, maxLength: number, code: string): void {
+  if (value === undefined || value === null || value === "") return;
+  if (typeof value !== "string" || value.length > maxLength) throw new Error(code);
+}
+
+function assertOptionalSnapshotString(
+  value: unknown,
+  maxLength: number | undefined,
+  code: string,
+  nullable = false,
+): void {
+  if (value === undefined || (nullable && value === null)) return;
+  if (typeof value !== "string" || (maxLength !== undefined && value.length > maxLength)) {
+    throw new Error(code);
+  }
+}
+
+function assertOptionalSnapshotBoolean(value: unknown, code: string): void {
+  if (value !== undefined && typeof value !== "boolean") throw new Error(code);
+}
+
+function assertOptionalSnapshotNumber(value: unknown, code: string): void {
+  if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+    throw new Error(code);
+  }
+}
+
+function assertOptionalSnapshotInteger(value: unknown, code: string): void {
+  if (
+    value !== undefined &&
+    (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) >= Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new Error(code);
+  }
+}
+
+function assertOptionalSnapshotRecord(value: unknown, code: string): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(code);
+}
+
+function assertNoUnexpectedSnapshotKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  code: string,
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(code);
+  }
 }
 
 async function resolveTargetSpaceId(db: Awaited<ReturnType<typeof getDb>>, value?: string): Promise<string> {
@@ -1131,14 +1662,21 @@ function toImportedItem(
     source: normalizeSource(item.source),
     folderId,
     spaceId,
-    isFavorite: false,
+    isFavorite: item.isFavorite === true,
     authorUsername: normalizeText(item.authorUsername, 160),
     likes: normalizeNumber(item.likes),
     upvotes: normalizeNumber(item.upvotes),
     media: (item.media || []).map(toImportedMedia).filter((entry): entry is NonNullable<ItemDocType["media"]>[number] => !!entry),
+    type: normalizeText(item.type, 120) || undefined,
+    fields: item.fields ? structuredClone(item.fields) : undefined,
+    blocks: item.blocks ? structuredClone(item.blocks) : undefined,
+    blobs: item.blobs ? structuredClone(item.blobs) : undefined,
     iconUrl: normalizeUrl(item.iconUrl) || undefined,
     displayImageUrl: normalizeUrl(item.displayImageUrl) || undefined,
-    parentId: null,
+    summary: normalizeText(item.summary, 20_000),
+    ai: item.ai ? structuredClone(item.ai) : undefined,
+    parentId: typeof item.parentId === "string" ? item.parentId : null,
+    chunkOrder: normalizeNumber(item.chunkOrder),
     vector_index: -1,
     vector_indexes: [],
     isEmbedded: false,
@@ -1191,6 +1729,11 @@ function normalizeTitle(value: unknown, fallback: string): string {
   return text || fallback.slice(0, 160);
 }
 
+function normalizeEntityName(value: unknown, fallback: string, maxLength: number): string {
+  const text = normalizeText(value, maxLength);
+  return text || fallback.slice(0, maxLength);
+}
+
 function normalizeText(value: unknown, max: number): string | undefined {
   if (typeof value !== "string") return undefined;
   const text = value.replace(/\r\n/g, "\n").trim();
@@ -1210,7 +1753,9 @@ function normalizeUrl(value: unknown): string | undefined {
 }
 
 function normalizeNumber(value: unknown): number | undefined {
-  return Number.isFinite(value) ? Math.max(0, Math.floor(value as number)) : undefined;
+  return Number.isFinite(value)
+    ? Math.min(Number.MAX_SAFE_INTEGER - 1, Math.max(0, Math.floor(value as number)))
+    : undefined;
 }
 
 function normalizeSource(value: unknown): ItemDocType["source"] {

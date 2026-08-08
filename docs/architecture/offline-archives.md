@@ -3,7 +3,9 @@
 Vibesearch stores a durable, inert HTML snapshot for a saved web page so web and
 mobile clients can preview it when the original site is unavailable. The
 extension is the high-fidelity capture source; the Cloudflare API is the
-sanitizer, fallback capturer, and R2 owner.
+sanitizer, fallback capturer, and R2 owner. The card View action fetches the
+latest snapshot by item ID and renders it in the extension's right-side preview
+sheet rather than embedding the live website.
 
 Implementation: `src/content/page-archive-capture.ts`,
 `src/services/archive-capture-session.ts`, `src/services/archive-outbox.ts`,
@@ -17,6 +19,7 @@ sequenceDiagram
     participant P as Saved page
     participant SW as Extension service worker
     participant O as OPFS archive outbox
+    participant L as Bounded local archive cache
     participant C as Cloud sync
     participant API as Vibesearch API / R2
 
@@ -30,13 +33,17 @@ sequenceDiagram
     SW->>API: PUT snapshot (or POST fallback capture)
     API->>API: sanitize, normalize, hash
     API->>API: attach R2 BlobRef to latest item revision
-    SW->>O: delete acknowledged job and local file
+    SW->>L: retain exact acknowledged HTML
+    SW->>O: delete acknowledged job and source file
 ```
 
 The delayed fallback is written before live capture starts. If Chrome terminates
 the Manifest V3 worker midway, the next alarm can still ask the server to capture
 the URL. A successful live capture replaces that intent atomically, so there is
-only one newest archive job per item.
+only one newest archive job per item. A successful upload is not acknowledged
+locally until the same bytes are safely copied into the bounded archive cache,
+so turning the device offline after save does not break View. Server-captured or
+cross-device archives are added to this cache after their first online preview.
 
 ## Live capture
 
@@ -65,6 +72,7 @@ limit. Abort and failed commit paths remove the temporary OPFS file.
 | Total page resource bytes | 14 MiB |
 | Resource attempts / concurrency | 96 / 4 |
 | OPFS outbox | 256 MiB |
+| Acknowledged offline archive cache | 256 MiB / 5,000 entries |
 | Pending intents | 20,000 |
 | Pending age | 30 days |
 | Archive uploads per drain | 2 |
@@ -91,6 +99,17 @@ The API removes scripts, event handlers, forms, refresh navigation, frames,
 objects, embeds, external imports, and unresolved network resources. Stored HTML
 uses a data-only CSP and is rendered by web/mobile viewers with scripts, file
 access, mixed content, shared cookies, and third-party cookies disabled.
+
+The extension viewer reads its local cache before requesting cloud storage,
+then adds the same data-only CSP before the stored bytes and
+uses a unique-origin, scriptless iframe. It reads at most 28 MiB, owns one Blob
+URL at a time, aborts an in-flight request when the sheet closes, and revokes the
+URL on close, retry, item switch, or unmount.
+
+The full local JSON migration format includes cached archive bytes as base64 and
+restores version-one backups that predate this field. The portable Drive backup
+keeps the archive `BlobRef` and other rich item metadata, while the R2 payload
+remains in cloud storage to keep Drive exports bounded.
 
 See the monorepo's `docs/ARCHIVE.md` for API limits, R2 retention, response
 headers, viewer behavior, and the full verification matrix.

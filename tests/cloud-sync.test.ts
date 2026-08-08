@@ -258,6 +258,65 @@ test("concurrent outbox enqueues retain both local mutations", async () => {
   }
 });
 
+test("reset cancellation aborts a stalled cloud request and removes its durable queue", async () => {
+  const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
+  const storage = new Map<string, unknown>([
+    [CLOUD_SYNC_QUEUE_KEY, [ref("stalled", 100)]],
+  ]);
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: {
+        local: {
+          async get(keys: string | string[]) {
+            const requested = Array.isArray(keys) ? keys : [keys];
+            return Object.fromEntries(
+              requested.filter((key) => storage.has(key)).map((key) => [key, storage.get(key)]),
+            );
+          },
+          async set(entries: Record<string, unknown>) {
+            for (const [key, value] of Object.entries(entries)) storage.set(key, value);
+          },
+          async remove(key: string) {
+            storage.delete(key);
+          },
+        },
+      },
+    },
+  });
+
+  const requestStarted = (() => {
+    let resolve = () => {};
+    const promise = new Promise<void>((done) => { resolve = done; });
+    return { promise, resolve };
+  })();
+  try {
+    const fake = fakeCollections({ items: [item({ id: "stalled", updatedAt: 100 })] });
+    const service = new CloudSyncService({
+      getCollectionResolver: async () => fake.resolve,
+      getCredentials: async () => ({ token: "test-token", userId: "user-1" }),
+      fetcher: (_input, init) => new Promise<Response>((_resolve, reject) => {
+        requestStarted.resolve();
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        );
+      }),
+    });
+
+    const draining = service.drain();
+    await requestStarted.promise;
+    await service.cancelAndClear();
+
+    expect(await draining).toMatchObject({ reason: "cancelled" });
+    expect(storage.has(CLOUD_SYNC_QUEUE_KEY)).toBe(false);
+  } finally {
+    if (originalChrome) Object.defineProperty(globalThis, "chrome", originalChrome);
+    else Reflect.deleteProperty(globalThis, "chrome");
+  }
+});
+
 test("cloud push drains 10,000 queued bookmarks with indexed reads per network batch", async () => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
   const storage = new Map<string, unknown>([[CLOUD_SYNC_TOKEN_KEY, "test-token"]]);

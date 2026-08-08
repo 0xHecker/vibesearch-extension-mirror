@@ -2,8 +2,10 @@ import * as React from "react";
 import {
   AlertTriangle,
   Bookmark,
+  CloudUpload,
   Download,
   FileUp,
+  FileOutput,
   Link2,
   Loader2,
   RefreshCw,
@@ -17,16 +19,17 @@ import { cn } from "@src/lib/utils";
 import { showErrorToast, showLoadingToast, showSuccessToast } from "@src/utils/toast-feedback";
 import { SectionHeading, SettingGroup, SettingRow, SettingStatus } from "../SettingsPrimitives";
 import {
-  buildBackupBundle,
+  buildBackupDownload,
+  createDriveBackup,
   deleteAllLocalData,
-  downloadBackupBundle,
+  downloadStagedBackup,
+  exportToNotion,
   formatMigrationSummary,
   listDriveBackups,
   rebuildVectorIndex,
   restoreDriveBackup,
   restoreStagedBundle,
-  stageBackupBundle,
-  summarizeBundle,
+  stageBackupFile,
   type GoogleDriveBackup,
   type LocalExtensionMigrationSummary,
 } from "../backup-ops";
@@ -53,6 +56,8 @@ export function DataSection({
   const [isDragging, setIsDragging] = React.useState(false);
   const [driveBackups, setDriveBackups] = React.useState<GoogleDriveBackup[]>([]);
   const [isLoadingDrive, setIsLoadingDrive] = React.useState(false);
+  const [isBackingUpDrive, setIsBackingUpDrive] = React.useState(false);
+  const [isExportingNotion, setIsExportingNotion] = React.useState(false);
   const [importingDriveId, setImportingDriveId] = React.useState<string | null>(null);
   const [driveChecked, setDriveChecked] = React.useState(false);
   const [needsRebuild, setNeedsRebuild] = React.useState(false);
@@ -60,18 +65,25 @@ export function DataSection({
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  const isBusy = isExporting || isStaging || isImporting || isLoadingDrive || !!importingDriveId;
+  const isBusy =
+    isExporting ||
+    isStaging ||
+    isImporting ||
+    isLoadingDrive ||
+    isBackingUpDrive ||
+    isExportingNotion ||
+    !!importingDriveId;
 
   const handleExport = async () => {
     setError(null);
     setIsExporting(true);
     const toastId = showLoadingToast("Building backup…");
     try {
-      const bundle = await buildBackupBundle();
-      downloadBackupBundle(bundle);
-      setSummary(summarizeBundle(bundle));
+      const staged = await buildBackupDownload();
+      await downloadStagedBackup(staged);
+      setSummary(staged.summary);
       showSuccessToast("Backup file downloaded.", { id: toastId });
-      if (bundle.warnings.length > 0) setError(bundle.warnings.join("\n"));
+      if (staged.warnings.length > 0) setError(staged.warnings.join("\n"));
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Could not export local data.";
       setError(message);
@@ -87,7 +99,7 @@ export function DataSection({
     setSummary(null);
     setIsStaging(true);
     try {
-      const staged = await stageBackupBundle(await file.text());
+      const staged = await stageBackupFile(file);
       setStagedRestoreId(staged.stageId);
       setSummary(staged.summary);
     } catch (cause) {
@@ -148,6 +160,34 @@ export function DataSection({
     }
   };
 
+  const handleBackupDrive = async () => {
+    setError(null);
+    setIsBackingUpDrive(true);
+    const toastId = showLoadingToast("Backing up to Google Drive…");
+    try {
+      const result = await createDriveBackup();
+      if (result.driveFileId) {
+        const savedBackup: GoogleDriveBackup = {
+          id: result.driveFileId,
+          name: "vibesearch-export.json",
+          modifiedTime: new Date(result.lastSyncedAt || Date.now()).toISOString(),
+        };
+        setDriveBackups((current) => [
+          savedBackup,
+          ...current.filter((backup) => backup.id !== savedBackup.id),
+        ]);
+      }
+      setDriveChecked(true);
+      showSuccessToast("Drive backup saved.", { id: toastId });
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "Could not back up to Google Drive.";
+      setError(message);
+      showErrorToast(message, { id: toastId });
+    } finally {
+      setIsBackingUpDrive(false);
+    }
+  };
+
   const handleRestoreDrive = async (fileId: string) => {
     setError(null);
     setImportingDriveId(fileId);
@@ -166,6 +206,23 @@ export function DataSection({
       showErrorToast(message, { id: toastId });
     } finally {
       setImportingDriveId(null);
+    }
+  };
+
+  const handleExportNotion = async () => {
+    setError(null);
+    setIsExportingNotion(true);
+    const toastId = showLoadingToast("Exporting to Notion — keep this tab open…");
+    try {
+      const result = await exportToNotion();
+      showSuccessToast(`Exported ${result.itemCount.toLocaleString()} items to Notion.`, { id: toastId });
+      if (result.pageUrl) await chrome.tabs.create({ url: result.pageUrl });
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "Could not export to Notion.";
+      setError(message);
+      showErrorToast(message, { id: toastId });
+    } finally {
+      setIsExportingNotion(false);
     }
   };
 
@@ -190,6 +247,9 @@ export function DataSection({
     const toastId = showLoadingToast("Deleting all data…");
     try {
       await deleteAllLocalData();
+      setStagedRestoreId(null);
+      setSummary(null);
+      setNeedsRebuild(false);
       showSuccessToast("All local data deleted.", { id: toastId });
       onDataChanged();
     } catch (cause) {
@@ -201,7 +261,7 @@ export function DataSection({
     <div>
       <SectionHeading
         title="Data"
-        description="Import from other tools, back up everything locally, or restore a previous export. Backups stay on your device unless you restore from Google Drive."
+        description="Import from other tools, create a full local backup, or use an explicitly requested private Google Drive backup."
       />
 
       <SettingGroup label="Import">
@@ -237,6 +297,40 @@ export function DataSection({
       </SettingGroup>
 
       <SettingGroup label="Backup & restore">
+        <SettingRow
+          title="Back up to Google Drive"
+          description="Create or update a private portable VibeSearch backup in your connected Drive account."
+        >
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => void handleBackupDrive()}
+            disabled={isBusy}
+            static={isBackingUpDrive}
+          >
+            {isBackingUpDrive ? <Loader2 className="size-4 animate-spin" /> : <CloudUpload className="size-4" />}
+            Back up now
+          </Button>
+        </SettingRow>
+
+        <SettingRow
+          title="Export to Notion"
+          description="Create a private Notion page with every current item, its link, space/folder, tags, favorite state, and a readable content excerpt."
+        >
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => void handleExportNotion()}
+            disabled={isBusy}
+            static={isExportingNotion}
+          >
+            {isExportingNotion ? <Loader2 className="size-4 animate-spin" /> : <FileOutput className="size-4" />}
+            Export
+          </Button>
+        </SettingRow>
+
         <SettingRow
           title="Restore from a backup file"
           description="Drop a VibeSearch JSON export below. Records merge by ID; keyword search is ready first."
@@ -293,7 +387,7 @@ export function DataSection({
 
         <SettingRow
           title="Export a full backup"
-          description="Spaces, folders, tabs, tags, history, flashcards, and referenced local media."
+          description="Spaces, folders, tabs, tags, history, flashcards, local media, and offline page archives."
         >
           <Button type="button" variant="outline" size="sm" onClick={() => void handleExport()} disabled={isBusy} static={isExporting}>
             {isExporting ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
@@ -355,7 +449,7 @@ export function DataSection({
       <SettingGroup label="Danger zone">
         <SettingRow
           title="Delete all data"
-          description="Permanently remove every space, tab group, tab, tag, and local media file from this device. This cannot be undone."
+          description="Permanently remove every space, tab group, tab, tag, local media file, and offline archive from this device. This cannot be undone."
         >
           <Button type="button" variant="destructive" size="sm" onClick={() => setDeleteOpen(true)}>
             <Trash2 className="size-4" />
@@ -375,7 +469,7 @@ export function DataSection({
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
         title="Delete all your data?"
-        description="Every space, tab group, tab, tag, and local media file on this device is permanently removed. Export a backup first if you might want it back. This cannot be undone."
+        description="Every space, tab group, tab, tag, local media file, and offline archive on this device is permanently removed. Export a backup first if you might want it back. This cannot be undone."
         confirmLabel="Delete everything"
         variant="danger"
         onConfirm={handleDeleteAll}

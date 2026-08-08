@@ -10,7 +10,10 @@ import {
   cloneOpfsMediaEntriesForItem,
   withOpfsMutationLock,
 } from "@src/services/media-storage";
-import { deleteUnreferencedOpfsItemDirectories } from "@src/services/opfs-media-lifecycle";
+import {
+  deleteUnreferencedOpfsItemDirectories,
+  requestOpfsMediaReconciliation,
+} from "@src/services/opfs-media-lifecycle";
 import {
   createRestoreTabGroup,
   resolveRestoreSpace,
@@ -29,12 +32,14 @@ import {
   withLiveSpaceDestination,
 } from "@src/services/live-destination";
 import { forEachIdKeysetPage } from "@src/services/rxdb-keyset-pagination";
+import { notifyArchivedItemsPurged } from "@src/services/archive-lifecycle";
 
 const FOLDER_ITEM_PAGE_SIZE = 200;
 
 type FoldersControllerOptions = {
   cloneOpfsMediaEntriesForItem?: typeof cloneOpfsMediaEntriesForItem;
   deleteUnreferencedOpfsItemDirectories?: typeof deleteUnreferencedOpfsItemDirectories;
+  notifyArchivedItemsPurged?: typeof notifyArchivedItemsPurged;
 };
 
 export class FoldersController {
@@ -208,7 +213,13 @@ export class FoldersController {
         const deleteDirectories =
           this.options.deleteUnreferencedOpfsItemDirectories ||
           deleteUnreferencedOpfsItemDirectories;
-        await deleteDirectories(db, removedItemIds);
+        try {
+          await deleteDirectories(db, removedItemIds);
+        } catch (error) {
+          console.warn("[folders] media cleanup deferred after permanent delete", error);
+          requestOpfsMediaReconciliation();
+        }
+        await (this.options.notifyArchivedItemsPurged || notifyArchivedItemsPurged)(removedItemIds);
       },
     });
     return removedItems;

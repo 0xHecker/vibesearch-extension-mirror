@@ -56,6 +56,15 @@ export class BrowserBookmarkResyncScheduler {
     await this.run(this.requestedGeneration);
   }
 
+  /** Cancel queued automatic work and wait for an already-running scan. */
+  async reset(): Promise<void> {
+    this.armVersion += 1;
+    this.cancelTimer();
+    this.completedGeneration = this.requestedGeneration;
+    await this.clearFallbackAlarm();
+    await this.runInFlight?.catch(() => {});
+  }
+
   private hasPendingWork(): boolean {
     return this.requestedGeneration > this.completedGeneration;
   }

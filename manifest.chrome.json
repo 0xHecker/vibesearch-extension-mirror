@@ -2,5 +2,11 @@
   "background": {
     "service_worker": "src/workers/background.ts",
     "type": "module"
+  },
+  "oauth2": {
+    "client_id": "400575856806-8ie45ter3reqjm1f51adflijaan5rgta.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.file"
+    ]
   }
 }

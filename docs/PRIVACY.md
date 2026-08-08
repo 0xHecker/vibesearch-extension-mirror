@@ -1,6 +1,6 @@
 # Vibesearch — Privacy Policy
 
-_Last updated: 2026-07-10 · Applies to: Vibesearch browser extension (Chrome & Firefox)_
+_Last updated: 2026-08-09 · Applies to: Vibesearch browser extension (Chrome & Firefox)_
 
 > This document describes how the Vibesearch browser extension handles your data. It is written
 > to be accurate to what the software actually does. It is not legal advice — review and adapt it
@@ -12,7 +12,7 @@ Vibesearch is **local-first**: the extension keeps its own local library, search
 vectors, and core search works without an account. When cloud sync is connected, library changes
 and offline page previews are sent to the Vibesearch API so they can appear on your other devices.
 URLs also leave the browser for link previews, and saved media may be uploaded for durability.
-Sharing, Google backup, and GitHub import are user-initiated features. Vibesearch shows **no ads**
+Sharing, Google backup, Notion export, and GitHub import are user-initiated features. Vibesearch shows **no ads**
 and uses **no third-party analytics or behavioral tracking**.
 
 ## What stays on your device
@@ -24,7 +24,7 @@ Stored locally in your browser (IndexedDB and the Origin Private File System):
 - The search index and all embedding vectors.
 - Your settings and preferences.
 - Your search history (which you can clear at any time).
-- Credentials you enter (a GitHub token; cached Google sign-in) are stored locally on your
+- Credentials you enter (a GitHub token; cached Google sign-in; Notion OAuth tokens) are stored locally on your
   device only.
 
 **Extension search runs entirely on your device.** Your query is converted to an embedding
@@ -40,7 +40,8 @@ locally and matched against your local index. The extension does not transmit se
 | Images & screenshots you save | Vibesearch media storage (`bucket.vibesearch.app`, Cloudflare R2) | So saved media survives local cache clears and can be shared/backed up | After you save an image or screenshot |
 | Model download requests (no personal data) | Vibesearch model host (`metadata-worker.watermelons.workers.dev`) | To download the embedding model, plus the OCR model on Chrome/Brave, then cache them locally | First run / when models update |
 | A snapshot of the space/folder/items you choose to share | Vibesearch share service (`share-worker.watermelons.workers.dev` / `share.vibesearch.app`) | To create a shareable link | Only when you create a share |
-| A backup snapshot of your library | **Your own Google account** (Google Drive & Sheets) | To back up and restore your library | Only if you connect Google and run a backup |
+| A backup snapshot of your library | **Your own Google Drive** (one Vibesearch JSON file) | To back up and restore your library | Only if you connect Google and run a backup |
+| Item titles, links, space/folder names, tags, favorite state, timestamps, and a bounded text excerpt | **Your own Notion workspace** (`api.notion.com`) | To create a private, readable catalog page | Only when you connect Notion and run an export |
 | Read request for your starred repositories | GitHub (`api.github.com`) using your token | To import your GitHub stars | Only when you import GitHub stars |
 
 Notes:
@@ -56,9 +57,13 @@ Notes:
   (and PIN, if you set one) can view the shared snapshot until you revoke it. Don't share links
   publicly if the content is sensitive. The share service stores the snapshot you shared and
   basic view counts for that link.
-- **Google backups go to your own Drive.** Vibesearch requests only the `drive.file` scope (it
-  can see and manage only the files it creates) and `spreadsheets`. Disconnecting clears the
-  cached sign-in on your device.
+- **Google backups go to your own Drive.** Vibesearch requests only the `drive.file` scope, so it
+  can see and manage only files it created or that you explicitly opened with it. It does not
+  request Google Sheets access. Disconnecting clears the cached sign-in on your device.
+- **Notion exports go directly to Notion.** The Vibesearch API brokers OAuth code exchange and
+  refresh because Notion requires a server-side client secret; it does not receive the library
+  export. The extension then creates a private workspace-level page through `api.notion.com` in
+  bounded batches. Disconnecting removes local tokens and requests revocation.
 
 ## What Vibesearch does NOT do
 
@@ -81,13 +86,13 @@ Notes:
 - **offscreen (Chrome/Brave only)** — host the database and search pipelines outside the MV3
   service worker. Firefox uses its DOM-backed MV3 background page instead and does not request
   this Chrome-only permission.
-- **identity** — sign in to Google (only if you connect Google for backup).
+- **identity** — run Google and Notion sign-in only when you connect those optional features.
 - **site access (`http://*/*`, `https://*/*`)** — run the lightweight save-target content script
   on web pages so right-click/hover save works. Full DOM snapshotting starts only after a save
   action. The archive path adds no new broad host permission or `pageCapture`, and has no
   privileged background resource proxy.
-- **host permissions** — limited to Vibesearch services, Google APIs (for backup), and GitHub's
-  API (for stars import).
+- **host permissions** — limited to Vibesearch services, Google APIs (for backup), Notion's API
+  (for export), and GitHub's API (for stars import).
 
 ## Your choices & data deletion
 
@@ -96,7 +101,7 @@ Notes:
 - **Delete everything** — Settings → Data → delete all data wipes your local library.
 - **Clear search history** — Settings → Search history.
 - **Revoke a share** — Settings → Shared tabs.
-- **Disconnect Google / remove your GitHub token** — Settings → Connectors.
+- **Disconnect Google or Notion / remove your GitHub token** — Settings → Connectors.
 - Uninstalling the extension removes its local data from your browser, but does not itself send a
   cloud-deletion request. Use Vibesearch deletion controls before uninstalling, or contact us to
   request deletion of synced items, page snapshots, uploaded media, and shares.
