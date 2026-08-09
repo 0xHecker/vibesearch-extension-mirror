@@ -35,9 +35,68 @@ const resolveConnectorApiBase = async (): Promise<string> => {
 };
 
 export interface CapturedMedia {
-  type: string; // photo | video | gif | image | audio
+  type: "image" | "video" | "audio" | "file";
   url: string;
+  storageType?: "hotlink" | "opfs" | "s3";
   thumbnailUrl?: string;
+  id?: string;
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  durationSec?: number;
+  altText?: string;
+  provider?: string;
+  externalId?: string;
+}
+
+export interface CapturedCreator {
+  id?: string;
+  name?: string;
+  handle?: string;
+  avatarUrl?: string;
+  url?: string;
+  verified?: boolean;
+}
+
+export interface CapturedItemMetadata {
+  schemaVersion: 1;
+  social?: {
+    platform: string;
+    postId?: string;
+    author?: CapturedCreator;
+    community?: { id?: string; name?: string; iconUrl?: string; url?: string };
+    postedAt?: number;
+    language?: string;
+    stats?: {
+      likes?: number;
+      upvotes?: number;
+      replies?: number;
+      comments?: number;
+      reposts?: number;
+      views?: number;
+      saves?: number;
+      shares?: number;
+    };
+    parentUrl?: string;
+    quotedPost?: { url?: string; text?: string; author?: CapturedCreator };
+  };
+  provenance?: {
+    method?: "extension" | "import";
+    importer?: string;
+    externalId?: string;
+    capturedAt?: number;
+    importedAt?: number;
+  };
+  sourceRecords?: Array<{
+    id: string;
+    provider: string;
+    kind: "api";
+    adapterVersion: string;
+    canonicalUrl?: string;
+    externalId?: string;
+    fetchedAt?: number;
+    inline: Record<string, unknown>;
+  }>;
 }
 
 /** Neutral shape a connector/capture produces; mapped to the API item on push. */
@@ -53,9 +112,13 @@ export interface CapturedItem {
   media?: CapturedMedia[];
   likes?: number;
   upvotes?: number;
+  /** Provider publication time; root createdAt remains the cloud capture time. */
+  postedAt?: number;
+  /** @deprecated kept only for callers compiled against the earlier shape. */
   createdAt?: number;
   folderId?: string;
   fields?: Record<string, unknown>;
+  metadata?: CapturedItemMetadata;
 }
 
 export interface CloudPushResult {
@@ -88,7 +151,7 @@ async function savePushedIds(ids: Set<string>): Promise<void> {
 }
 
 /** Map a neutral CapturedItem to the `vibesearch-api` item-create body. */
-function toItemBody(item: CapturedItem): Record<string, unknown> {
+export function toItemBody(item: CapturedItem): Record<string, unknown> {
   return {
     url: item.url,
     title: item.title,
@@ -101,11 +164,24 @@ function toItemBody(item: CapturedItem): Record<string, unknown> {
     media: (item.media ?? []).map((m) => ({
       type: m.type,
       originalUrl: m.url,
+      storageType: m.storageType ?? "hotlink",
       thumbnailUrl: m.thumbnailUrl,
+      id: m.id,
+      mimeType: m.mimeType,
+      width: m.width,
+      height: m.height,
+      durationSec: m.durationSec,
+      altText: m.altText,
+      provider: m.provider,
+      externalId: m.externalId,
     })),
     folderId: item.folderId ?? "",
-    fields: { ...(item.fields ?? {}), externalId: item.externalId },
-    ...(item.createdAt ? { createdAt: item.createdAt } : {}),
+    fields: {
+      ...(item.fields ?? {}),
+      externalId: item.externalId,
+      ...(item.postedAt !== undefined ? { postedAt: item.postedAt } : {}),
+    },
+    metadata: item.metadata,
   };
 }
 

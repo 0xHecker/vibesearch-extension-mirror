@@ -8,7 +8,7 @@
  */
 import type { CapturedItem } from "../cloud-sync.service";
 import type { ConnectorAccount, ConnectorModule, FetchSavedResult } from "./types";
-import { findEntryList, normalizeEntry, findCursor, politeDelay } from "./harvest";
+import { findInstagramCursor, findInstagramEntryList, normalizeEntry, politeDelay } from "./harvest";
 
 const IG_APP_ID = "936619743392459"; // Instagram web app id (public, sent by the web client)
 
@@ -84,14 +84,14 @@ async function fetchSaved(opts: { sinceId?: string; cursor?: string; maxPages?: 
       nextCursor = maxId;
       break;
     }
-    const entries = findEntryList(raw);
+    const entries = findInstagramEntryList(raw);
     console.log(`[Vibesearch · Instagram] page ${page + 1}: found ${entries.length} saved post(s)`);
     for (const el of entries) {
       const item = normalizeEntry(el, {
         source: "instagram",
         idPrefix: "ig",
         connector: "instagram-saved",
-        defaultType: "image",
+        defaultType: "social",
         origin: "https://www.instagram.com",
         buildUrl: ({ code }) => (code ? `https://www.instagram.com/p/${code}/` : "https://www.instagram.com/"),
       });
@@ -104,7 +104,7 @@ async function fetchSaved(opts: { sinceId?: string; cursor?: string; maxPages?: 
       }
       items.push(item);
     }
-    const next = findCursor(raw);
+    const next = findInstagramCursor(raw);
     console.log(`[Vibesearch · Instagram] collected ${items.length} saved post(s) so far${next ? " — more pages…" : " — last page."}`);
     opts.onProgress?.(`Read ${items.length} saved post${items.length === 1 ? "" : "s"}${next ? " so far…" : "."}`);
     if (reachedKnown || !next || next === maxId || entries.length === 0) {

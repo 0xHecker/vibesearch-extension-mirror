@@ -7,7 +7,7 @@
  */
 import type { CapturedItem } from "../cloud-sync.service";
 import type { ConnectorAccount, ConnectorModule, FetchSavedResult } from "./types";
-import { findEntryList, normalizeEntry, findCursor, politeDelay } from "./harvest";
+import { findRedditCursor, findRedditEntryList, normalizeEntry, politeDelay } from "./harvest";
 
 async function fetchJson(url: string): Promise<unknown | null> {
   try {
@@ -64,14 +64,14 @@ async function fetchSaved(opts: { sinceId?: string; cursor?: string; maxPages?: 
       nextCursor = after;
       break;
     }
-    const entries = findEntryList(raw);
+    const entries = findRedditEntryList(raw);
     console.log(`[Vibesearch · Reddit] page ${page + 1}: found ${entries.length} saved item(s)`);
     for (const el of entries) {
       const item = normalizeEntry(el, {
         source: "reddit",
         idPrefix: "reddit",
         connector: "reddit-saved",
-        defaultType: "link",
+        defaultType: "forum",
         origin: "https://www.reddit.com",
         buildUrl: ({ id }) => `https://www.reddit.com/${id}`,
       });
@@ -84,7 +84,7 @@ async function fetchSaved(opts: { sinceId?: string; cursor?: string; maxPages?: 
       }
       items.push(item);
     }
-    const next = findCursor(raw);
+    const next = findRedditCursor(raw);
     console.log(`[Vibesearch · Reddit] collected ${items.length} saved item(s) so far${next ? " — more pages…" : " — last page."}`);
     opts.onProgress?.(`Read ${items.length} saved item${items.length === 1 ? "" : "s"}${next ? " so far…" : "."}`);
     if (reachedKnown || !next || next === after || entries.length === 0) {

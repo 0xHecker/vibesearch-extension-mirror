@@ -1,5 +1,12 @@
 import { describe, it, expect } from "bun:test";
-import { findEntryList, normalizeEntry, findCursor } from "../src/services/connectors/harvest";
+import {
+  findCursor,
+  findEntryList,
+  findInstagramEntryList,
+  findRedditEntryList,
+  findXEntryList,
+  normalizeEntry,
+} from "../src/services/connectors/harvest";
 
 const xCtx = {
   source: "twitter",
@@ -47,13 +54,13 @@ describe("harvest — shape-agnostic extraction", () => {
         },
       },
     };
-    const entries = findEntryList(payload);
+    const entries = findXEntryList(payload);
     expect(entries.length).toBeGreaterThanOrEqual(1);
     const item = normalizeEntry(entries[0], xCtx)!;
     expect(item.externalId).toBe("x:111");
     expect(item.textContent).toContain("hello world");
     expect(item.authorUsername).toBe("alice");
-    expect(item.media?.[0]?.url).toBe("https://pbs.twimg.com/a.jpg");
+    expect(item.media?.[0]).toMatchObject({ type: "image", url: "https://pbs.twimg.com/a.jpg" });
     expect(item.url).toBe("https://x.com/alice/status/111");
     expect(item.likes).toBe(12);
     expect(findCursor(payload)).toBe("CURSOR123");
@@ -73,7 +80,7 @@ describe("harvest — shape-agnostic extraction", () => {
     expect(item.textContent).toContain("still cope");
     expect(item.authorUsername).toBe("bob");
     expect(item.media?.[0]).toEqual({ type: "video", url: "https://video.twimg.com/v.mp4" });
-    expect(item.type).toBe("video");
+    expect(item.type).toBe("social");
     expect(findCursor(payload)).toBe("NEXT222");
   });
 
@@ -98,16 +105,17 @@ describe("harvest — shape-agnostic extraction", () => {
         ],
       },
     };
-    const entries = findEntryList(payload);
+    const entries = findRedditEntryList(payload);
     const item = normalizeEntry(entries[0], {
       source: "reddit",
       idPrefix: "reddit",
       connector: "reddit-saved",
-      defaultType: "link",
+      defaultType: "forum",
       origin: "https://www.reddit.com",
       buildUrl: ({ id }) => `https://www.reddit.com/${id}`,
     })!;
     expect(item.externalId).toBe("reddit:t3_abc");
+    expect(item.title).toBe("A saved post");
     expect(item.textContent).toContain("longer body text");
     expect(item.authorUsername).toBe("carol");
     expect(item.url).toBe("https://www.reddit.com/r/test/comments/abc/a_saved_post/");
@@ -133,12 +141,12 @@ describe("harvest — shape-agnostic extraction", () => {
       next_max_id: "NEXTIG",
       more_available: true,
     };
-    const entries = findEntryList(payload);
+    const entries = findInstagramEntryList(payload);
     const item = normalizeEntry(entries[0], {
       source: "instagram",
       idPrefix: "ig",
       connector: "instagram-saved",
-      defaultType: "image",
+      defaultType: "social",
       origin: "https://www.instagram.com",
       buildUrl: ({ code }) => (code ? `https://www.instagram.com/p/${code}/` : "https://www.instagram.com/"),
     })!;
@@ -147,6 +155,112 @@ describe("harvest — shape-agnostic extraction", () => {
     expect(item.authorUsername).toBe("dave");
     expect(item.url).toBe("https://www.instagram.com/p/ABC123/");
     expect(item.media?.[0]?.url).toBe("https://scontent.cdninstagram.com/p.jpg");
+    expect(item.media?.[0]?.type).toBe("image");
+    expect(item.type).toBe("social");
+    expect(item.createdAt).toBeUndefined();
+    expect(item.metadata?.social?.postedAt).toBe(1751328000000);
     expect(findCursor(payload)).toBe("NEXTIG");
+  });
+
+  it("keeps one X bookmark when the tweet contains a four-photo gallery", () => {
+    const payload = {
+      data: {
+        bookmark_timeline_v2: {
+          timeline: {
+            instructions: [{
+              type: "TimelineAddEntries",
+              entries: [{
+                entryId: "tweet-111",
+                content: {
+                  itemContent: {
+                    tweet_results: {
+                      result: {
+                        rest_id: "111",
+                        legacy: {
+                          full_text: "one saved gallery",
+                          entities: {
+                            user_mentions: [
+                              { id_str: "998", name: "Mention One", screen_name: "mention_one" },
+                              { id_str: "999", name: "Mention Two", screen_name: "mention_two" },
+                            ],
+                          },
+                          extended_entities: {
+                            media: [1, 2, 3, 4].map((index) => ({
+                              id_str: `m${index}`,
+                              type: "photo",
+                              media_url_https: `https://pbs.twimg.com/${index}.jpg`,
+                            })),
+                          },
+                        },
+                        core: {
+                          user_results: {
+                            result: {
+                              rest_id: "42",
+                              legacy: {
+                                name: "Alice Example",
+                                screen_name: "alice",
+                                profile_image_url_https: "https://pbs.twimg.com/alice.jpg",
+                                verified: true,
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              }],
+            }],
+          },
+        },
+      },
+    };
+
+    const entries = findXEntryList(payload);
+    expect(entries).toHaveLength(1);
+    const item = normalizeEntry(entries[0], xCtx)!;
+    expect(item.externalId).toBe("x:111");
+    expect(item.authorUsername).toBe("alice");
+    expect(item.media).toHaveLength(4);
+    expect(item.media?.every((media) => media.type === "image")).toBe(true);
+    expect(item.metadata?.sourceRecords).toHaveLength(1);
+    expect(item.metadata?.social?.author).toMatchObject({
+      id: "42",
+      name: "Alice Example",
+      handle: "alice",
+      verified: true,
+    });
+  });
+
+  it("keeps an Instagram carousel as one saved social post", () => {
+    const payload = {
+      items: [{
+        media: {
+          pk: "999",
+          code: "CAROUSEL",
+          caption: { text: "three places I loved" },
+          user: { pk: "7", username: "dave", full_name: "Dave Example" },
+          carousel_media: [1, 2, 3].map((index) => ({
+            pk: `slide-${index}`,
+            image_versions2: {
+              candidates: [{ url: `https://scontent.cdninstagram.com/${index}.jpg` }],
+            },
+          })),
+        },
+      }],
+    };
+
+    const entries = findInstagramEntryList(payload);
+    expect(entries).toHaveLength(1);
+    const item = normalizeEntry(entries[0], {
+      source: "instagram",
+      idPrefix: "ig",
+      connector: "instagram-saved",
+      defaultType: "social",
+      buildUrl: ({ code }) => `https://www.instagram.com/p/${code}/`,
+    })!;
+    expect(item.externalId).toBe("ig:999");
+    expect(item.type).toBe("social");
+    expect(item.media).toHaveLength(3);
   });
 });

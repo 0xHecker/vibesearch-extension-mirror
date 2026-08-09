@@ -9,7 +9,7 @@
  */
 import type { CapturedItem } from "../cloud-sync.service";
 import type { ConnectorAccount, ConnectorModule, FetchSavedResult } from "./types";
-import { findEntryList, normalizeEntry, findCursor, politeDelay } from "./harvest";
+import { findXCursor, findXEntryList, normalizeEntry, politeDelay } from "./harvest";
 
 const BEARER =
   "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -133,7 +133,7 @@ export async function fetchXBookmarks(
       nextCursor = cursor;
       break;
     }
-    const entries = findEntryList(raw);
+    const entries = findXEntryList(raw);
     console.log(`[Vibesearch · X] page ${page + 1}: found ${entries.length} entries`);
     for (const el of entries) {
       const item = normalizeEntry(el, {
@@ -152,7 +152,7 @@ export async function fetchXBookmarks(
       }
       items.push(item);
     }
-    const next = findCursor(raw);
+    const next = findXCursor(raw);
     console.log(`[Vibesearch · X] collected ${items.length} bookmark(s) so far${next ? " — more pages…" : " — last page."}`);
     opts.onProgress?.(`Read ${items.length} bookmark${items.length === 1 ? "" : "s"}${next ? " so far…" : "."}`);
     if (reachedKnown || !next || next === cursor || entries.length === 0) {
