@@ -15,6 +15,8 @@ const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
 
 const INTERNAL_ONLY_OFFSCREEN_METHODS = new Set<string>([
   "items:saveFetchedMetadata",
+  "items:findLiveByUrls",
+  "cloudSync:syncAll",
   // Full-library operations must pass through their tracked background control
   // messages. Raw extension-page forwarding would bypass reset cancellation,
   // sender checks, staged-file limits, and destructive-operation orchestration.

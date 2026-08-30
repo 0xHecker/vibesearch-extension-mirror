@@ -16,7 +16,7 @@ export type NotionConnectionStatus = {
 
 type StoredNotionAuth = {
   accessToken: string;
-  refreshToken: string;
+  refreshToken?: string;
   expiresAt: number;
   workspaceId?: string;
   workspaceName?: string;
@@ -43,12 +43,12 @@ const normalizeStoredNotionAuth = (value: unknown): StoredNotionAuth | null => {
   const accessToken = text(row.accessToken, 4_096);
   const refreshToken = text(row.refreshToken, 4_096);
   const expiresAt = Number(row.expiresAt);
-  if (!accessToken || !refreshToken || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+  if (!accessToken || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
     return null;
   }
   return {
     accessToken,
-    refreshToken,
+    ...(refreshToken ? { refreshToken } : {}),
     expiresAt,
     ...(text(row.workspaceId, 256) ? { workspaceId: text(row.workspaceId, 256) } : {}),
     ...(text(row.workspaceName, 500) ? { workspaceName: text(row.workspaceName, 500) } : {}),
@@ -70,21 +70,27 @@ const removeStoredNotionAuth = async (): Promise<void> => {
   await chrome.storage.local.remove(NOTION_TOKEN_STORAGE_KEY);
 };
 
+const isTerminalRefreshError = (error: unknown): boolean =>
+  error instanceof Error && error.message === "NOTION_OAUTH_PROVIDER_INVALID_GRANT";
+
 const parseBrokerTokenBundle = (
   value: BrokerTokenBundle,
   previous?: StoredNotionAuth | null,
 ): StoredNotionAuth => {
   const accessToken = text(value.accessToken, 4_096);
   const refreshToken = text(value.refreshToken, 4_096) || previous?.refreshToken || "";
-  if (!accessToken || !refreshToken) throw new Error("NOTION_AUTH_TOKEN_MISSING");
+  if (!accessToken) throw new Error("NOTION_AUTH_TOKEN_MISSING");
   const expiresIn = Number(value.expiresIn);
-  const lifetimeSeconds = Number.isSafeInteger(expiresIn) && expiresIn > 0
-    ? Math.min(expiresIn, 30 * 24 * 60 * 60)
-    : 60 * 60;
+  const hasDeclaredLifetime = Number.isSafeInteger(expiresIn) && expiresIn > 0;
+  const expiresAt = hasDeclaredLifetime
+    ? Date.now() + Math.min(expiresIn, 30 * 24 * 60 * 60) * 1_000
+    : refreshToken
+      ? Date.now() + 60 * 60 * 1_000
+      : Number.MAX_SAFE_INTEGER;
   return {
     accessToken,
-    refreshToken,
-    expiresAt: Date.now() + lifetimeSeconds * 1_000,
+    ...(refreshToken ? { refreshToken } : {}),
+    expiresAt,
     ...(text(value.workspaceId, 256) || previous?.workspaceId
       ? { workspaceId: text(value.workspaceId, 256) || previous?.workspaceId }
       : {}),
@@ -205,10 +211,12 @@ export async function getNotionConnectionStatus(): Promise<NotionConnectionStatu
 }
 
 export async function getNotionAccessToken(
-  options: { interactive?: boolean } = {},
+  options: { interactive?: boolean; forceRefresh?: boolean } = {},
 ): Promise<string> {
   let auth = await readStoredNotionAuth();
-  if (auth && auth.expiresAt > Date.now() + 60_000) return auth.accessToken;
+  if (!options.forceRefresh && auth && auth.expiresAt > Date.now() + 60_000) {
+    return auth.accessToken;
+  }
   if (auth?.refreshToken) {
     try {
       const bundle = await callBroker<BrokerTokenBundle & Record<string, unknown>>(
@@ -218,9 +226,20 @@ export async function getNotionAccessToken(
       auth = parseBrokerTokenBundle(bundle, auth);
       await writeStoredNotionAuth(auth);
       return auth.accessToken;
-    } catch {
+    } catch (error) {
+      // A timeout, rate limit, broker outage, or malformed upstream response
+      // must not discard a refresh token that may still be valid. Only an
+      // explicit OAuth invalid_grant response proves the authorization is no
+      // longer usable.
+      if (!isTerminalRefreshError(error)) throw error;
       await removeStoredNotionAuth();
     }
+  }
+  if (auth) {
+    // A long-lived access token has no refresh token. Once Notion rejects it,
+    // or a declared expiry passes, it cannot be recovered without consent.
+    await removeStoredNotionAuth();
+    auth = null;
   }
   if (options.interactive === false) throw new Error("NOTION_NOT_CONNECTED");
   await connectNotion();
@@ -229,13 +248,34 @@ export async function getNotionAccessToken(
   return connected.accessToken;
 }
 
+export async function runWithNotionAccessToken<T>(
+  operation: (accessToken: string) => Promise<T>,
+  options: { interactive?: boolean } = {},
+): Promise<T> {
+  const token = await getNotionAccessToken(options);
+  try {
+    return await operation(token);
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "NOTION_AUTH_EXPIRED") throw error;
+  }
+
+  // A direct Notion 401 can arrive before a response's synthetic/default
+  // expiry. Rotate once and retry the request that Notion rejected; never
+  // retry an operation after any other response status.
+  const refreshed = await getNotionAccessToken({
+    ...options,
+    forceRefresh: true,
+  });
+  return operation(refreshed);
+}
+
 export async function disconnectNotion(): Promise<void> {
   const auth = await readStoredNotionAuth();
   await removeStoredNotionAuth();
   if (!auth) return;
   await callBroker<Record<string, unknown>>(
     "/oauth/notion/revoke",
-    { token: auth.refreshToken || auth.accessToken },
+    { token: auth.accessToken },
   ).catch(() => {});
 }
 

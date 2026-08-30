@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   cloudSyncRefsForDocs,
+  cloudSyncRefsForRxChange,
   CLOUD_SYNC_PUSH_BATCH_MAX,
   CLOUD_SYNC_QUEUE_KEY,
   CLOUD_SYNC_TOKEN_KEY,
@@ -68,6 +69,13 @@ test("cloud sync queue keeps the newest ref per collection/id", () => {
   ]);
 });
 
+test("equal-clock live refs cannot replace a queued deletion tombstone", () => {
+  const tombstone = { ...ref("same", 200), deletedAt: 200 };
+  expect(mergeCloudSyncQueue([tombstone], [ref("same", 200)])).toEqual([
+    { ...tombstone, attempts: 0 },
+  ]);
+});
+
 test("cloud sync refs are compact for very large imports", () => {
   const items = Array.from({ length: 10_000 }, (_, index) =>
     item({ id: `item-${index}`, updatedAt: 1_000 + index })
@@ -95,6 +103,58 @@ test("cloud sync refs are compact for very large imports", () => {
   expect(Object.keys(refs[0]).sort()).toEqual(["collection", "deletedAt", "id", "queuedAt", "updatedAt"]);
 });
 
+test("RxDB changes queue live documents and durable deletion tombstones", () => {
+  expect(cloudSyncRefsForRxChange("itemTags", {
+    events: [
+      {
+        operation: "INSERT",
+        documentId: "item-1|tag-1",
+        documentData: {
+          id: "item-1|tag-1",
+          updatedAt: 100,
+          deletedAt: 0,
+        },
+      },
+      {
+        operation: "DELETE",
+        documentId: "item-2|tag-2",
+        previousDocumentData: {
+          id: "item-2|tag-2",
+          updatedAt: 200,
+          deletedAt: 0,
+        },
+      },
+    ],
+  }, 500)).toEqual([
+    {
+      collection: "itemTags",
+      id: "item-1|tag-1",
+      updatedAt: 100,
+      deletedAt: 0,
+      queuedAt: 500,
+    },
+    {
+      collection: "itemTags",
+      id: "item-2|tag-2",
+      updatedAt: 500,
+      deletedAt: 500,
+      queuedAt: 500,
+    },
+  ]);
+});
+
+test("cloud sync preserves opaque RxDB primary keys exactly", () => {
+  expect(cloudSyncRefsForRxChange("items", {
+    operation: "UPDATE",
+    documentId: " item/with?reserved#characters ",
+    documentData: {
+      id: " item/with?reserved#characters ",
+      updatedAt: 100,
+      deletedAt: 0,
+    },
+  }, 500)[0]?.id).toBe(" item/with?reserved#characters ");
+});
+
 test("cloud item normalization fills the web/mobile content type surface", () => {
   const normalized = normalizeCloudDoc("items", item()) as Record<string, any>;
 
@@ -106,6 +166,29 @@ test("cloud item normalization fills the web/mobile content type surface", () =>
     author: "user",
     likes: 42,
   });
+});
+
+test("cloud item normalization classifies every shared provider family", () => {
+  const expected = {
+    threads: "social",
+    mastodon: "social",
+    bluesky: "social",
+    vimeo: "video",
+    spotify: "audio",
+    ytmusic: "audio",
+    soundcloud: "audio",
+  } as const;
+
+  for (const [source, type] of Object.entries(expected)) {
+    const normalized = normalizeCloudDoc(
+      "items",
+      item({ source: source as ItemDocType["source"], type: undefined }),
+    ) as Record<string, any>;
+    expect(normalized.type, source).toBe(type);
+    if (type === "social") {
+      expect(normalized.fields, source).toMatchObject({ platform: source, author: "user", likes: 42 });
+    }
+  }
 });
 
 test("cloud item normalization maps GitHub stars to repo fields", () => {
@@ -154,6 +237,7 @@ test("cloud item normalization preserves polymorphic content and archive metadat
   ) as Record<string, any>;
 
   expect(normalized).toMatchObject({
+    url: "https://x.com/user/status/1",
     type: "article",
     fields: { author: "Ada", readingMinutes: 4 },
     blocks,
@@ -161,6 +245,210 @@ test("cloud item normalization preserves polymorphic content and archive metadat
     summary: "A useful summary",
     ai: { status: "done", autoTags: ["research"], updatedAt: 301 },
   });
+});
+
+test("manual cloud sync backfills every local collection under the signed-in user", async () => {
+  const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
+  const storage = new Map<string, unknown>();
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      runtime: {
+        sendMessage: async () => undefined,
+      },
+      storage: {
+        local: {
+          async get(keys: string | string[]) {
+            const requested = Array.isArray(keys) ? keys : [keys];
+            return Object.fromEntries(
+              requested.filter((key) => storage.has(key)).map((key) => [key, storage.get(key)]),
+            );
+          },
+          async set(entries: Record<string, unknown>) {
+            for (const [key, value] of Object.entries(entries)) storage.set(key, value);
+          },
+        },
+      },
+    },
+  });
+
+  const records: Record<CloudSyncQueueRef["collection"], Array<Record<string, unknown> & { id: string }>> = {
+    spaceGroups: [{ id: "group-1", name: "Research", sortOrder: 0, isCollapsed: false, createdAt: 1, updatedAt: 2 }],
+    spaces: [{ id: "space-1", name: "Public", slug: "public", spaceGroupId: "group-1", isPrivate: false, autoLockMs: 30_000, sortOrder: 0, isArchived: false, deletedAt: 0, purgeAt: 0, createdAt: 1, updatedAt: 3 }],
+    folders: [{ id: "folder-1", name: "Reading", spaceId: "space-1", parentId: null, type: "folder", sortOrder: 0, isLocked: false, isPinned: false, isCollapsed: false, deletedAt: 0, purgeAt: 0, isDirty: true, serverVersion: 0, createdAt: 1, updatedAt: 4, userId: "" }],
+    items: [item({
+      id: "archived-item",
+      url: "https://example.com/article?from=extension#saved",
+      updatedAt: 5,
+    }) as ItemDocType & Record<string, unknown>],
+    tags: [{ id: "tag-1", name: "Read later", userId: null, isDirty: true, serverVersion: 0, createdAt: 1, updatedAt: 6 }],
+    itemTags: [{
+      id: "archived-item|tag-1",
+      itemId: "archived-item",
+      tagId: "tag-1",
+      userId: null,
+      createdAt: 1,
+      updatedAt: 6,
+      deletedAt: 0,
+    }],
+  };
+  const document = (row: Record<string, unknown> & { id: string }) => ({
+    primary: row.id,
+    get: (field: string) => row[field],
+    toMutableJSON: () => ({ ...row }),
+  });
+  const resolver: CloudSyncCollectionResolver = (collection) => ({
+    findByIds(ids) {
+      return {
+        exec: async () => new Map(
+          records[collection]
+            .filter((row) => ids.includes(row.id))
+            .map((row) => [row.id, document(row)] as const),
+        ),
+      };
+    },
+    find(query) {
+      const selector = query.selector as { id?: { $gt?: string } };
+      const afterId = selector.id?.$gt || "";
+      return {
+        exec: async () => records[collection]
+          .filter((row) => row.id > afterId)
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .slice(0, query.limit)
+          .map(document),
+      };
+    },
+  });
+  const credentialRefreshes: boolean[] = [];
+  const sent: CloudSyncChange[] = [];
+
+  try {
+    const service = new CloudSyncService({
+      getCollectionResolver: async () => resolver,
+      getCredentials: async (forceRefresh) => {
+        credentialRefreshes.push(forceRefresh === true);
+        return { token: "signed-in-token", userId: "user-1" };
+      },
+      fetcher: async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { changes: CloudSyncChange[] };
+        sent.push(...body.changes);
+        return Response.json({
+          checkpoint: 1,
+          applied: body.changes.length,
+          conflicts: 0,
+          acceptedRefs: body.changes.map(({ collection, id }) => ({ collection, id })),
+          conflictRefs: [],
+        });
+      },
+    });
+
+    const result = await service.syncAll({ pageSize: 1, maxBatches: 10 });
+
+    expect(result).toMatchObject({
+      scanned: 6,
+      enqueued: 6,
+      push: { pushed: 6, remaining: 0 },
+    });
+    expect(credentialRefreshes[0]).toBe(true);
+    expect(new Set(sent.map((change) => change.collection))).toEqual(new Set([
+      "spaceGroups",
+      "spaces",
+      "folders",
+      "items",
+      "tags",
+      "itemTags",
+    ]));
+    expect(sent.find((change) => change.id === "archived-item")?.doc).toMatchObject({
+      userId: "user-1",
+      url: "https://example.com/article?from=extension#saved",
+    });
+    expect(storage.get(CLOUD_SYNC_QUEUE_KEY)).toEqual([]);
+  } finally {
+    if (originalChrome) Object.defineProperty(globalThis, "chrome", originalChrome);
+    else Reflect.deleteProperty(globalThis, "chrome");
+  }
+});
+
+test("manual cloud sync refuses to scan local data without a signed-in account", async () => {
+  let collectionReads = 0;
+  const service = new CloudSyncService({
+    getCredentials: async () => ({ token: "", userId: "" }),
+    getCollectionResolver: async () => {
+      collectionReads += 1;
+      throw new Error("must not scan");
+    },
+  });
+
+  await expect(service.syncAll()).rejects.toThrow("CLOUD_SYNC_AUTH_REQUIRED");
+  expect(collectionReads).toBe(0);
+});
+
+test("manual cloud sync never uploads a scan after the signed-in account changes", async () => {
+  const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
+  const queuedItem = item({ id: "account-bound", updatedAt: 100 });
+  const storage = new Map<string, unknown>();
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: {
+        local: {
+          async get(keys: string | string[]) {
+            const requested = Array.isArray(keys) ? keys : [keys];
+            return Object.fromEntries(
+              requested.filter((key) => storage.has(key)).map((key) => [key, storage.get(key)]),
+            );
+          },
+          async set(entries: Record<string, unknown>) {
+            for (const [key, value] of Object.entries(entries)) storage.set(key, value);
+          },
+        },
+      },
+    },
+  });
+  const document = (row: ItemDocType) => ({
+    primary: row.id,
+    get: (field: string) => row[field as keyof ItemDocType],
+    toMutableJSON: () => ({ ...row }),
+  });
+  const resolver: CloudSyncCollectionResolver = (collection) => ({
+    findByIds(ids) {
+      return {
+        exec: async () => collection === "items" && ids.includes(queuedItem.id)
+          ? new Map([[queuedItem.id, document(queuedItem)]])
+          : new Map(),
+      };
+    },
+    find() {
+      return {
+        exec: async () => collection === "items" ? [document(queuedItem)] : [],
+      };
+    },
+  });
+  let fetchCalls = 0;
+
+  try {
+    const service = new CloudSyncService({
+      getCollectionResolver: async () => resolver,
+      getCredentials: async (forceRefresh) => forceRefresh
+        ? { token: "token-1", userId: "user-1" }
+        : { token: "token-2", userId: "user-2" },
+      fetcher: async () => {
+        fetchCalls += 1;
+        return Response.json({ checkpoint: 1, applied: 1, conflicts: 0 });
+      },
+    });
+
+    const result = await service.syncAll({ pageSize: 10, maxBatches: 1 });
+
+    expect(result.push).toMatchObject({ reason: "invalid-auth", pushed: 0, remaining: 1 });
+    expect(fetchCalls).toBe(0);
+    expect(storage.get(CLOUD_SYNC_QUEUE_KEY)).toEqual([
+      expect.objectContaining({ collection: "items", id: "account-bound" }),
+    ]);
+  } finally {
+    if (originalChrome) Object.defineProperty(globalThis, "chrome", originalChrome);
+    else Reflect.deleteProperty(globalThis, "chrome");
+  }
 });
 
 test("cloud sync only clears acknowledged refs from a pushed batch", () => {
@@ -175,6 +463,103 @@ test("cloud sync only clears acknowledged refs from a pushed batch", () => {
 test("qualified acknowledgements cannot clear the same id in another collection", () => {
   const batch = [ref("same", 100, "items"), ref("same", 101, "tags")];
   expect(selectAcknowledgedQueueRefs(batch, [{ collection: "tags", id: "same" }])).toEqual([batch[1]]);
+});
+
+test("malformed qualified acknowledgements leave the entire pushed batch queued", async () => {
+  const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
+  const storage = new Map<string, unknown>();
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: {
+      storage: {
+        local: {
+          async get(keys: string | string[]) {
+            const requested = Array.isArray(keys) ? keys : [keys];
+            return Object.fromEntries(
+              requested.filter((key) => storage.has(key)).map((key) => [key, storage.get(key)]),
+            );
+          },
+          async set(entries: Record<string, unknown>) {
+            for (const [key, value] of Object.entries(entries)) storage.set(key, value);
+          },
+        },
+      },
+    },
+  });
+
+  const first = item({ id: "first", updatedAt: 100 });
+  const second = item({ id: "second", updatedAt: 101 });
+  const fake = fakeCollections({ items: [first, second] });
+  const cases = [
+    {
+      name: "duplicate ref",
+      response: {
+        checkpoint: 1,
+        applied: 2,
+        conflicts: 0,
+        acceptedRefs: [
+          { collection: "items", id: "first" },
+          { collection: "items", id: "first" },
+        ],
+        conflictRefs: [],
+      },
+    },
+    {
+      name: "unknown ref",
+      response: {
+        checkpoint: 1,
+        applied: 2,
+        conflicts: 0,
+        acceptedRefs: [
+          { collection: "items", id: "first" },
+          { collection: "items", id: "unknown" },
+        ],
+        conflictRefs: [],
+      },
+    },
+    {
+      name: "partial acknowledgement",
+      response: {
+        checkpoint: 1,
+        applied: 1,
+        conflicts: 0,
+        acceptedRefs: [{ collection: "items", id: "first" }],
+        conflictRefs: [],
+      },
+    },
+    {
+      name: "overlapping accepted and conflicted refs",
+      response: {
+        checkpoint: 1,
+        applied: 1,
+        conflicts: 1,
+        acceptedRefs: [{ collection: "items", id: "first" }],
+        conflictRefs: [{ collection: "items", id: "first" }],
+      },
+    },
+  ] as const;
+
+  try {
+    for (const scenario of cases) {
+      const queued = [ref("first", 100), ref("second", 101)];
+      storage.set(CLOUD_SYNC_QUEUE_KEY, queued);
+      const service = new CloudSyncService({
+        getCollectionResolver: async () => fake.resolve,
+        getCredentials: async () => ({ token: "test-token", userId: "user-1" }),
+        fetcher: async () => Response.json(scenario.response),
+      });
+
+      const result = await service.drain({ batchSize: 2, maxBatches: 1 });
+
+      expect(result.reason, scenario.name).toBe("invalid-response");
+      expect(result.pushed, scenario.name).toBe(0);
+      expect(result.conflicts, scenario.name).toBe(0);
+      expect(storage.get(CLOUD_SYNC_QUEUE_KEY), scenario.name).toEqual(queued);
+    }
+  } finally {
+    if (originalChrome) Object.defineProperty(globalThis, "chrome", originalChrome);
+    else Reflect.deleteProperty(globalThis, "chrome");
+  }
 });
 
 test("cloud sync priority selection moves a dependent item into a bounded batch", () => {
@@ -358,8 +743,11 @@ test("cloud push drains 10,000 queued bookmarks with indexed reads per network b
         const body = JSON.parse(String(init?.body)) as { changes: CloudSyncChange[] };
         sentBatches.push(body.changes);
         return Response.json({
+          checkpoint: sentBatches.length,
           applied: body.changes.length,
+          conflicts: 0,
           acceptedRefs: body.changes.map(({ collection, id }) => ({ collection, id })),
+          conflictRefs: [],
         });
       },
     });
@@ -369,8 +757,9 @@ test("cloud push drains 10,000 queued bookmarks with indexed reads per network b
     expect(result).toMatchObject({ pushed: 10_000, batches: 1_000, remaining: 0 });
     expect(sentBatches).toHaveLength(1_000);
     expect(sentBatches.every((batch) => batch.length === CLOUD_SYNC_PUSH_BATCH_MAX)).toBe(true);
+    // A push drain only ever pushes: reading the server's log is a separate,
+    // explicit step so an upload can never be mistaken for a merge.
     expect(requests.every(({ url, method }) => url.endsWith("/v1/sync/push") && method === "POST")).toBe(true);
-    expect("pull" in service).toBe(false);
     expect("sync" in service).toBe(false);
     expect(fake.calls.items.findByIds).toBe(1_000);
     expect(storage.get(CLOUD_SYNC_QUEUE_KEY)).toEqual([]);

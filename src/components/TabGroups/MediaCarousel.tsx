@@ -23,6 +23,9 @@ interface ResolvedEntry {
 }
 
 const resolveEntry = async (entry: MediaEntry): Promise<ResolvedEntry | null> => {
+  // The carousel intentionally supports only renderable media. Synced file
+  // attachments stay on the item for consumers with a dedicated file UI.
+  if (entry.type === "file") return null;
   if (entry.type === "video" && entry.embedUrl) {
     const embedUrl = normalizeIframeEmbedUrl(entry.embedUrl);
     if (embedUrl) {
@@ -84,7 +87,7 @@ export const MediaCarousel = ({
       const isYouTube =
         !!getYouTubeVideoIdFromUrl(pageUrl || "") ||
         (media || []).some((entry) =>
-          [entry.embedUrl, entry.originalUrl, entry.pageUrl, entry.thumbnailUrl]
+          [entry.embedUrl, entry.originalUrl, entry.pageUrl, entry.s3ThumbnailUrl, entry.thumbnailUrl]
             .filter(Boolean)
             .some((url) => !!url && !!getYouTubeVideoIdFromUrl(url))
         );

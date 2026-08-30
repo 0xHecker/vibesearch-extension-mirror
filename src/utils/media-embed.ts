@@ -58,6 +58,20 @@ export const isYouTubeShortsUrl = (value: string | undefined): boolean => {
   }
 };
 
+/**
+ * Origins the manifest CSP `frame-src` directive actually permits. Extension
+ * pages cannot frame anything else — the browser blocks it and only emits a
+ * console violation — so non-allowlisted embeds resolve to null and callers
+ * fall back to thumbnails or native <video> rendering instead.
+ */
+const FRAMEABLE_HOSTS = new Set([
+  "vibesearch-web.watermelons.workers.dev",
+  "metadata-worker.watermelons.workers.dev",
+]);
+
+const isFrameableUrl = (parsed: URL): boolean =>
+  FRAMEABLE_HOSTS.has(parsed.hostname.toLowerCase());
+
 export const normalizeIframeEmbedUrl = (value: string | undefined): string | null => {
   if (!value) return null;
   try {
@@ -65,7 +79,7 @@ export const normalizeIframeEmbedUrl = (value: string | undefined): string | nul
     if (parsed.protocol !== "https:") return null;
     const youtubeVideoId = getYouTubeVideoIdFromUrl(parsed.toString());
     if (youtubeVideoId) return getWorkerYouTubeEmbedUrl(youtubeVideoId);
-    return parsed.toString();
+    return isFrameableUrl(parsed) ? parsed.toString() : null;
   } catch {
     return null;
   }

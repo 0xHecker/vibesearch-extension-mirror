@@ -82,6 +82,36 @@ export const isBlockedArchiveResourceHost = (rawHost: string): boolean => {
   return host.includes(":") ? ipv6Blocked(host) : false;
 };
 
+/**
+ * The API edge forwards the archive source URL only up to this length; a longer
+ * target arrives at the store with no source URL at all and is rejected as an
+ * unusable stub.
+ */
+export const ARCHIVE_SOURCE_URL_MAX_LENGTH = 8_192;
+
+/**
+ * Mirror of the API's `assertPublicUrl` guard for archive *targets*.
+ *
+ * A page that only resolves inside this browser — localhost, a private or
+ * link-local address, a custom port, or embedded credentials — can never be
+ * fetched by the server-side capturer. Asking it to try burns Browser Run
+ * attempts and comes back as an opaque stub rejection, so the outbox checks
+ * this locally and hands those pages straight to the browser-session capture.
+ */
+export const isServerCapturableArchiveUrl = (rawUrl: string): boolean => {
+  try {
+    const target = new URL(rawUrl);
+    if (target.protocol !== "http:" && target.protocol !== "https:") return false;
+    if (target.toString().length > ARCHIVE_SOURCE_URL_MAX_LENGTH) return false;
+    if (target.username || target.password) return false;
+    const standardPort = !target.port || (target.protocol === "http:" ? target.port === "80" : target.port === "443");
+    if (!standardPort) return false;
+    return !isBlockedArchiveResourceHost(target.hostname);
+  } catch {
+    return false;
+  }
+};
+
 export const isSafeArchiveResourceUrl = (rawUrl: string, sourceUrl: string): boolean => {
   try {
     const target = new URL(rawUrl);

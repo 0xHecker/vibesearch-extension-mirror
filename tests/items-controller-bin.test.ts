@@ -231,6 +231,26 @@ const promotionController = () =>
     readOpfsFileIdentity: async () => testOpfsIdentity,
   });
 
+test("archive lookup reuses the newest live item for the same page URL", async () => {
+  const older = makeItem("older-copy", "folder-a", 0);
+  const newer = makeItem("newer-copy", "folder-b", 0);
+  const deleted = makeItem("deleted-copy", "folder-c", now);
+  older.url = "https://example.com/same-page";
+  newer.url = "https://example.com/same-page";
+  deleted.url = "https://example.com/same-page";
+  older.updatedAt = now - 100;
+  newer.updatedAt = now + 100;
+  deleted.updatedAt = now + 200;
+  items.splice(0, items.length, older, newer, deleted);
+
+  await expect(itemsController.findLiveByUrls({
+    urls: ["https://example.com/same-page"],
+  })).resolves.toEqual({
+    id: "newer-copy",
+    url: "https://example.com/same-page",
+  });
+});
+
 describe("item bin restore", () => {
   test("restores an item into a new tab group when its original folder is in bin", async () => {
     spaces.splice(0, spaces.length, makeSpace("space-a"));

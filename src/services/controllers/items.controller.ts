@@ -285,6 +285,8 @@ type LocalQueryResponse = {
     totalMs: number;
   };
   debug?: QueryDebugPayload;
+  /** Benign concurrency outcome: a newer search generation replaced this one. */
+  superseded?: boolean;
 };
 
 type CandidateLite = {
@@ -1793,12 +1795,43 @@ export class ItemsController {
         vectorQueryLease = await this.vectorStore.acquireQueryLease(searchSignal);
         this.assertSearchGeneration(searchGeneration);
       }
-      return await this.queryLocalWithVectorLease(
-        payload,
-        searchGeneration,
-        searchSignal,
-        vectorQueryLease
-      );
+      try {
+        return await this.queryLocalWithVectorLease(
+          payload,
+          searchGeneration,
+          searchSignal,
+          vectorQueryLease
+        );
+      } catch (error) {
+        if (
+          error instanceof SupersededRankRequestError ||
+          error instanceof Error &&
+          (error.message === RANK_REQUEST_SUPERSEDED || error.name === RANK_REQUEST_SUPERSEDED)
+        ) {
+          // A newer keystroke won the race. Benign concurrency outcome, not a
+          // failure: resolve in-band so the router does not log an error and
+          // the UI keeps its currently rendered results.
+          this.rankTelemetry.supersededCount += 1;
+          return {
+            items: [],
+            total: 0,
+            totalIsExact: true,
+            vectorHits: 0,
+            lexicalHits: 0,
+            sortBy: payload.sort?.by || "relevance",
+            sortOrder: payload.sort?.order || "desc",
+            page: Math.max(1, payload.pagination?.page || 1),
+            limit: Math.max(
+              1,
+              Math.min(payload.pagination?.limit || payload.topK || 100, MAX_GRID_QUERY_LIMIT)
+            ),
+            hasMore: false,
+            nextCursor: null,
+            superseded: true,
+          };
+        }
+        throw error;
+      }
     } finally {
       vectorQueryLease?.release();
       this.finishSearchGeneration(searchGeneration);
@@ -2891,6 +2924,32 @@ export class ItemsController {
       .filter(Boolean)
       .map((doc) => doc!.toMutableJSON() as ItemDocType)
       .filter((item) => (item.deletedAt || 0) === 0 && allowedSpaceIdSet.has(item.spaceId));
+  }
+
+  /** Internal archive identity lookup. Re-capturing a URL updates the newest
+   * live saved item instead of manufacturing another library row. */
+  async findLiveByUrls(payload: { urls?: string[] }): Promise<{ id: string; url: string } | null> {
+    const urls = Array.from(
+      new Set(
+        (payload.urls || [])
+          .slice(0, 20)
+          .map((url) => this.normalizeUrl(url))
+          .filter((url): url is string => !!url)
+      )
+    );
+    if (urls.length === 0) return null;
+    const db = await getDb();
+    const docs = await db.items
+      .find({ selector: { url: { $in: urls }, deletedAt: { $eq: 0 } } })
+      .exec();
+    const newest = docs
+      .map((doc) => doc.toMutableJSON() as ItemDocType)
+      .sort((left, right) =>
+        (right.updatedAt || 0) - (left.updatedAt || 0) ||
+        (right.createdAt || 0) - (left.createdAt || 0) ||
+        right.id.localeCompare(left.id)
+      )[0];
+    return newest ? { id: newest.id, url: newest.url } : null;
   }
 
   async addToFolder(payload: {

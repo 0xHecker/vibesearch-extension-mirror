@@ -4,6 +4,7 @@ import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
 import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
 import { folderMigrationStrategies, folderSchema } from "../src/schemas/folder_schema";
 import { itemMigrationStrategies, itemSchema } from "../src/schemas/item_schema";
+import { itemTagMigrationStrategies, itemTagSchema } from "../src/schemas/item_tag_schema";
 import { spaceMigrationStrategies, spaceSchema } from "../src/schemas/space_schema";
 import {
   boundedMigrationRecoveryBatchSize,
@@ -38,6 +39,7 @@ describe("database schema version high-water marks", () => {
     // Older releases wrote these versions. Reusing a lower number opens a
     // different Dexie store and makes the existing records appear deleted.
     expect(itemSchema.version).toBeGreaterThan(8);
+    expect(itemTagSchema.version).toBeGreaterThan(0);
     expect(folderSchema.version).toBeGreaterThan(6);
     expect(spaceSchema.version).toBeGreaterThan(1);
   });
@@ -45,6 +47,7 @@ describe("database schema version high-water marks", () => {
   test("prefers normalized soft tombstones over equally fresh live historical rows", () => {
     const normalizers = [
       ["item", itemMigrationStrategies[itemSchema.version]],
+      ["itemTag", itemTagMigrationStrategies[itemTagSchema.version]],
       ["folder", folderMigrationStrategies[folderSchema.version]],
       ["space", spaceMigrationStrategies[spaceSchema.version]],
     ] as const;

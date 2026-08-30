@@ -20,13 +20,22 @@ import { GOOGLE_BACKUP_MAX_BYTES } from "@src/services/google-backup-limits";
 export type ShareSourceKind = "folder" | "folders" | "items";
 
 export type SharedMedia = {
-  type: "image" | "video" | "audio";
+  id?: string;
+  type: "image" | "video" | "audio" | "file";
   originalUrl?: string;
   storageType: "hotlink" | "s3";
   s3Url?: string;
+  s3ThumbnailUrl?: string;
   embedUrl?: string;
   embedType?: "iframe";
   thumbnailUrl?: string;
+  mimeType?: string;
+  fileName?: string;
+  byteSize?: number;
+  contentHash?: string;
+  durationSec?: number;
+  provider?: string;
+  externalId?: string;
   altText?: string;
   titleText?: string;
   ariaLabel?: string;
@@ -668,7 +677,15 @@ export async function importSharedSnapshot(
       const itemId = itemIdMap.get(join.itemId);
       const tagId = tagIdMap.get(join.tagId);
       if (!itemId || !tagId) return null;
-      return { id: `${itemId}|${tagId}`, itemId, tagId, userId: "user1" } as ItemTagDocType;
+      return {
+        id: `${itemId}|${tagId}`,
+        itemId,
+        tagId,
+        userId: "user1",
+        createdAt: now,
+        updatedAt: now,
+        deletedAt: 0,
+      } as ItemTagDocType;
     })
     .filter((join): join is ItemTagDocType => join !== null);
 
@@ -1179,6 +1196,9 @@ async function mergeBackupSnapshotLocked(
         itemId: source.itemId,
         tagId,
         userId: "user1",
+        createdAt: now,
+        updatedAt: now,
+        deletedAt: 0,
       } as ItemTagDocType;
       itemTagsById.set(row.id, row);
   }
@@ -1296,13 +1316,25 @@ function sanitizeMedia(item: ItemDocType, warnings: ShareSnapshotWarning[]): Sha
       continue;
     }
     output.push({
+      id: normalizeText(entry.id, 512),
       type: entry.type,
       originalUrl,
       storageType: s3Url ? "s3" : "hotlink",
       s3Url,
+      s3ThumbnailUrl: normalizeUrl(entry.s3ThumbnailUrl) || undefined,
       embedUrl: normalizeUrl(entry.embedUrl) || undefined,
       embedType: entry.embedType === "iframe" ? "iframe" : undefined,
       thumbnailUrl: normalizeUrl(entry.thumbnailUrl) || undefined,
+      mimeType: normalizeText(entry.mimeType, 255),
+      fileName: normalizeText(entry.fileName, 1_024),
+      byteSize: normalizeNumber(entry.byteSize),
+      contentHash: normalizeText(entry.contentHash, 512),
+      durationSec:
+        typeof entry.durationSec === "number" && Number.isFinite(entry.durationSec)
+          ? Math.max(0, entry.durationSec)
+          : undefined,
+      provider: normalizeText(entry.provider, 256),
+      externalId: normalizeText(entry.externalId, 512),
       altText: normalizeText(entry.altText, 500),
       titleText: normalizeText(entry.titleText, 500),
       ariaLabel: normalizeText(entry.ariaLabel, 500),
@@ -1436,11 +1468,22 @@ function validateSnapshot(value: unknown): ShareSnapshotV1 {
     if (row.media !== undefined) {
       assertSnapshotRecordArray(row.media, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID", (media) => {
         if (
-          !["image", "video", "audio"].includes(String(media.type)) ||
+          !["image", "video", "audio", "file"].includes(String(media.type)) ||
           !["hotlink", "s3"].includes(String(media.storageType))
         ) {
           throw new Error("SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
         }
+        assertOptionalSnapshotString(media.id, 512, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotString(media.mimeType, 255, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotString(media.fileName, 1_024, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotInteger(media.byteSize, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotString(media.contentHash, 512, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotNumber(media.durationSec, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        if (typeof media.durationSec === "number" && media.durationSec < 0) {
+          throw new Error("SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        }
+        assertOptionalSnapshotString(media.provider, 256, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
+        assertOptionalSnapshotString(media.externalId, 512, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
         assertOptionalSnapshotNumber(media.width, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
         assertOptionalSnapshotNumber(media.height, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
         assertOptionalSnapshotInteger(media.capturedAt, "SHARE_SNAPSHOT_ITEM_MEDIA_INVALID");
@@ -1693,13 +1736,25 @@ function toImportedMedia(entry: SharedMedia): NonNullable<ItemDocType["media"]>[
   const originalUrl = normalizeUrl(entry.originalUrl) || normalizeUrl(entry.s3Url) || normalizeUrl(entry.thumbnailUrl);
   if (!originalUrl) return null;
   return {
+    id: normalizeText(entry.id, 512),
     type: entry.type,
     originalUrl,
     storageType: entry.s3Url ? "s3" : "hotlink",
     s3Url: normalizeUrl(entry.s3Url) || undefined,
+    s3ThumbnailUrl: normalizeUrl(entry.s3ThumbnailUrl) || undefined,
     embedUrl: normalizeUrl(entry.embedUrl) || undefined,
     embedType: entry.embedType === "iframe" ? "iframe" : undefined,
     thumbnailUrl: normalizeUrl(entry.thumbnailUrl) || undefined,
+    mimeType: normalizeText(entry.mimeType, 255),
+    fileName: normalizeText(entry.fileName, 1_024),
+    byteSize: normalizeNumber(entry.byteSize),
+    contentHash: normalizeText(entry.contentHash, 512),
+    durationSec:
+      typeof entry.durationSec === "number" && Number.isFinite(entry.durationSec)
+        ? Math.max(0, entry.durationSec)
+        : undefined,
+    provider: normalizeText(entry.provider, 256),
+    externalId: normalizeText(entry.externalId, 512),
     altText: normalizeText(entry.altText, 500),
     titleText: normalizeText(entry.titleText, 500),
     ariaLabel: normalizeText(entry.ariaLabel, 500),

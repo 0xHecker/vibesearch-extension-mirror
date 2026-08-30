@@ -337,6 +337,45 @@ describe("buildGitHubStarsImportPlan", () => {
     expect(enqueued).toHaveLength(0);
   });
 
+  test("reimport keeps a binned managed star in the Bin while it is still starred on GitHub", async () => {
+    const db = createFakeGitHubDb();
+    const enqueued: CloudSyncDocBatch[] = [];
+    let now = NOW + 100_000;
+    const service = new GitHubStarsImportService({
+      getDb: async () => db as never,
+      cloudSync: {
+        enqueueDocs: async (batch) => {
+          enqueued.push(batch);
+          return { queued: 0, added: 0 };
+        },
+      } as never,
+      markSearchDirty: () => {},
+      now: () => now,
+      yieldToEventLoop: async () => {},
+      notifyDbChange: () => {},
+    });
+    const initialStars = createStars(1);
+    await service.importStars({ stars: initialStars });
+    const imported = Array.from(db.items.rows.values())[0];
+    const binnedAt = now + 5;
+    db.items.rows.set(String(imported.id), {
+      ...cloneRow(imported),
+      deletedAt: binnedAt,
+      updatedAt: binnedAt,
+    });
+    enqueued.length = 0;
+    db.items.resetWriteHistory();
+
+    now = binnedAt + 1_000;
+    const result = await service.importStars({ stars: structuredClone(initialStars) });
+
+    expect(result.updatedCount).toBe(0);
+    const row = db.items.rows.get(String(imported.id));
+    expect(row?.deletedAt).toBe(binnedAt);
+    expect(db.items.upsertBatches).toHaveLength(0);
+    expect(enqueued).toHaveLength(0);
+  });
+
   test("rejects a managed stars import when RxDB rejects an item batch", async () => {
     const db = createFakeGitHubDb();
     const enqueued: CloudSyncDocBatch[] = [];

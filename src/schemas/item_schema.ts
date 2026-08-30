@@ -13,7 +13,10 @@ export type MediaOcrMetadata = {
   engine?: string;
 };
 
-export type ContentFieldValue = string | number | boolean | string[] | null;
+export type ContentJsonPrimitive = string | number | boolean | null;
+export type ContentJsonObject = { [key: string]: ContentJsonValue };
+export type ContentJsonValue = ContentJsonPrimitive | ContentJsonObject | ContentJsonValue[];
+export type ContentFieldValue = ContentJsonValue;
 export type ContentFields = Record<string, ContentFieldValue>;
 
 export type ContentBlock = {
@@ -26,6 +29,23 @@ export type ContentBlock = {
   language?: string;
   searchable?: boolean;
   createdAt?: number;
+  updatedAt?: number;
+};
+
+export type TextArtifactRef = {
+  key: string;
+  purpose: "transcript" | "transcript-segments" | "document" | "source" | "block" | "ocr" | "other";
+  contentType: "text/plain" | "text/markdown" | "application/json";
+  byteSize: number;
+  hash: string;
+  createdAt: number;
+  label?: string;
+  language?: string;
+};
+
+export type ItemMetadata = {
+  schemaVersion: 1;
+  [key: string]: unknown;
 };
 
 export type BlobRef = {
@@ -43,6 +63,7 @@ export type AiExtraction = {
   modelVersion?: string;
   summary?: string;
   autoTags?: string[];
+  generatedUnderstanding?: Record<string, unknown>;
   suggestedFolderPath?: string[];
   suggestedType?: string;
   extractedFields?: ContentFields;
@@ -77,25 +98,42 @@ export type ItemDocType = {
     | "tiktok"
     | "substack"
     | "linkedin"
+    | "threads"
+    | "mastodon"
+    | "bluesky"
     | "github"
+    | "spotify"
+    | "ytmusic"
+    | "vimeo"
+    | "soundcloud"
     | "article";
   type?: string;
   fields?: ContentFields;
   folderId: string;
+  folderChangedAt?: number;
   spaceId: string;
   isFavorite: boolean;
   authorUsername?: string;
   likes?: number;
   upvotes?: number;
   media?: {
-    type: "image" | "video" | "audio";
+    id?: string;
+    type: "image" | "video" | "audio" | "file";
     originalUrl: string;
     storageType: "hotlink" | "opfs" | "s3";
     opfsPath?: string;
     s3Url?: string;
     embedUrl?: string;
     embedType?: "iframe";
+    s3ThumbnailUrl?: string;
     thumbnailUrl?: string;
+    mimeType?: string;
+    fileName?: string;
+    byteSize?: number;
+    contentHash?: string;
+    durationSec?: number;
+    provider?: string;
+    externalId?: string;
     expiresAt?: number;
     altText?: string;
     titleText?: string;
@@ -108,13 +146,16 @@ export type ItemDocType = {
     height?: number;
     capturedAt?: number;
     ocr?: MediaOcrMetadata;
+    visualRendition?: Record<string, unknown>;
   }[];
   blocks?: ContentBlock[];
   blobs?: BlobRef[];
+  textArtifacts?: TextArtifactRef[];
   iconUrl?: string;
   displayImageUrl?: string;
   summary?: string;
   ai?: AiExtraction;
+  metadata?: ItemMetadata;
   parentId: string | null;
   chunkOrder?: number;
   vector_index?: number;
@@ -130,12 +171,14 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 9,
+  version: 10,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
   properties: {
-    id: { type: "string", maxLength: 100 },
+    id: { type: "string", maxLength: 512 },
+    // RxDB cannot index nullable values. Local anonymous ownership stays "";
+    // cloud sync replaces it with the authenticated account id on the wire.
     userId: { type: "string", default: "", maxLength: 1000 },
     title: { type: "string" },
     textContent: { type: "string" },
@@ -176,7 +219,14 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
         "tiktok",
         "substack",
         "linkedin",
+        "threads",
+        "mastodon",
+        "bluesky",
         "github",
+        "spotify",
+        "ytmusic",
+        "vimeo",
+        "soundcloud",
         "article",
       ],
       maxLength: 20,
@@ -187,6 +237,12 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
       additionalProperties: true,
     },
     folderId: { type: "string", ref: "folders", maxLength: 1000 },
+    folderChangedAt: {
+      type: "integer",
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER - 1,
+      multipleOf: 1,
+    },
     spaceId: { type: "string", default: "space_public_default", maxLength: 1000 },
     isFavorite: { type: "boolean", default: false },
     // Social media specific fields
@@ -198,7 +254,8 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
       items: {
         type: "object",
         properties: {
-          type: { type: "string", enum: ["image", "video", "audio"] },
+          id: { type: "string", maxLength: 512 },
+          type: { type: "string", enum: ["image", "video", "audio", "file"] },
           originalUrl: { type: "string" },
           storageType: {
             type: "string",
@@ -208,7 +265,20 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
           s3Url: { type: "string" },
           embedUrl: { type: "string" },
           embedType: { type: "string", enum: ["iframe"] },
+          s3ThumbnailUrl: { type: "string" },
           thumbnailUrl: { type: "string" },
+          mimeType: { type: "string" },
+          fileName: { type: "string" },
+          byteSize: {
+            type: "integer",
+            minimum: 0,
+            maximum: Number.MAX_SAFE_INTEGER - 1,
+            multipleOf: 1,
+          },
+          contentHash: { type: "string" },
+          durationSec: { type: "number", minimum: 0 },
+          provider: { type: "string" },
+          externalId: { type: "string", maxLength: 512 },
           expiresAt: { type: "number" },
           altText: { type: "string" },
           titleText: { type: "string" },
@@ -220,6 +290,10 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
           width: { type: "number" },
           height: { type: "number" },
           capturedAt: { type: "number" },
+          visualRendition: {
+            type: "object",
+            additionalProperties: true,
+          },
           ocr: {
             type: "object",
             properties: {
@@ -274,6 +348,12 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
             maximum: Number.MAX_SAFE_INTEGER - 1,
             multipleOf: 1,
           },
+          updatedAt: {
+            type: "integer",
+            minimum: 0,
+            maximum: Number.MAX_SAFE_INTEGER - 1,
+            multipleOf: 1,
+          },
         },
         required: ["id", "kind"],
       },
@@ -308,8 +388,43 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
         required: ["key", "kind"],
       },
     },
+    textArtifacts: {
+      type: "array",
+      maxItems: 32,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          key: { type: "string", maxLength: 1024 },
+          purpose: {
+            type: "string",
+            enum: ["transcript", "transcript-segments", "document", "source", "block", "ocr", "other"],
+          },
+          contentType: {
+            type: "string",
+            enum: ["text/plain", "text/markdown", "application/json"],
+          },
+          byteSize: {
+            type: "integer",
+            minimum: 1,
+            maximum: 8 * 1024 * 1024,
+            multipleOf: 1,
+          },
+          hash: { type: "string", maxLength: 128 },
+          createdAt: {
+            type: "integer",
+            minimum: 0,
+            maximum: Number.MAX_SAFE_INTEGER - 1,
+            multipleOf: 1,
+          },
+          label: { type: "string", maxLength: 256 },
+          language: { type: "string", maxLength: 35 },
+        },
+        required: ["key", "purpose", "contentType", "byteSize", "hash", "createdAt"],
+      },
+    },
     // Content Chunking
-    parentId: { type: ["string", "null"], ref: "items", default: null, maxLength: 100 },
+    parentId: { type: ["string", "null"], ref: "items", default: null, maxLength: 512 },
     chunkOrder: { type: "number" },
     vector_index: {
       type: "number",
@@ -337,6 +452,14 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     ai: {
       type: "object",
       additionalProperties: true,
+    },
+    metadata: {
+      type: "object",
+      additionalProperties: true,
+      properties: {
+        schemaVersion: { type: "integer", enum: [1] },
+      },
+      required: ["schemaVersion"],
     },
     // Timestamps
     createdAt: {
@@ -428,7 +551,7 @@ const normalizeLegacyItem = (oldDoc: ItemDocType): ItemDocType => {
 };
 
 // Versions 2–8 were shipped before a regression reset the collection to v0.
-// v9 is the permanent high-water mark and normalizes rows from every lineage.
+// v9 restored the high-water mark; v10 adds the current shared cloud item surface.
 export const itemMigrationStrategies = {
   1: keepLegacyItem,
   2: keepLegacyItem,
@@ -439,4 +562,5 @@ export const itemMigrationStrategies = {
   7: keepLegacyItem,
   8: keepLegacyItem,
   9: normalizeLegacyItem,
+  10: normalizeLegacyItem,
 };

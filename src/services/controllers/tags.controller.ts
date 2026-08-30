@@ -236,7 +236,16 @@ export class TagsController {
     const joinId = `${payload.itemId}|${tagId}`;
     const existingJoin = await db.item_tags.findOne(joinId).exec();
     if (!existingJoin) {
-      await db.item_tags.insert({ id: joinId, itemId: payload.itemId, tagId, userId } as any);
+      const now = Date.now();
+      await db.item_tags.insert({
+        id: joinId,
+        itemId: payload.itemId,
+        tagId,
+        userId,
+        createdAt: now,
+        updatedAt: now,
+        deletedAt: 0,
+      } as any);
     }
 
     // Update the tag's updatedAt to track recent usage (LRU)

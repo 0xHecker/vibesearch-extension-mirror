@@ -44,11 +44,12 @@ import {
   withEntityMutationLock,
   withSpaceMutationLocks,
 } from "@src/services/entity-mutation-lock";
-import { getArchiveCache } from "@src/services/archive-cache";
+import { ARCHIVE_OUTBOX_DIRECTORY } from "@src/services/archive-outbox";
 import {
-  ARCHIVE_OUTBOX_DIRECTORY,
-  ARCHIVE_OUTBOX_STORAGE_KEY,
-} from "@src/services/archive-outbox";
+  clearOffscreenArchiveOutboxMetadata,
+  getOffscreenArchiveCache,
+  getOffscreenArchiveOutboxReader,
+} from "@src/services/archive-migration-storage-bridge";
 import { createLocalMigrationJsonBlob } from "@src/services/local-extension-migration-json";
 import {
   clearStagedPayloads,
@@ -560,11 +561,16 @@ class DatabaseManager {
   async restoreLocalExtensionMigrationBundle(payload: {
     bundle: LocalExtensionMigrationBundle;
   }): Promise<RestoreLocalExtensionMigrationResult> {
-    return restoreLocalExtensionMigration(payload.bundle);
+    return restoreLocalExtensionMigration(payload.bundle, {
+      archiveCache: getOffscreenArchiveCache(),
+    });
   }
 
   async buildLocalExtensionMigrationBundle(): Promise<LocalExtensionMigrationBundle> {
-    return buildLocalExtensionMigrationBundle();
+    return buildLocalExtensionMigrationBundle({
+      archiveCache: getOffscreenArchiveCache(),
+      archiveOutbox: getOffscreenArchiveOutboxReader(),
+    });
   }
 
   async buildLocalExtensionMigrationDownload(): Promise<{
@@ -573,7 +579,7 @@ class DatabaseManager {
     summary: LocalExtensionMigrationSummary;
     warnings: string[];
   }> {
-    const bundle = await buildLocalExtensionMigrationBundle();
+    const bundle = await this.buildLocalExtensionMigrationBundle();
     const blob = createLocalMigrationJsonBlob(bundle);
     if (blob.size > LOCAL_MIGRATION_MAX_JSON_BYTES) {
       throw new Error("MIGRATION_FILE_JSON_TOO_LARGE");
@@ -624,7 +630,9 @@ class DatabaseManager {
   }): Promise<RestoreLocalExtensionMigrationResult> {
     const bundle = this.stagedLocalRestoreBundles.get(payload.stageId);
     if (!bundle) throw new Error("MIGRATION_FILE_NOT_STAGED");
-    const result = await restoreLocalExtensionMigration(bundle);
+    const result = await restoreLocalExtensionMigration(bundle, {
+      archiveCache: getOffscreenArchiveCache(),
+    });
     this.stagedLocalRestoreBundles.delete(payload.stageId);
     return result;
   }
@@ -711,7 +719,7 @@ class DatabaseManager {
       if (!ignoreMissingDirectory(error)) failures.push(error);
     }
     try {
-      await getArchiveCache().clear();
+      await getOffscreenArchiveCache().clear();
     } catch (error) {
       failures.push(error);
     }
@@ -722,7 +730,7 @@ class DatabaseManager {
       if (!ignoreMissingDirectory(error)) failures.push(error);
     }
     try {
-      await chrome.storage.local.remove(ARCHIVE_OUTBOX_STORAGE_KEY);
+      await clearOffscreenArchiveOutboxMetadata();
     } catch (error) {
       failures.push(error);
     }

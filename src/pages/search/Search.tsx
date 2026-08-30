@@ -216,6 +216,8 @@ type SearchQueryPayload = {
   nextCursor?: RankQueryCursor | null;
   diagnostics?: SearchQueryDiagnostics;
   debug?: QueryDebugPayload;
+  /** Benign: a newer search generation replaced this one; keep current results. */
+  superseded?: boolean;
 };
 
 const defaultAnalysis: QueryAnalysis = {
@@ -2302,6 +2304,12 @@ const SearchInner = () => {
       if (requestId !== requestIdRef.current) {
         staleSuppressedCountRef.current += 1;
         setStaleSuppressedCount(staleSuppressedCountRef.current);
+        return;
+      }
+
+      // A newer search generation replaced this one in the controller. Benign:
+      // keep the currently rendered results instead of flashing empty state.
+      if (payload?.superseded) {
         return;
       }
 

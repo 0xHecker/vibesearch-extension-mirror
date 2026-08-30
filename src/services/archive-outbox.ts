@@ -3,7 +3,10 @@ import {
   DEFAULT_VIBESEARCH_API_BASE,
 } from "./cloud-config";
 import { getCloudAuthToken } from "./cloud-auth";
+import { getArchiveDeviceKey } from "./device-key";
 import { withOpfsMutationLock } from "./media-storage";
+import { collectArchiveItemIds, normalizeArchiveItemId } from "./archive-identity";
+import { isServerCapturableArchiveUrl } from "./archive-resource-url";
 
 export const ARCHIVE_OUTBOX_STORAGE_KEY = "vibesearch:archiveOutbox:v1";
 export const ARCHIVE_OUTBOX_ALARM_NAME = "archive-outbox-alarm";
@@ -13,6 +16,18 @@ export const ARCHIVE_OUTBOX_MAX_DISK_BYTES = 256 * 1024 * 1024;
 export const ARCHIVE_OUTBOX_MAX_JOBS = 20_000;
 export const ARCHIVE_OUTBOX_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export const ARCHIVE_OUTBOX_DRAIN_LIMIT = 2;
+/** Server captures burn Browser Run minutes; give up after this many tries. */
+export const ARCHIVE_CAPTURE_MAX_ATTEMPTS = 8;
+/**
+ * A terminal server capture is retried from the user's own browser session.
+ * That fallback opens a temporary tab, so it stays strictly bounded per queued
+ * job instead of running on every drain. Two attempts, because the first can be
+ * lost to a transient condition (a tab that cannot answer yet, a page still
+ * loading) rather than to the page being genuinely uncapturable.
+ */
+export const ARCHIVE_SESSION_CAPTURE_MAX_ATTEMPTS = 2;
+/** Marker error for a target the archiving service can never fetch. */
+export const ARCHIVE_CAPTURE_URL_NOT_PUBLIC = "ARCHIVE_CAPTURE_URL_NOT_PUBLIC";
 
 export type ArchiveOutboxJob = {
   id: string;
@@ -27,11 +42,23 @@ export type ArchiveOutboxJob = {
   nextAttemptAt: number;
   lastError?: string;
   locallyRetained?: boolean;
+  /** A bounded server capture exhausted retries and now waits for explicit user action. */
+  terminal?: true;
+  /** How many times the browser-session fallback has been started for this item. */
+  sessionCaptureAttempts?: number;
+  /**
+   * Attempts where the archiving service actually answered. The remote cap must
+   * count only these: a sync backlog or a flaky connection is not the site
+   * refusing to be captured.
+   */
+  remoteAttempts?: number;
 };
 
 export type ArchiveOutboxConnection = {
   token: string;
   apiBase: string;
+  /** Login-less identity: uploads land in the anonymous per-device namespace. */
+  deviceKey?: string;
 };
 
 export type ArchiveItemReadiness = {
@@ -62,7 +89,7 @@ export type ArchiveOutboxOptions = {
   storage: ArchiveOutboxStorage;
   files: ArchiveOutboxFiles;
   ensureItem: (itemId: string) => Promise<ArchiveItemReadiness>;
-  getConnection?: () => Promise<ArchiveOutboxConnection>;
+  getConnection?: (forceRefresh?: boolean) => Promise<ArchiveOutboxConnection>;
   fetcher?: typeof fetch;
   now?: () => number;
   randomId?: () => string;
@@ -89,8 +116,17 @@ export type ArchiveOutboxDrainResult = {
   deferred: number;
   convertedToServerCapture: number;
   discarded: number;
+  terminal: number;
+  /** Snapshots kept in the offline cache after the cloud refused the target. */
+  retainedLocally: number;
+  /**
+   * The API refused a bearer-token request during this drain. Reported even when
+   * a fallback identity later succeeded, so a dead session cannot hide behind a
+   * successful device-key upload.
+   */
+  tokenRejected: boolean;
   remaining: number;
-  reason?: "empty" | "missing-token" | "not-due";
+  reason?: "empty" | "missing-token" | "auth-required" | "not-due" | "terminal";
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -103,6 +139,25 @@ const trimError = (value: unknown): string | undefined => {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim().slice(0, 240);
   return trimmed || undefined;
+};
+
+/**
+ * Bounded, factual copy for a capture that will not be retried remotely. It
+ * states only what happened — the background worker owns the "what happens
+ * next" wording, because only it knows whether a browser-session capture is
+ * still available. The attempt count comes from the job instead of assuming the
+ * cap, because a hard rejection goes terminal on its first try.
+ */
+const terminalArchiveMessage = (job: ArchiveOutboxJob, error: string): string => {
+  if (error === ARCHIVE_CAPTURE_URL_NOT_PUBLIC) {
+    return "This page is only reachable from your browser (a local, private, or custom-port address), " +
+      "so the archiving service cannot fetch it.";
+  }
+  const detail = trimError(error) || "The site rejected automated capture.";
+  const attempts = Math.max(1, job.remoteAttempts ?? job.attempts);
+  return attempts >= ARCHIVE_CAPTURE_MAX_ATTEMPTS
+    ? `This site could not be captured after ${attempts} attempts. It may block automated archiving. ${detail}`
+    : `This site rejected automated capture. ${detail}`;
 };
 
 const normalizeHttpUrl = (value: unknown): string | null => {
@@ -119,7 +174,7 @@ const normalizeHttpUrl = (value: unknown): string | null => {
 const normalizeJob = (value: unknown): ArchiveOutboxJob | null => {
   if (!isRecord(value)) return null;
   const id = typeof value.id === "string" ? value.id.trim().slice(0, 160) : "";
-  const itemId = typeof value.itemId === "string" ? value.itemId.trim().slice(0, 160) : "";
+  const itemId = normalizeArchiveItemId(value.itemId) ?? "";
   const sourceUrl = normalizeHttpUrl(value.sourceUrl);
   const mode = value.mode === "upload" ? "upload" : value.mode === "capture" ? "capture" : null;
   const fileName = typeof value.fileName === "string" ? value.fileName.trim().slice(0, 200) : "";
@@ -127,6 +182,8 @@ const normalizeJob = (value: unknown): ArchiveOutboxJob | null => {
 
   const createdAt = safeInteger(value.createdAt, 0);
   const updatedAt = safeInteger(value.updatedAt, createdAt);
+  const sessionCaptureAttempts = safeInteger(value.sessionCaptureAttempts, 0);
+  const remoteAttempts = safeInteger(value.remoteAttempts, 0);
   return {
     id,
     itemId,
@@ -140,6 +197,9 @@ const normalizeJob = (value: unknown): ArchiveOutboxJob | null => {
     nextAttemptAt: safeInteger(value.nextAttemptAt, createdAt),
     ...(trimError(value.lastError) ? { lastError: trimError(value.lastError) } : {}),
     ...(value.locallyRetained === true ? { locallyRetained: true } : {}),
+    ...(value.terminal === true && mode === "capture" ? { terminal: true } : {}),
+    ...(sessionCaptureAttempts > 0 ? { sessionCaptureAttempts } : {}),
+    ...(remoteAttempts > 0 ? { remoteAttempts } : {}),
   };
 };
 
@@ -173,15 +233,17 @@ export const parseRetryAfterMs = (value: string | null, now = Date.now()): numbe
   return Number.isFinite(date) ? Math.max(0, date - now) : 0;
 };
 
-const defaultConnection = async (): Promise<ArchiveOutboxConnection> => {
-  const [row, token] = await Promise.all([
+const defaultConnection = async (forceRefresh = false): Promise<ArchiveOutboxConnection> => {
+  const [row, token, deviceKey] = await Promise.all([
     chrome.storage.local.get(CLOUD_SYNC_API_BASE_KEY),
-    getCloudAuthToken(),
+    getCloudAuthToken(forceRefresh).catch(() => ""),
+    getArchiveDeviceKey(),
   ]);
   const configured = typeof row[CLOUD_SYNC_API_BASE_KEY] === "string" ? row[CLOUD_SYNC_API_BASE_KEY].trim() : "";
   return {
     token,
     apiBase: (configured || DEFAULT_VIBESEARCH_API_BASE).replace(/\/+$/, ""),
+    deviceKey,
   };
 };
 
@@ -268,6 +330,43 @@ export const createOpfsArchiveOutboxFiles = (): ArchiveOutboxFiles => ({
     }
   },
 });
+
+export type PendingArchiveUpload = {
+  itemId: string;
+  body: Blob;
+  sourceUrl: string;
+  updatedAt: number;
+};
+
+/**
+ * Read the newest completed device capture even while it is still waiting in
+ * the upload outbox. The outbox bytes are already a durable local snapshot;
+ * cloud acknowledgement must not be a prerequisite for opening them.
+ */
+export const readPendingArchiveUpload = async (
+  itemIdRaw: string,
+  storage: ArchiveOutboxStorage = createChromeArchiveOutboxStorage(),
+  files: ArchiveOutboxFiles = createOpfsArchiveOutboxFiles(),
+): Promise<PendingArchiveUpload | null> => {
+  const itemId = normalizeArchiveItemId(itemIdRaw);
+  if (!itemId) return null;
+  const job = normalizeArchiveOutbox(await storage.read())
+    .filter((candidate) => candidate.itemId === itemId && candidate.mode === "upload")
+    .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id))[0];
+  if (!job?.fileName || job.byteSize < 20 || job.byteSize > ARCHIVE_OUTBOX_MAX_FILE_BYTES) {
+    return null;
+  }
+  const body = await files.read(job.fileName);
+  if (!body || body.size !== job.byteSize || body.size < 20 || body.size > ARCHIVE_OUTBOX_MAX_FILE_BYTES) {
+    return null;
+  }
+  return {
+    itemId,
+    body,
+    sourceUrl: job.sourceUrl,
+    updatedAt: job.updatedAt,
+  };
+};
 
 const ARCHIVE_OUTBOX_ERROR_MAX_BYTES = 64 * 1024;
 
@@ -359,7 +458,7 @@ export class ArchiveOutbox {
   readonly files: ArchiveOutboxFiles;
   private readonly storage: ArchiveOutboxStorage;
   private readonly ensureItem: ArchiveOutboxOptions["ensureItem"];
-  private readonly getConnection: () => Promise<ArchiveOutboxConnection>;
+  private readonly getConnection: (forceRefresh?: boolean) => Promise<ArchiveOutboxConnection>;
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
   private readonly randomId: () => string;
@@ -380,7 +479,9 @@ export class ArchiveOutbox {
     this.files = options.files;
     this.ensureItem = options.ensureItem;
     this.getConnection = options.getConnection ?? defaultConnection;
-    this.fetcher = options.fetcher ?? fetch;
+    // Bound like archive-preview: a detached fetch reference throws
+    // "Illegal invocation" in window contexts.
+    this.fetcher = options.fetcher ?? fetch.bind(globalThis);
     this.now = options.now ?? Date.now;
     this.randomId = options.randomId ?? (() => crypto.randomUUID());
     this.maxDiskBytes = options.maxDiskBytes ?? ARCHIVE_OUTBOX_MAX_DISK_BYTES;
@@ -406,14 +507,15 @@ export class ArchiveOutbox {
     fileName: string;
     byteSize: number;
   }): Promise<ArchiveOutboxJob> {
-    if (!input.itemId.trim() || !normalizeHttpUrl(input.sourceUrl)) throw new Error("INVALID_ARCHIVE_JOB");
+    const itemId = normalizeArchiveItemId(input.itemId);
+    if (!itemId || !normalizeHttpUrl(input.sourceUrl)) throw new Error("INVALID_ARCHIVE_JOB");
     if (!input.fileName || input.byteSize < 20 || input.byteSize > ARCHIVE_OUTBOX_MAX_FILE_BYTES) {
       throw new Error("INVALID_ARCHIVE_FILE");
     }
     const now = this.now();
     const job: ArchiveOutboxJob = {
       id: this.randomId(),
-      itemId: input.itemId.trim(),
+      itemId,
       mode: "upload",
       sourceUrl: new URL(input.sourceUrl).toString(),
       fileName: input.fileName,
@@ -448,11 +550,12 @@ export class ArchiveOutbox {
     options: { notBefore?: number } = {},
   ): Promise<ArchiveOutboxJob> {
     const normalizedUrl = normalizeHttpUrl(sourceUrl);
-    if (!itemId.trim() || !normalizedUrl) throw new Error("INVALID_ARCHIVE_JOB");
+    const normalizedItemId = normalizeArchiveItemId(itemId);
+    if (!normalizedItemId || !normalizedUrl) throw new Error("INVALID_ARCHIVE_JOB");
     const now = this.now();
     const job: ArchiveOutboxJob = {
       id: this.randomId(),
-      itemId: itemId.trim(),
+      itemId: normalizedItemId,
       mode: "capture",
       sourceUrl: normalizedUrl,
       byteSize: 0,
@@ -470,9 +573,7 @@ export class ArchiveOutbox {
   }
 
   async discardItems(itemIdsRaw: Iterable<string>): Promise<void> {
-    const itemIds = new Set(
-      Array.from(itemIdsRaw, (itemId) => itemId.trim()).filter(Boolean),
-    );
+    const itemIds = new Set(collectArchiveItemIds(itemIdsRaw));
     if (itemIds.size === 0) return;
     // The drain is intentionally small and single-flight. Abort its current
     // request before removing a purged item so sensitive HTML cannot finish
@@ -534,6 +635,19 @@ export class ArchiveOutbox {
     return run;
   }
 
+  /** Explicit user action: finish any current drain, bypass stored retry
+   * windows once, and attempt pending archives immediately. */
+  async drainNow(limit = ARCHIVE_OUTBOX_DRAIN_LIMIT): Promise<ArchiveOutboxDrainResult> {
+    await this.drainInFlight?.catch(() => {});
+    const now = this.now();
+    await this.mutate((jobs) => jobs.map((job) =>
+      job.attempts > 0 && job.nextAttemptAt > now
+        ? { ...job, nextAttemptAt: now }
+        : job
+    ));
+    return this.drain(limit);
+  }
+
   private async replaceItemJob(job: ArchiveOutboxJob): Promise<void> {
     const removed: ArchiveOutboxJob[] = [];
     const downgraded: ArchiveOutboxJob[] = [];
@@ -546,6 +660,20 @@ export class ArchiveOutbox {
       );
       if (job.updatedAt <= previousUpdatedAt) {
         job.updatedAt = previousUpdatedAt + 1;
+      }
+      // Any replacement inherits how many browser-session fallbacks this item
+      // already consumed — including an upload, which can later be converted
+      // back into a capture. Without that, a failed fallback that re-queues the
+      // job earns a fresh tab on the next drain and loops forever on a page the
+      // service can never fetch.
+      if (job.sessionCaptureAttempts === undefined) {
+        const inherited = jobs.reduce(
+          (highest, existing) => existing.itemId === job.itemId
+            ? Math.max(highest, existing.sessionCaptureAttempts ?? 0)
+            : highest,
+          0,
+        );
+        if (inherited > 0) job.sessionCaptureAttempts = inherited;
       }
       const next = jobs.filter((existing) => {
         if (existing.itemId !== job.itemId) return true;
@@ -590,14 +718,23 @@ export class ArchiveOutbox {
       deferred: 0,
       convertedToServerCapture: 0,
       discarded: 0,
+      terminal: 0,
+      retainedLocally: 0,
+      tokenRejected: false,
       remaining: 0,
     };
-    const connection = await this.getConnection();
+    let connection = await this.getConnection();
     let jobs = await this.list();
     if (jobs.length === 0) return { ...result, reason: "empty" };
-    if (!connection.token) return { ...result, remaining: jobs.length, reason: "missing-token" };
+    // Login-optional: a device key uploads to the anonymous namespace when no
+    // cloud account is connected.
+    if (!connection.token && !connection.deviceKey) {
+      return { ...result, remaining: jobs.length, reason: "missing-token" };
+    }
 
     const attemptedIds = new Set<string>();
+    let authRefreshAttempted = false;
+    let authRejected = false;
     while (result.attempted < limit) {
       const now = this.now();
       jobs = await this.list();
@@ -609,17 +746,58 @@ export class ArchiveOutbox {
         continue;
       }
 
-      const job = jobs.find((candidate) => candidate.nextAttemptAt <= now && !attemptedIds.has(candidate.id));
+      const job = jobs.find(
+        (candidate) =>
+          candidate.terminal !== true &&
+          candidate.nextAttemptAt <= now &&
+          !attemptedIds.has(candidate.id),
+      );
       if (!job) break;
       const jobGeneration = this.generation;
+      // Pin the controller that was current when this job was selected. A
+      // delete/clear swaps the instance after aborting it; consulting the
+      // mutable field later could otherwise give a pre-delete job a fresh,
+      // non-aborted signal and let it start uploading after it was purged.
+      const jobCancellationSignal = this.requestAbortController.signal;
       attemptedIds.add(job.id);
       result.attempted += 1;
 
+      // Server captures render the live page in a headless browser — the most
+      // expensive thing the outbox does. Pages that block bots (login walls,
+      // bot checks) fail identically every time, so stop after a bounded
+      // number of attempts instead of retrying for the job's full 30-day age.
+      if (job.mode === "capture" && (job.remoteAttempts ?? 0) >= ARCHIVE_CAPTURE_MAX_ATTEMPTS) {
+        await this.markTerminal(job, job.lastError || "ARCHIVE_CAPTURE_ATTEMPTS_EXHAUSTED");
+        result.terminal += 1;
+        continue;
+      }
+
+      // The archiving service fetches the page from its own network. A target
+      // that only resolves inside this browser (localhost, a private address,
+      // a custom port) is rejected as an unusable stub URL, identically every
+      // time. Fail it on the spot so the browser-session fallback takes over
+      // instead of spending eight remote attempts on a certain rejection.
+      if (job.mode === "capture" && !isServerCapturableArchiveUrl(job.sourceUrl)) {
+        await this.markTerminal(job, ARCHIVE_CAPTURE_URL_NOT_PUBLIC);
+        result.terminal += 1;
+        continue;
+      }
+
       let readiness: ArchiveItemReadiness;
-      try {
-        readiness = await this.ensureItem(job.itemId);
-      } catch (error) {
-        readiness = { ready: false, reason: error instanceof Error ? error.message : "ITEM_SYNC_FAILED" };
+      if (!connection.token && connection.deviceKey) {
+        // Login-less uploads anchor the item inside the anonymous namespace;
+        // there is no account to sync the item into first.
+        readiness = { ready: true };
+      } else {
+        try {
+          readiness = await this.ensureItem(job.itemId);
+        } catch (error) {
+          readiness = { ready: false, reason: error instanceof Error ? error.message : "ITEM_SYNC_FAILED" };
+        }
+      }
+      if (!(await this.isCurrentJob(job, jobGeneration, jobCancellationSignal))) {
+        result.discarded += 1;
+        continue;
       }
       if (!readiness.ready) {
         await this.deferJob(job, readiness.reason || "ITEM_NOT_SYNCED", readiness.retryAfterMs);
@@ -630,6 +808,10 @@ export class ArchiveOutbox {
       let body: Blob | null = null;
       if (job.mode === "upload") {
         body = job.fileName ? await this.files.read(job.fileName) : null;
+        if (!(await this.isCurrentJob(job, jobGeneration, jobCancellationSignal))) {
+          result.discarded += 1;
+          continue;
+        }
         if (!body || body.size < 20 || body.size > ARCHIVE_OUTBOX_MAX_FILE_BYTES) {
           await this.convertToServerCapture(job, "LOCAL_ARCHIVE_FILE_MISSING");
           result.convertedToServerCapture += 1;
@@ -640,28 +822,66 @@ export class ArchiveOutbox {
       let response: Response;
       let responseFailure = "";
       try {
-        const request = await requestWithTimeout(
+        const sendArchiveRequest = (activeConnection: ArchiveOutboxConnection) => requestWithTimeout(
           this.fetcher,
-          `${connection.apiBase}/v1/items/${encodeURIComponent(job.itemId)}/archive`,
+          `${activeConnection.apiBase}/v1/items/${encodeURIComponent(job.itemId)}/archive`,
           {
             method: job.mode === "upload" ? "PUT" : "POST",
             headers: {
-              authorization: `Bearer ${connection.token}`,
+              // Login-less uploads target the anonymous per-device namespace;
+              // the signed-in token always wins when both exist.
+              ...(activeConnection.token
+                ? { authorization: `Bearer ${activeConnection.token}` }
+                : {}),
+              ...(!activeConnection.token && activeConnection.deviceKey
+                ? { "x-vs-device-key": activeConnection.deviceKey }
+                : {}),
+              // Server-capture stubs need a source URL to anchor the item.
+              // The import marker also lets the server revive items that are
+              // alive locally but tombstoned server-side (e.g. casualties of
+              // the old bin-resurrection bug) — the user is explicitly
+              // archiving this live page right now.
               ...(job.mode === "upload"
                 ? {
                     "content-type": "text/html; charset=utf-8",
                     "x-vs-archive-byte-size": String(body?.size ?? job.byteSize),
                     "x-vs-archive-source-url": job.sourceUrl,
                   }
-                : {}),
+                : { "x-vs-archive-source-url": job.sourceUrl }),
+              "x-vs-archive-import": "1",
             },
             ...(body ? { body } : {}),
             credentials: "omit",
             cache: "no-store",
           },
           this.requestTimeoutMs,
-          this.requestAbortController.signal,
+          jobCancellationSignal,
         );
+        // One send, plus one retry if a refusal can be answered by a different
+        // identity on this device (a dead bearer session leaves the device key).
+        const send = async (activeConnection: ArchiveOutboxConnection) => {
+          const attempt = await sendArchiveRequest(activeConnection);
+          const refused = attempt.response.status === 401 || attempt.response.status === 403;
+          // Report a refused session even when the retry below rescues this
+          // upload, so a dead account cannot hide behind a working device key.
+          if (refused && activeConnection.token) result.tokenRejected = true;
+          return { attempt, refused };
+        };
+
+        let { attempt: request, refused } = await send(connection);
+        // The service answered, so this attempt counts against the remote cap.
+        await this.noteRemoteAttempt(job);
+        if (refused && !authRefreshAttempted && (connection.token || connection.deviceKey)) {
+          authRefreshAttempted = true;
+          const refreshed = await this.getConnection(true);
+          const sameIdentity =
+            refreshed.token === connection.token && refreshed.deviceKey === connection.deviceKey;
+          const usable = Boolean(refreshed.token || refreshed.deviceKey);
+          if (usable && !sameIdentity) {
+            connection = refreshed;
+            ({ attempt: request } = await send(connection));
+          }
+        }
         response = request.response;
         responseFailure = request.errorText || "";
       } catch (error) {
@@ -742,7 +962,37 @@ export class ArchiveOutbox {
       }
 
       const error = responseFailure || `${response.status} ${response.statusText}`.trim().slice(0, 240);
+      if (response.status === 401 || response.status === 403) authRejected = true;
       if (job.mode === "upload" && (response.status === 400 || response.status === 413 || response.status === 415 || response.status === 422)) {
+        // A page only this browser can reach cannot anchor a cloud archive
+        // owner, so the mirror will refuse it forever. Settle as a local-only
+        // archive instead of converting it into a server capture that can never
+        // run — but only once the bytes are confirmed still readable. The
+        // `locallyRetained` flag is written at enqueue time and the bounded
+        // cache may have evicted the entry since, and this branch deletes the
+        // last remaining copy.
+        if (!isServerCapturableArchiveUrl(job.sourceUrl) && job.locallyRetained === true) {
+          const stillReadable = body && this.isUploadedArchiveRetained
+            ? await this.isUploadedArchiveRetained(job.itemId, job.updatedAt, body.size).catch(() => false)
+            : false;
+          if (stillReadable) {
+            await this.removeJobs([job]);
+            await this.deleteJobFiles([job]);
+            result.retainedLocally += 1;
+            continue;
+          }
+          // The cache lost it: keep the outbox copy, which is now the only one.
+          if (body && this.retainUploadedArchive) {
+            try {
+              await this.retainUploadedArchive(job.itemId, body, job.updatedAt);
+            } catch {
+              // Deferring below keeps the bytes; the next drain retries.
+            }
+          }
+          await this.deferJob(job, "ARCHIVE_LOCAL_COPY_UNVERIFIED");
+          result.deferred += 1;
+          continue;
+        }
         await this.convertToServerCapture(job, error);
         result.convertedToServerCapture += 1;
         continue;
@@ -758,9 +1008,24 @@ export class ArchiveOutbox {
         response.status === 429 ||
         response.status >= 500
       ) {
-        const authDelay = response.status === 401 || response.status === 403 ? 15 * 60 * 1000 : 0;
+        // A refused bearer token normally means waiting for the user to
+        // reconnect. But when this device also holds an archive device key, the
+        // next attempt authenticates as a different identity, so there is
+        // nothing to wait for — retry soon instead of parking for 15 minutes.
+        const authRefused = response.status === 401 || response.status === 403;
+        const identityCanChange = Boolean(connection.token && connection.deviceKey);
+        const authDelay = authRefused ? (identityCanChange ? 30_000 : 15 * 60 * 1000) : 0;
         await this.deferJob(job, error, Math.max(authDelay, parseRetryAfterMs(response.headers.get("retry-after"), now)));
         result.deferred += 1;
+        continue;
+      }
+
+      if (
+        job.mode === "capture" &&
+        (response.status === 400 || response.status === 409 || response.status === 410 || response.status === 422)
+      ) {
+        await this.markTerminal(job, error);
+        result.terminal += 1;
         continue;
       }
 
@@ -770,7 +1035,10 @@ export class ArchiveOutbox {
     }
 
     result.remaining = (await this.list()).length;
-    if (result.attempted === 0 && result.remaining > 0) result.reason = "not-due";
+    if (authRejected) result.reason = "auth-required";
+    else if (result.terminal > 0 || (result.remaining > 0 && (await this.list()).every((job) => job.terminal))) {
+      result.reason = "terminal";
+    } else if (result.attempted === 0 && result.remaining > 0) result.reason = "not-due";
     return result;
   }
 
@@ -786,9 +1054,23 @@ export class ArchiveOutbox {
       updatedAt: this.now(),
       lastError: trimError(reason),
       locallyRetained: undefined,
+      // Carried explicitly: a conversion must not hand the item a fresh budget
+      // of browser-session captures.
+      ...(job.sessionCaptureAttempts ? { sessionCaptureAttempts: job.sessionCaptureAttempts } : {}),
     };
     await this.mutate((jobs) => jobs.map((candidate) => (candidate.id === job.id ? replacement : candidate)));
     await this.deleteJobFiles([job]);
+  }
+
+  /** Count one attempt where the archiving service actually responded. */
+  private async noteRemoteAttempt(job: ArchiveOutboxJob): Promise<void> {
+    await this.mutate((jobs) =>
+      jobs.map((candidate) =>
+        candidate.id === job.id
+          ? { ...candidate, remoteAttempts: (candidate.remoteAttempts ?? 0) + 1 }
+          : candidate,
+      ),
+    );
   }
 
   private async deferJob(job: ArchiveOutboxJob, error: string, retryAfterMs = 0): Promise<void> {
@@ -808,9 +1090,68 @@ export class ArchiveOutbox {
     );
   }
 
+  private async markTerminal(job: ArchiveOutboxJob, error: string): Promise<void> {
+    await this.mutate((jobs) =>
+      jobs.map((candidate) =>
+        candidate.id === job.id
+          ? {
+              ...candidate,
+              terminal: true,
+              nextAttemptAt: Number.MAX_SAFE_INTEGER,
+              updatedAt: this.now(),
+              lastError: trimError(terminalArchiveMessage(candidate, error)),
+            }
+          : candidate,
+      ),
+    );
+  }
+
+  /**
+   * Terminal captures whose only remaining remedy is a capture from the user's
+   * own browser session. Claiming increments the bounded attempt counter inside
+   * the storage mutation, so two overlapping drains can never open two tabs for
+   * the same page.
+   */
+  async claimSessionCaptureCandidates(limit = 1): Promise<ArchiveOutboxJob[]> {
+    const max = Math.max(0, Math.floor(limit));
+    if (max === 0) return [];
+    const claimable = (job: ArchiveOutboxJob): boolean =>
+      job.terminal === true &&
+      job.mode === "capture" &&
+      (job.sessionCaptureAttempts ?? 0) < ARCHIVE_SESSION_CAPTURE_MAX_ATTEMPTS;
+    // Callers poll this on every drain so a row that went terminal in an
+    // earlier worker lifetime still gets its one fallback. Read first and skip
+    // the storage write entirely when there is nothing to claim.
+    if (!(await this.list()).some(claimable)) return [];
+    const claimed: ArchiveOutboxJob[] = [];
+    await this.mutate((jobs) =>
+      jobs.map((job) => {
+        if (claimed.length >= max || !claimable(job)) return job;
+        const next: ArchiveOutboxJob = {
+          ...job,
+          sessionCaptureAttempts: (job.sessionCaptureAttempts ?? 0) + 1,
+          updatedAt: this.now(),
+        };
+        claimed.push(next);
+        return next;
+      }),
+    );
+    return claimed;
+  }
+
   private async removeJobs(toRemove: ArchiveOutboxJob[]): Promise<void> {
     const ids = new Set(toRemove.map((job) => job.id));
     await this.mutate((jobs) => jobs.filter((job) => !ids.has(job.id)));
+  }
+
+  private async isCurrentJob(
+    job: ArchiveOutboxJob,
+    generation: number,
+    cancellationSignal: AbortSignal,
+  ): Promise<boolean> {
+    if (cancellationSignal.aborted || generation !== this.generation) return false;
+    const current = (await this.list()).some((candidate) => candidate.id === job.id);
+    return current && !cancellationSignal.aborted && generation === this.generation;
   }
 
   private async deleteJobFiles(jobs: ArchiveOutboxJob[]): Promise<void> {

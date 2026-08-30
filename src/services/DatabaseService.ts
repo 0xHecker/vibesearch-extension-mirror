@@ -21,7 +21,11 @@ import { folderMigrationStrategies, folderSchema, FolderDocType } from "@src/sch
 import { spaceMigrationStrategies, spaceSchema, SpaceDocType } from "@src/schemas/space_schema";
 import { spaceGroupSchema, SpaceGroupDocType } from "@src/schemas/space_group_schema";
 import { tagSchema, TagDocType } from "@src/schemas/tag_schema";
-import { itemTagSchema, ItemTagDocType } from "@src/schemas/item_tag_schema";
+import {
+  itemTagMigrationStrategies,
+  itemTagSchema,
+  ItemTagDocType,
+} from "@src/schemas/item_tag_schema";
 import { searchHistorySchema, SearchHistoryDocType } from "@src/schemas/search_history_schema";
 import { flashcardSchema, FlashcardDocType } from "@src/schemas/flashcard_schema";
 import { deletedItemSchema, DeletedItemDocType } from "@src/schemas/deleted_item_schema";
@@ -112,6 +116,7 @@ const createDatabase = async () => {
     },
     item_tags: {
       schema: itemTagSchema,
+      migrationStrategies: itemTagMigrationStrategies,
     },
     search_history: {
       schema: searchHistorySchema,

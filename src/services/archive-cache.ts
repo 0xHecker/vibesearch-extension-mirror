@@ -3,10 +3,11 @@ import {
   readLocalDataResetState,
   type LocalDataResetState,
 } from "@src/services/large-payload-staging";
+import { collectArchiveItemIds, normalizeArchiveItemId } from "@src/services/archive-identity";
 
 export const ARCHIVE_CACHE_STORAGE_KEY = "vibesearch:archiveCache:v1";
 export const ARCHIVE_CACHE_DIRECTORY = "archive-cache-v1";
-export const ARCHIVE_CACHE_MAX_FILE_BYTES = 28 * 1024 * 1024;
+export const ARCHIVE_CACHE_MAX_FILE_BYTES = 40 * 1024 * 1024;
 export const ARCHIVE_CACHE_MAX_DISK_BYTES = 256 * 1024 * 1024;
 export const ARCHIVE_CACHE_MAX_ENTRIES = 5_000;
 
@@ -56,7 +57,7 @@ const normalizeMimeType = (value: unknown): string => {
 
 const normalizeEntry = (value: unknown): ArchiveCacheEntry | null => {
   if (!isRecord(value)) return null;
-  const itemId = typeof value.itemId === "string" ? value.itemId.trim().slice(0, 160) : "";
+  const itemId = normalizeArchiveItemId(value.itemId) ?? "";
   const fileName = typeof value.fileName === "string" ? value.fileName.trim().slice(0, 200) : "";
   const byteSize = Number.isSafeInteger(value.byteSize) ? Number(value.byteSize) : 0;
   const updatedAt = Number.isSafeInteger(value.updatedAt) && Number(value.updatedAt) >= 0
@@ -215,7 +216,7 @@ export class ArchiveCache {
   }
 
   async get(itemIdRaw: string): Promise<Blob | null> {
-    const itemId = itemIdRaw.trim();
+    const itemId = normalizeArchiveItemId(itemIdRaw);
     if (!itemId) return null;
     const entry = (await this.list()).find((candidate) => candidate.itemId === itemId);
     if (!entry) return null;
@@ -246,8 +247,8 @@ export class ArchiveCache {
     body: Blob,
     updatedAt = this.now(),
   ): Promise<ArchiveCacheEntry> {
-    const itemId = itemIdRaw.trim();
-    if (!itemId || itemId.length > 160) throw new Error("ARCHIVE_CACHE_ITEM_INVALID");
+    const itemId = normalizeArchiveItemId(itemIdRaw);
+    if (!itemId) throw new Error("ARCHIVE_CACHE_ITEM_INVALID");
     return withOpfsMutationLock(async () => {
       const existing = normalizeArchiveCache(await this.storage.read())
         .find((entry) => entry.itemId === itemId);
@@ -267,8 +268,8 @@ export class ArchiveCache {
     updatedAt = this.now(),
     options: { source?: "local" | "cloud"; replaceCloudNewer?: boolean } = {},
   ): Promise<ArchiveCacheEntry> {
-    const itemId = itemIdRaw.trim();
-    if (!itemId || itemId.length > 160) throw new Error("ARCHIVE_CACHE_ITEM_INVALID");
+    const itemId = normalizeArchiveItemId(itemIdRaw);
+    if (!itemId) throw new Error("ARCHIVE_CACHE_ITEM_INVALID");
     if (!body || body.size <= 0 || body.size > this.maxFileBytes || body.size > this.maxDiskBytes) {
       throw new Error("ARCHIVE_CACHE_FILE_INVALID");
     }
@@ -373,9 +374,7 @@ export class ArchiveCache {
   }
 
   async deleteMany(itemIdsRaw: Iterable<string>): Promise<void> {
-    const itemIds = new Set(
-      Array.from(itemIdsRaw, (itemId) => itemId.trim()).filter(Boolean),
-    );
+    const itemIds = new Set(collectArchiveItemIds(itemIdsRaw));
     if (itemIds.size === 0) return;
     await withOpfsMutationLock(async () => {
       const current = normalizeArchiveCache(await this.storage.read());

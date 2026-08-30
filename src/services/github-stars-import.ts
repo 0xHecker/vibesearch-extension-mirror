@@ -251,6 +251,9 @@ const updateFolder = (existing: FolderDocType | undefined, candidate: FolderDocT
 
 const updateItem = (existing: ItemDocType | undefined, candidate: ItemDocType, now: number) => {
   if (!existing) return candidate;
+  // Items moved to the Bin by the user stay in the Bin. The star still exists on
+  // GitHub, but reconciliation must never resurrect binned rows.
+  if (existing.deletedAt !== 0) return null;
   const contentChanged =
     existing.title !== candidate.title ||
     existing.textContent !== candidate.textContent ||
@@ -261,8 +264,7 @@ const updateItem = (existing: ItemDocType | undefined, candidate: ItemDocType, n
     existing.authorUsername !== candidate.authorUsername ||
     existing.likes !== candidate.likes ||
     existing.iconUrl !== candidate.iconUrl ||
-    existing.source !== candidate.source ||
-    existing.deletedAt !== 0;
+    existing.source !== candidate.source;
   if (!contentChanged) return null;
   return {
     ...existing,

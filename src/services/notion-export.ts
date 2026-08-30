@@ -7,6 +7,7 @@ const NOTION_REQUEST_TIMEOUT_MS = 45_000;
 const NOTION_RESPONSE_MAX_BYTES = 256 * 1024;
 const NOTION_REQUEST_MAX_BYTES = 450 * 1024;
 const NOTION_MAX_ATTEMPTS = 4;
+const NOTION_MAX_INLINE_RETRY_DELAY_MS = 30_000;
 
 type NotionText = {
   type: "text";
@@ -108,9 +109,24 @@ const readBoundedText = async (
 const retryDelayMs = (response: Response, attempt: number): number => {
   const raw = response.headers.get("retry-after")?.trim() || "";
   const seconds = Number(raw);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30_000, seconds * 1_000);
-  const date = Date.parse(raw);
-  if (Number.isFinite(date)) return Math.max(0, Math.min(30_000, date - Date.now()));
+  if (raw && Number.isFinite(seconds) && seconds >= 0) {
+    const delay = seconds * 1_000;
+    if (delay > NOTION_MAX_INLINE_RETRY_DELAY_MS) {
+      // An MV3 service worker cannot reliably stay alive for an arbitrarily
+      // long timer. Fail the export instead of violating Notion's minimum
+      // Retry-After and issuing a guaranteed-premature request.
+      throw new Error("NOTION_API_RETRY_AFTER_TOO_LONG");
+    }
+    return delay;
+  }
+  const date = raw ? Date.parse(raw) : Number.NaN;
+  if (Number.isFinite(date)) {
+    const delay = Math.max(0, date - Date.now());
+    if (delay > NOTION_MAX_INLINE_RETRY_DELAY_MS) {
+      throw new Error("NOTION_API_RETRY_AFTER_TOO_LONG");
+    }
+    return delay;
+  }
   return Math.min(8_000, 500 * 2 ** attempt);
 };
 
@@ -144,10 +160,11 @@ export async function requestNotionJson<T extends Record<string, unknown>>(
         cache: "no-store",
       });
       const raw = await readBoundedText(response, controller.signal, NOTION_RESPONSE_MAX_BYTES);
-      if (
-        [429, 500, 502, 503, 504, 529].includes(response.status) &&
-        attempt + 1 < NOTION_MAX_ATTEMPTS
-      ) {
+      // These exports only use mutating POST/PATCH requests. Notion's official
+      // client retries 429 for every method, but deliberately does not retry
+      // server errors for non-idempotent methods because a failed response can
+      // arrive after the mutation was applied.
+      if (response.status === 429 && attempt + 1 < NOTION_MAX_ATTEMPTS) {
         await wait(retryDelayMs(response, attempt));
         continue;
       }
@@ -263,12 +280,35 @@ export async function appendNotionExportItems(
 ): Promise<void> {
   if (items.length === 0) return;
   if (items.length > NOTION_BLOCKS_PER_REQUEST) throw new Error("NOTION_EXPORT_BATCH_TOO_LARGE");
-  await requestNotionJson<Record<string, unknown>>(
-    token,
-    `/blocks/${encodeURIComponent(pageId)}/children`,
-    {
-      method: "PATCH",
-      body: { children: items.map(buildNotionItemBlock) },
-    },
-  );
+  const children = items.map(buildNotionItemBlock);
+  const encoder = new TextEncoder();
+  let offset = 0;
+  while (offset < children.length) {
+    // The API allows 100 children but also caps the full payload at 500 KB.
+    // Multi-byte text can make a nominally bounded 80-block batch too large,
+    // so find the largest request under our conservative 450 KB ceiling.
+    let low = 1;
+    let high = Math.min(NOTION_BLOCKS_PER_REQUEST, children.length - offset);
+    let fittingCount = 0;
+    while (low <= high) {
+      const candidateCount = Math.floor((low + high) / 2);
+      const body = { children: children.slice(offset, offset + candidateCount) };
+      if (encoder.encode(JSON.stringify(body)).byteLength <= NOTION_REQUEST_MAX_BYTES) {
+        fittingCount = candidateCount;
+        low = candidateCount + 1;
+      } else {
+        high = candidateCount - 1;
+      }
+    }
+    if (fittingCount === 0) throw new Error("NOTION_REQUEST_TOO_LARGE");
+    await requestNotionJson<Record<string, unknown>>(
+      token,
+      `/blocks/${encodeURIComponent(pageId)}/children`,
+      {
+        method: "PATCH",
+        body: { children: children.slice(offset, offset + fittingCount) },
+      },
+    );
+    offset += fittingCount;
+  }
 }

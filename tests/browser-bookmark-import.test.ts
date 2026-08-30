@@ -409,6 +409,45 @@ describe("buildBrowserBookmarkImportPlan", () => {
     expect(enqueued).toHaveLength(0);
   });
 
+  test("reimport keeps a binned managed bookmark in the Bin when it still exists in the source tree", async () => {
+    const db = createFakeBookmarkDb();
+    const enqueued: CloudSyncDocBatch[] = [];
+    let now = NOW + 100_000;
+    const service = new BrowserBookmarkImportService({
+      getDb: async () => db as never,
+      cloudSync: {
+        enqueueDocs: async (batch) => {
+          enqueued.push(batch);
+          return { queued: 0, added: 0 };
+        },
+      } as never,
+      markSearchDirty: () => {},
+      now: () => now,
+      yieldToEventLoop: async () => {},
+      notifyDbChange: () => {},
+    });
+    const initialTree = createLargeBookmarkTree(1);
+    await service.importTree({ tree: initialTree });
+    const imported = Array.from(db.items.rows.values())[0];
+    const binnedAt = now + 5;
+    db.items.rows.set(String(imported.id), {
+      ...cloneRow(imported),
+      deletedAt: binnedAt,
+      updatedAt: binnedAt,
+    });
+    enqueued.length = 0;
+    db.items.resetWriteHistory();
+
+    now = binnedAt + 1_000;
+    const result = await service.importTree({ tree: structuredClone(initialTree) });
+
+    expect(result.updatedBookmarkCount).toBe(0);
+    const row = db.items.rows.get(String(imported.id));
+    expect(row?.deletedAt).toBe(binnedAt);
+    expect(db.items.upsertBatches).toHaveLength(0);
+    expect(enqueued).toHaveLength(0);
+  });
+
   test("rejects a managed bookmark import when RxDB rejects an item batch", async () => {
     const db = createFakeBookmarkDb();
     const enqueued: CloudSyncDocBatch[] = [];

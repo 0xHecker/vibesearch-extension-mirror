@@ -67,11 +67,25 @@ import {
   ARCHIVE_OUTBOX_ALARM_NAME,
   ARCHIVE_OUTBOX_DRAIN_LIMIT,
   ArchiveOutbox,
+  ArchiveOutboxDrainResult,
+  ArchiveOutboxJob,
   createChromeArchiveOutboxStorage,
   createOpfsArchiveOutboxFiles,
 } from "@src/services/archive-outbox";
 import { ArchiveCaptureSessionManager } from "@src/services/archive-capture-session";
 import { getArchiveCache } from "@src/services/archive-cache";
+import { collectArchiveItemIds } from "@src/services/archive-identity";
+import {
+  ARCHIVE_MIGRATION_STORAGE_BRIDGE_MESSAGE,
+  handleArchiveMigrationStorageBridge,
+  isArchiveMigrationStorageBridgeSender,
+  OFFSCREEN_DOCUMENT_PATH,
+} from "@src/services/archive-migration-storage-bridge";
+import {
+  CLOUD_AUTH_STORAGE_BRIDGE_MESSAGE,
+  handleCloudAuthStorageBridge,
+  isCloudAuthStorageBridgeSender,
+} from "@src/services/cloud-auth-storage-bridge";
 import {
   PAGE_ARCHIVE_ABORT_MESSAGE,
   PAGE_ARCHIVE_CAPTURE_MESSAGE,
@@ -81,8 +95,17 @@ import {
   PAGE_ARCHIVE_FINISH_MESSAGE,
   type ArchiveProtocolResponse,
 } from "@src/services/archive-capture-protocol";
-import { CLOUD_SYNC_TOKEN_KEY } from "@src/services/cloud-sync";
+import {
+  CLOUD_SYNC_TOKEN_KEY,
+  type CloudSyncAllResult,
+  type CloudSyncPullResult,
+} from "@src/services/cloud-sync";
 import type { CloudAuthStatus } from "@src/services/cloud-auth";
+import { getCloudAuthToken, markCloudSessionRejected } from "@src/services/cloud-auth";
+import { CLOUD_SYNC_API_BASE_KEY, DEFAULT_VIBESEARCH_API_BASE } from "@src/services/cloud-config";
+import { getArchiveDeviceKey } from "@src/services/device-key";
+import { pickLiveArchiveCaptureTab, withTemporaryArchiveTab } from "@src/services/archive-tab-recovery";
+import { isServerCapturableArchiveUrl } from "@src/services/archive-resource-url";
 import type { GitHubStar, GitHubStarsImportResult } from "@src/services/github-stars-import";
 import { collectGitHubStarsPages } from "@src/services/github-stars-api";
 import {
@@ -115,8 +138,8 @@ import {
 import {
   connectNotion,
   disconnectNotion,
-  getNotionAccessToken,
   getNotionConnectionStatus,
+  runWithNotionAccessToken,
 } from "@src/services/notion-auth";
 import {
   appendNotionExportItems,
@@ -904,12 +927,11 @@ const archiveCaptureSessions = new ArchiveCaptureSessionManager({
   outbox: archiveOutbox,
 });
 const cancelledArchiveItems = new Map<string, number>();
+const archiveSessionCaptureInFlight = new Set<string>();
 let archiveWritesSuspended = false;
 
 const purgeArchivedItems = async (itemIdsRaw: Iterable<string>): Promise<void> => {
-  const itemIds = Array.from(
-    new Set(Array.from(itemIdsRaw, (itemId) => itemId.trim()).filter(Boolean)),
-  );
+  const itemIds = collectArchiveItemIds(itemIdsRaw);
   if (itemIds.length === 0) return;
   const cancelledAt = Date.now();
   for (const itemId of itemIds) cancelledArchiveItems.set(itemId, cancelledAt);
@@ -948,7 +970,7 @@ const markArchiveItemCancelled = async (itemId: string): Promise<void> => {
 };
 
 const scheduleArchiveOutboxRetry = async (): Promise<void> => {
-  const jobs = await archiveOutbox.list();
+  const jobs = (await archiveOutbox.list()).filter((job) => job.terminal !== true);
   if (jobs.length === 0) {
     await chrome.alarms.clear(ARCHIVE_OUTBOX_RETRY_ALARM_NAME);
     return;
@@ -959,38 +981,155 @@ const scheduleArchiveOutboxRetry = async (): Promise<void> => {
   });
 };
 
-const triggerArchiveOutboxDrain = async (): Promise<void> => {
-  if (archiveWritesSuspended) return;
-  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+const triggerArchiveOutboxDrain = async (): Promise<ArchiveOutboxDrainResult | undefined> => {
+  if (archiveWritesSuspended) return undefined;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return undefined;
   try {
     const result = await archiveOutbox.drain(ARCHIVE_OUTBOX_DRAIN_LIMIT);
-    if (result.remaining > 0 && result.reason !== "missing-token") await scheduleArchiveOutboxRetry();
+    // The API refused the stored session. Record it so the UI stops reporting
+    // "Connected" while every cloud call is being rejected — even when a device
+    // key rescued this particular upload.
+    if (result.reason === "auth-required" || result.tokenRejected) {
+      await markCloudSessionRejected().catch(() => {});
+    }
+    // A capture the service can never complete is not a dead end: retry it once
+    // from the user's own browser session, which owns the cookies, the local
+    // network, and any address the service cannot reach. Checked on every drain
+    // so a row stranded by an earlier worker lifetime still gets its fallback.
+    const escalated = await escalateTerminalArchivesToSessionCapture();
+    const jobs = await archiveOutbox.list();
+    for (const job of jobs.filter((candidate) => candidate.terminal).slice(-20)) {
+      if (escalated.has(job.itemId) || archiveSessionCaptureInFlight.has(job.itemId)) continue;
+      const detail = job.lastError || "This site blocks automated archiving.";
+      sendProcessStatus(
+        `archive-${job.itemId}`,
+        "Offline preview",
+        "error",
+        `${detail} Open the page in a tab, then use View to capture it again.`,
+      );
+    }
+    if (
+      jobs.some((job) => job.terminal !== true) &&
+      result.reason !== "missing-token"
+    ) {
+      await scheduleArchiveOutboxRetry();
+    }
+    return result;
   } catch (error) {
     console.warn("[archive] outbox drain skipped", error);
     await scheduleArchiveOutboxRetry().catch(() => {});
+    return undefined;
   }
 };
 
 const queueServerArchive = async (itemId: string, archiveUrl: string): Promise<void> => {
   if (archiveWritesSuspended || cancelledArchiveItems.has(itemId)) return;
   await archiveOutbox.enqueueServerCapture(itemId, archiveUrl);
-  sendProcessStatus(`archive-${itemId}`, "Offline preview", "processing", "Queued for capture.");
-  void triggerArchiveOutboxDrain();
+  const statusId = `archive-${itemId}`;
+  sendProcessStatus(statusId, "Offline preview", "processing", "Queued for capture.");
+  const result = await triggerArchiveOutboxDrain();
+  const job = (await archiveOutbox.list()).find((candidate) => candidate.itemId === itemId);
+  if (!job) {
+    sendProcessStatus(statusId, "Offline preview", "success", "Captured.");
+    return;
+  }
+  if (result?.attempted) {
+    sendProcessStatus(
+      statusId,
+      "Offline preview",
+      "error",
+      `Capture not finished: ${job.lastError || "will retry"}`,
+    );
+  }
 };
 
-const capturePageArchiveForItem = async (input: {
-  itemId: string;
+/** Copy login-less device archives into the signed-in account (best effort). */
+const claimAnonArchives = async (): Promise<void> => {
+  try {
+    const token = await getCloudAuthToken();
+    if (!token) return;
+    const deviceKey = await getArchiveDeviceKey();
+    if (!deviceKey) return;
+    const row = await chrome.storage.local.get(CLOUD_SYNC_API_BASE_KEY);
+    const configured = typeof row[CLOUD_SYNC_API_BASE_KEY] === "string"
+      ? row[CLOUD_SYNC_API_BASE_KEY].trim().replace(/\/+$/, "")
+      : "";
+    const apiBase = configured || DEFAULT_VIBESEARCH_API_BASE;
+    const response = await fetch(`${apiBase}/v1/archives/claim`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-vs-device-key": deviceKey,
+      },
+      credentials: "omit",
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      console.warn("[archive] anon claim failed", response.status);
+      return;
+    }
+    const payload = await response.json().catch(() => null) as { imported?: number } | null;
+    if (payload?.imported) {
+      console.info(`[archive] claimed ${payload.imported} device archive(s) into account`);
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" }).catch(() => {});
+    }
+  } catch (error) {
+    console.warn("[archive] anon claim skipped", error);
+  }
+};
+
+/**
+ * A tab that just finished loading — or one reopened after an extension reload
+ * — can report "complete" a beat before its content script is listening, and
+ * `sendMessage` then fails with "Receiving end does not exist". Retry briefly
+ * on exactly that class of error so a live page is not misread as uncapturable.
+ */
+const ARCHIVE_CAPTURE_RECEIVER_RETRY_DELAY_MS = 400;
+const ARCHIVE_CAPTURE_RECEIVER_MAX_ATTEMPTS = 8;
+
+const isMissingCaptureReceiverError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /receiving end does not exist|could not establish connection|message port closed/i.test(message);
+};
+
+const sendArchiveCaptureRequest = async (
+  tabId: number,
+  message: unknown,
+  deadlineAt: number,
+): Promise<unknown> => {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < ARCHIVE_CAPTURE_RECEIVER_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (error) {
+      lastError = error;
+      if (!isMissingCaptureReceiverError(error)) throw error;
+      if (Date.now() + ARCHIVE_CAPTURE_RECEIVER_RETRY_DELAY_MS >= deadlineAt) break;
+      await new Promise((resolve) => setTimeout(resolve, ARCHIVE_CAPTURE_RECEIVER_RETRY_DELAY_MS));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("ARCHIVE_CAPTURE_NO_RECEIVER");
+};
+
+const capturePageArchiveForItem = async (input: {  itemId: string;
   archiveUrl: string;
   liveArchiveUrl?: string;
   tab?: chrome.tabs.Tab;
-}): Promise<void> => {
-  if (archiveWritesSuspended) return;
+  deferDrain?: boolean;
+}): Promise<{ capturedLocally: boolean; reason?: string }> => {
+  if (archiveWritesSuspended) {
+    return { capturedLocally: false, reason: "ARCHIVE_WRITES_SUSPENDED" };
+  }
   cancelledArchiveItems.delete(input.itemId);
   const tabId = input.tab?.id;
   const liveUrl = normalizeHttpUrl(input.liveArchiveUrl || null);
+  // A server capture is only useful insurance when the service can actually
+  // fetch the target; for a local-only page it just re-fails and re-marks the
+  // row terminal between recovery attempts.
+  const serverFallbackUsable = isServerCapturableArchiveUrl(input.archiveUrl);
   if (typeof tabId !== "number" || !liveUrl) {
-    await queueServerArchive(input.itemId, input.archiveUrl);
-    return;
+    if (serverFallbackUsable) await queueServerArchive(input.itemId, input.archiveUrl);
+    return { capturedLocally: false, reason: "ARCHIVE_LIVE_TAB_UNAVAILABLE" };
   }
 
   const statusId = `archive-${input.itemId}`;
@@ -1005,10 +1144,12 @@ const capturePageArchiveForItem = async (input: {
     // The service worker can be terminated unexpectedly even while Chrome would
     // normally keep this message alive. A delayed server job is the durable
     // fallback; a completed local capture replaces it with the OPFS upload.
-    await archiveOutbox.enqueueServerCapture(input.itemId, input.archiveUrl, {
-      notBefore: deadlineAt + 2_000,
-    });
-    await scheduleArchiveOutboxRetry();
+    if (serverFallbackUsable) {
+      await archiveOutbox.enqueueServerCapture(input.itemId, input.archiveUrl, {
+        notBefore: deadlineAt + 2_000,
+      });
+      await scheduleArchiveOutboxRetry();
+    }
     const opened = await archiveCaptureSessions.open({
       itemId: input.itemId,
       tabId,
@@ -1023,7 +1164,7 @@ const capturePageArchiveForItem = async (input: {
     let response: ArchiveProtocolResponse;
     try {
       response = (await Promise.race([
-        chrome.tabs.sendMessage(tabId, {
+        sendArchiveCaptureRequest(tabId, {
           type: PAGE_ARCHIVE_CAPTURE_MESSAGE,
           payload: {
             sessionId,
@@ -1031,7 +1172,7 @@ const capturePageArchiveForItem = async (input: {
             deadlineAt,
             maxHtmlBytes: opened.maxHtmlBytes,
           },
-        }),
+        }, deadlineAt),
         timeoutPromise,
       ])) as ArchiveProtocolResponse;
     } finally {
@@ -1041,16 +1182,136 @@ const capturePageArchiveForItem = async (input: {
     if (archiveCaptureSessions.isOpen(sessionId)) throw new Error("ARCHIVE_CAPTURE_INCOMPLETE");
     if (archiveWritesSuspended || cancelledArchiveItems.has(input.itemId)) {
       await archiveOutbox.discardItem(input.itemId);
-      return;
+      return { capturedLocally: false, reason: "ARCHIVE_CAPTURE_CANCELLED" };
     }
     sendProcessStatus(statusId, "Offline preview", "processing", "Captured locally; waiting to sync.");
-    void triggerArchiveOutboxDrain();
+    if (!input.deferDrain) void triggerArchiveOutboxDrain();
+    return { capturedLocally: true };
   } catch (error) {
     if (sessionId) await archiveCaptureSessions.abort(sessionId, tabId).catch(() => {});
-    if (archiveWritesSuspended || cancelledArchiveItems.has(input.itemId)) return;
+    const detail = error instanceof Error ? error.message : "ARCHIVE_CAPTURE_FAILED";
+    if (archiveWritesSuspended || cancelledArchiveItems.has(input.itemId)) {
+      return { capturedLocally: false, reason: detail };
+    }
     console.warn("[archive] live page capture fell back to server capture", error);
-    await queueServerArchive(input.itemId, input.archiveUrl);
+    if (serverFallbackUsable) await queueServerArchive(input.itemId, input.archiveUrl);
+    return { capturedLocally: false, reason: detail };
   }
+};
+
+const captureArchiveForPreviewRecovery = async (
+  itemId: string,
+  sourceUrlRaw: string,
+): Promise<{ captured: boolean; reason?: string }> => {
+  const sourceUrl = normalizeHttpUrl(sourceUrlRaw);
+  if (!itemId || !sourceUrl) {
+    return { captured: false, reason: "This item has no valid web address to capture." };
+  }
+
+  const captureLoadedTab = async (tab: chrome.tabs.Tab) => {
+    const liveUrl = normalizeHttpUrl(tab.url);
+    if (!liveUrl) throw new Error("ARCHIVE_RECOVERY_TAB_URL_INVALID");
+    const result = await capturePageArchiveForItem({
+      itemId,
+      archiveUrl: sourceUrl,
+      liveArchiveUrl: liveUrl,
+      tab,
+      deferDrain: true,
+    });
+    if (!result.capturedLocally) {
+      throw new Error(result.reason || "ARCHIVE_BROWSER_CAPTURE_FAILED");
+    }
+  };
+
+  try {
+    const openTabs = await chrome.tabs.query({});
+    const existing = pickLiveArchiveCaptureTab(openTabs, sourceUrl, normalizeHttpUrl);
+    if (existing) {
+      try {
+        await captureLoadedTab(existing as chrome.tabs.Tab);
+      } catch (error) {
+        // The tab looked usable but could not answer — its content script was
+        // orphaned by an extension reload, it is mid-navigation, or the browser
+        // froze it. A tab we open ourselves always has a live content script,
+        // so retry there instead of spending the whole recovery on that tab.
+        console.warn("[archive] open tab could not be captured; retrying in a temporary tab", error);
+        await withTemporaryArchiveTab(sourceUrl, captureLoadedTab);
+      }
+    } else {
+      await withTemporaryArchiveTab(sourceUrl, captureLoadedTab);
+    }
+  } catch (error) {
+    // If the browser itself cannot load the page, retain a durable server job
+    // so a transient offline/load failure can still recover later. A target the
+    // service can never fetch is left terminal instead of churning the queue.
+    const alreadyQueued = (await archiveOutbox.list()).some((job) => job.itemId === itemId);
+    if (!alreadyQueued && isServerCapturableArchiveUrl(sourceUrl)) {
+      await archiveOutbox.enqueueServerCapture(itemId, sourceUrl);
+      await triggerArchiveOutboxDrain();
+    }
+    const detail = error instanceof Error ? error.message : "ARCHIVE_BROWSER_CAPTURE_FAILED";
+    return { captured: false, reason: detail };
+  }
+
+  // The OPFS capture is already complete. Cloud is a mirror and must not add a
+  // 60-second upload gate before the eye icon can render the local HTML.
+  void triggerArchiveOutboxDrain();
+  return { captured: true };
+};
+
+/** At most one temporary recovery tab per drain, so a batch cannot flood tabs. */
+const ARCHIVE_SESSION_CAPTURE_PER_DRAIN = 1;
+
+/**
+ * A server capture that went terminal — a bot wall, a permanently refused
+ * target, or an address only this browser can resolve — still has one reliable
+ * route left: capture the page in the user's own session. Claiming the job
+ * bounds this to a single automatic retry, and the explicit "capture now"
+ * action in the preview sheet remains available afterwards.
+ */
+const escalateTerminalArchivesToSessionCapture = async (): Promise<Set<string>> => {
+  const handled = new Set<string>();
+  if (archiveWritesSuspended) return handled;
+  const candidates = await archiveOutbox
+    .claimSessionCaptureCandidates(ARCHIVE_SESSION_CAPTURE_PER_DRAIN)
+    .catch(() => [] as ArchiveOutboxJob[]);
+  for (const job of candidates) {
+    if (cancelledArchiveItems.has(job.itemId) || archiveSessionCaptureInFlight.has(job.itemId)) continue;
+    const statusId = `archive-${job.itemId}`;
+    archiveSessionCaptureInFlight.add(job.itemId);
+    handled.add(job.itemId);
+    sendProcessStatus(
+      statusId,
+      "Offline preview",
+      "processing",
+      "Automated capture was refused. Capturing this page from your browser session…",
+    );
+    try {
+      const result = await captureArchiveForPreviewRecovery(job.itemId, job.sourceUrl);
+      if (result.captured) {
+        sendProcessStatus(statusId, "Offline preview", "success", "Captured from your browser session.");
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" }).catch(() => {});
+      } else {
+        sendProcessStatus(
+          statusId,
+          "Offline preview",
+          "error",
+          `Could not capture this page, even from your browser session. ${result.reason ?? ""}`.trim(),
+        );
+      }
+    } catch (error) {
+      console.warn("[archive] browser-session recovery failed", error);
+      sendProcessStatus(
+        statusId,
+        "Offline preview",
+        "error",
+        "Could not capture this page. Open it in a tab and use View to capture it again.",
+      );
+    } finally {
+      archiveSessionCaptureInFlight.delete(job.itemId);
+    }
+  }
+  return handled;
 };
 
 const deleteAllLocalDataOrchestrated = async (): Promise<{ deletedCollections: number }> => {
@@ -4027,6 +4288,35 @@ const runArchiveSnapshotAction = async (
 
   sendProcessStatus(job.id, job.label, "processing", "Saving and queuing an offline preview…");
   try {
+    const archiveUrl = normalizeHttpUrl(
+      context.frameUrl || context.pageUrl || context.tabUrl || tab?.url || null
+    );
+    const candidateUrls = uniqueList([
+      archiveUrl || "",
+      normalizeHttpUrl(context.pageUrl) || "",
+      normalizeHttpUrl(context.tabUrl) || "",
+      normalizeHttpUrl(tab?.url) || "",
+    ]);
+    const existing = candidateUrls.length > 0
+      ? await sendForwardedToOffscreen<{ id: string; url: string } | null>({
+          service: "items",
+          type: "findLiveByUrls",
+          payload: { urls: candidateUrls },
+        })
+      : null;
+    if (existing && archiveUrl) {
+      await capturePageArchiveForItem({
+        itemId: existing.id,
+        archiveUrl,
+        liveArchiveUrl: resolveLiveArchiveUrl(context, tab),
+        tab,
+      });
+      sendProcessStatus(job.id, job.label, "success", "Saved; the existing archive was updated.");
+      await showBrandedToast(tab, "Archive updated", [
+        { label: "Open", action: "OPEN_SEARCH" },
+      ], 4000);
+      return;
+    }
     await runImportAction({ mode: "save", spaceId: PUBLIC_SPACE_ID }, context, tab);
     sendProcessStatus(job.id, job.label, "success", "Saved; the offline preview is queued.");
   } catch (error) {
@@ -4542,6 +4832,33 @@ const scheduleCloudSyncContinuation = async (): Promise<void> => {
   }
 };
 
+/**
+ * Read this account's changes from other devices. Additive by construction, so
+ * a failure here never leaves the local library in a half-merged state.
+ */
+/** One explicit "back up these" action stays bounded. */
+const CLOUD_SYNC_SELECTION_LIMIT = 200;
+
+const pullCloudChanges = async (): Promise<CloudSyncPullResult | undefined> => {
+  try {
+    const result = await sendForwardedToOffscreen<CloudSyncPullResult>({
+      service: "cloudSync",
+      type: "pull",
+      payload: { maxPages: 4 },
+    });
+    if (result?.inserted) {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" }).catch(() => {});
+    }
+    if (result?.reason === "invalid-auth") {
+      await markCloudSessionRejected().catch(() => {});
+    }
+    return result;
+  } catch (error) {
+    console.warn("[cloudSync] pull skipped", error);
+    return undefined;
+  }
+};
+
 const triggerCloudSync = (): Promise<void> => {
   if (!isOnline()) return Promise.resolve();
   cloudSyncRequestVersion += 1;
@@ -4555,7 +4872,23 @@ const triggerCloudSync = (): Promise<void> => {
         type: "drain",
         payload: { maxBatches: 10 },
       });
-      if (shouldScheduleCloudSyncContinuation(result) || cloudSyncRequestVersion > runVersion) {
+      // A background refusal is the common case (the user may never open
+      // settings), so the session state is corrected here too.
+      const pushRefused = (result as { reason?: string; error?: string } | undefined);
+      if (
+        pushRefused?.reason === "invalid-auth" ||
+        (pushRefused?.reason === "http-error" && /^(401|403)\b/.test(pushRefused.error || ""))
+      ) {
+        await markCloudSessionRejected().catch(() => {});
+      }
+      // Sync is two-way: after handing this device's changes over, read what the
+      // other devices added. Pull is additive, so it can never undo local work.
+      const pulled = await pullCloudChanges();
+      if (
+        shouldScheduleCloudSyncContinuation(result) ||
+        pulled?.hasMore === true ||
+        cloudSyncRequestVersion > runVersion
+      ) {
         await scheduleCloudSyncContinuation();
       }
     } catch (error) {
@@ -4859,6 +5192,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sender?.id === chrome.runtime.id && typeof sender.tab?.id === "number" ? sender.tab.id : null;
   if (
     message?.target === "background" &&
+    message?.type === CLOUD_AUTH_STORAGE_BRIDGE_MESSAGE
+  ) {
+    if (!isCloudAuthStorageBridgeSender(
+      sender,
+      chrome.runtime.id,
+      chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH),
+    )) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void handleCloudAuthStorageBridge(message?.payload)
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Cloud auth storage bridge failed",
+      }));
+    return true;
+  }
+  if (
+    message?.target === "background" &&
+    message?.type === ARCHIVE_MIGRATION_STORAGE_BRIDGE_MESSAGE
+  ) {
+    if (!isArchiveMigrationStorageBridgeSender(
+      sender,
+      chrome.runtime.id,
+      chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH),
+    )) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void handleArchiveMigrationStorageBridge(message?.payload)
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "Archive storage bridge failed",
+      }));
+    return true;
+  }
+  if (
+    message?.target === "background" &&
     CONNECTOR_MESSAGE_TYPES.has(String(message?.type || "")) &&
     (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender))
   ) {
@@ -4999,11 +5372,200 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.target === "background" && message?.type === "ARCHIVE_CLAIM_ANON") {
+    if (isTrustedExtensionSender(sender)) {
+      void claimAnonArchives();
+    }
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "ARCHIVE_CAPTURE_NOW") {
+    if (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    const itemId = typeof message?.payload?.itemId === "string" ? message.payload.itemId : "";
+    const sourceUrl = typeof message?.payload?.url === "string" ? message.payload.url : "";
+    void (async () => {
+      if (archiveWritesSuspended) throw new Error("Archive writes are temporarily suspended.");
+      const statusId = `archive-${itemId}`;
+      sendProcessStatus(
+        statusId,
+        "Offline preview",
+        "processing",
+        "Capturing this page from your browser session…",
+      );
+      const result = await captureArchiveForPreviewRecovery(itemId, sourceUrl);
+      if (result.captured) {
+        sendProcessStatus(
+          statusId,
+          "Offline preview",
+          "success",
+          "Captured. Open the archived copy again.",
+        );
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" }).catch(() => {});
+        return { queued: true, captured: true };
+      }
+      const detail = result.reason || "Capture is queued for retry.";
+      sendProcessStatus(statusId, "Offline preview", "error", `Capture not finished: ${detail}`);
+      return { queued: true, captured: false, reason: detail };
+    })()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "Capture request failed",
+        }),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_SYNC_ITEMS") {
+    if (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    const itemIds = Array.isArray(message?.payload?.itemIds)
+      ? message.payload.itemIds.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
+      : [];
+    void (async () => {
+      if (itemIds.length === 0) return { synced: 0, pending: 0 };
+      if (!isOnline()) throw new Error("You're offline. Reconnect, then try again.");
+      // Push these first, then read back what other devices have added.
+      for (const itemId of itemIds.slice(0, CLOUD_SYNC_SELECTION_LIMIT)) {
+        await sendForwardedToOffscreen({
+          service: "cloudSync",
+          type: "pushItem",
+          payload: { itemId },
+        });
+      }
+      await pullCloudChanges();
+      const states = await sendForwardedToOffscreen<Record<string, string>>({
+        service: "cloudSync",
+        type: "itemSyncState",
+        payload: { itemIds },
+      });
+      const values = Object.values(states || {});
+      return {
+        synced: values.filter((state) => state === "synced").length,
+        pending: values.filter((state) => state !== "synced").length,
+      };
+    })()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "Backup failed.",
+        }),
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_SYNC_ITEM_STATE") {
+    if (!isTrustedExtensionSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    const itemIds = Array.isArray(message?.payload?.itemIds)
+      ? message.payload.itemIds.filter((id: unknown): id is string => typeof id === "string")
+      : [];
+    void sendForwardedToOffscreen<Record<string, string>>({
+      service: "cloudSync",
+      type: "itemSyncState",
+      payload: { itemIds },
+    })
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch(() => sendResponse({ success: true, payload: {} }));
+    return true;
+  }
+
   if (message?.target === "background" && message?.type === "CLOUD_SYNC_QUEUED") {
     if (isTrustedExtensionSender(sender)) {
       void triggerCloudSync().then(() => triggerArchiveOutboxDrain());
     }
     return;
+  }
+
+  if (message?.target === "background" && message?.type === "CLOUD_SYNC_NOW") {
+    if (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void runBackgroundDataJob(async () => {
+      if (!isOnline()) throw new Error("You’re offline. Reconnect, then try syncing again.");
+      sendProcessStatus(
+        "cloud-manual-sync",
+        "Cloud library",
+        "processing",
+        "Checking local records and syncing them to your account…",
+      );
+      const result = await sendForwardedToOffscreen<CloudSyncAllResult>({
+        service: "cloudSync",
+        type: "syncAll",
+        payload: { pageSize: 250, maxBatches: 25 },
+      });
+      if (shouldScheduleCloudSyncContinuation(result.push)) {
+        await scheduleCloudSyncContinuation();
+      }
+      if (
+        result.push.reason &&
+        result.push.reason !== "empty"
+      ) {
+        const refusedByServer = result.push.reason === "invalid-auth" ||
+          (result.push.reason === "http-error" && /^(401|403)\b/.test(result.push.error || ""));
+        if (refusedByServer) {
+          // The server rejected this session: stop reporting "Connected".
+          await markCloudSessionRejected().catch(() => {});
+          throw new Error("Your Vibesearch session expired. Reconnect your cloud account and try again.");
+        }
+        if (result.push.reason === "missing-token") {
+          throw new Error("Connect your cloud account to sync this library.");
+        }
+        throw new Error(result.push.error || `Cloud sync stopped: ${result.push.reason}`);
+      }
+
+      const archive = await (async () => {
+        await claimAnonArchives();
+        return archiveOutbox.drainNow(ARCHIVE_OUTBOX_DRAIN_LIMIT);
+      })();
+      if (archive.remaining > 0 && archive.reason !== "missing-token") {
+        await scheduleArchiveOutboxRetry();
+      }
+      if (archive.reason === "auth-required" || archive.tokenRejected) {
+        // The API actually refused a token: the session is dead.
+        await markCloudSessionRejected().catch(() => {});
+        throw new Error("Your Vibesearch session expired. Reconnect your cloud account and try again.");
+      }
+      if (archive.reason === "missing-token") {
+        // No usable credential on this device — not a refusal, so the account is
+        // left alone and the user is told what to do.
+        throw new Error("Connect your cloud account to back up archives.");
+      }
+
+      // Two-way: hand this device's changes over, then bring the others' down.
+      const pulled = await pullCloudChanges();
+      const remaining = result.push.remaining + archive.remaining;
+      const arrived = pulled?.inserted ?? 0;
+      const arrivedNote = arrived > 0
+        ? ` ${arrived.toLocaleString()} ${arrived === 1 ? "item" : "items"} from your other devices arrived.`
+        : "";
+      sendProcessStatus(
+        "cloud-manual-sync",
+        "Cloud library",
+        "success",
+        remaining > 0
+          ? `Checked ${result.scanned.toLocaleString()} local records; ${remaining.toLocaleString()} uploads will continue in the background.${arrivedNote}`
+          : `Checked and synced ${result.scanned.toLocaleString()} local records.${arrivedNote}`,
+      );
+      return { ...result, archive, pull: pulled };
+    })
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) => {
+        const detail = error instanceof Error ? error.message : "Cloud sync failed.";
+        sendProcessStatus("cloud-manual-sync", "Cloud library", "error", detail);
+        sendResponse({ success: false, error: detail });
+      });
+    return true;
   }
 
   if (message?.target === "background" && message?.type === "HOVER_SAVE_TARGET") {
@@ -5491,8 +6053,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.target === "background" && message?.type === "NOTION_EXPORT_ALL") {
     void runBackgroundDataJob(async () => {
       sendProcessStatus("notion-export", "Notion export", "processing", "Connecting to Notion...");
-      const token = await getNotionAccessToken({ interactive: true });
-      const page = await createNotionExportPage(token);
+      const page = await runWithNotionAccessToken(
+        (token) => createNotionExportPage(token),
+        { interactive: true },
+      );
       let itemCount = 0;
       let afterId = "";
       try {
@@ -5506,7 +6070,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (itemCount + batch.items.length > NOTION_EXPORT_MAX_ITEMS) {
             throw new Error("NOTION_EXPORT_ITEM_LIMIT");
           }
-          await appendNotionExportItems(token, page.id, batch.items);
+          await runWithNotionAccessToken(
+            (token) => appendNotionExportItems(token, page.id, batch.items),
+            { interactive: false },
+          );
           itemCount += batch.items.length;
           sendProcessStatus(
             "notion-export",

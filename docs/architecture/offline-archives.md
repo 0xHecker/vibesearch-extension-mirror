@@ -3,9 +3,10 @@
 Vibesearch stores a durable, inert HTML snapshot for a saved web page so web and
 mobile clients can preview it when the original site is unavailable. The
 extension is the high-fidelity capture source; the Cloudflare API is the
-sanitizer, fallback capturer, and R2 owner. The card View action fetches the
-latest snapshot by item ID and renders it in the extension's right-side preview
-sheet rather than embedding the live website.
+sanitizer, fallback capturer, and R2 owner. The card View action reads a
+completed pending device capture first, then the acknowledged local cache, and
+only then fetches cloud storage by item ID. It renders the result in the
+extension's right-side preview sheet rather than embedding the live website.
 
 Implementation: `src/content/page-archive-capture.ts`,
 `src/services/archive-capture-session.ts`, `src/services/archive-outbox.ts`,
@@ -44,6 +45,11 @@ only one newest archive job per item. A successful upload is not acknowledged
 locally until the same bytes are safely copied into the bounded archive cache,
 so turning the device offline after save does not break View. Server-captured or
 cross-device archives are added to this cache after their first online preview.
+Completed live captures are also directly readable from the durable outbox, so
+offline, auth, or upload delay never blocks View before acknowledgement.
+
+Explicit re-archive resolves the newest live item with the same normalized URL
+and replaces its one pending snapshot. It does not add another library row.
 
 ## Live capture
 
@@ -93,6 +99,38 @@ An invalid or oversized client snapshot is converted to server capture. Undo is
 acknowledged only after the active capture, outbox job, OPFS file, and saved item
 cleanup complete.
 
+Server captures stop automatically after eight failed attempts. A target the
+service can never fetch — localhost, a private or link-local address, a custom
+port, embedded credentials, or a URL too long for the edge to forward — is
+failed on the first drain without spending a remote attempt, because the API
+answers it with an unusable-stub rejection every time.
+
+A terminal capture then escalates once to a capture from the user's own browser
+session: the recovery path reuses a live open tab for that URL or loads it in one
+temporary background tab, so bot walls and local-only addresses both succeed
+where the service could not. A discarded tab is never chosen — it reports its URL
+but runs no content script — and if a tab that looked usable cannot answer (its
+content script was orphaned by an extension reload, or it is mid-navigation) the
+recovery retries in a temporary tab rather than spending the escalation there. A
+freshly loaded tab can also report `complete` a beat before its content script
+listens, so the capture request retries briefly on a missing receiver.
+
+The escalation budget is stored on the outbox row and inherited by any
+replacement job, so a failing page can never earn a fresh tab on every drain.
+Two attempts are allowed, because the first can be lost to a transient condition
+rather than to the page being genuinely uncapturable. After it is spent, the row
+keeps its bounded error text and the UI points to the explicit live-page/session
+capture, which replaces the terminal row and starts a clean retry generation.
+
+A delayed server-capture fallback is only written when the service can actually
+fetch the target; queueing one for a local-only page just re-fails and re-marks
+the row terminal between recovery attempts.
+
+A client upload whose target cannot anchor a cloud archive owner (login-less
+namespaces materialize that owner from the source URL) settles as a local-only
+archive: the exact bytes stay in the offline cache and the job is retired
+instead of degrading into a server capture that can never run.
+
 ## Stored security model
 
 The API removes scripts, event handlers, forms, refresh navigation, frames,
@@ -105,6 +143,11 @@ then adds the same data-only CSP before the stored bytes and
 uses a unique-origin, scriptless iframe. It reads at most 28 MiB, owns one Blob
 URL at a time, aborts an in-flight request when the sheet closes, and revokes the
 URL on close, retry, item switch, or unmount.
+
+Cloud storage refusing a login-less device key is treated exactly like a missing
+cloud copy, not as an auth wall: with no account there is nothing to sign in to,
+so the viewer captures the page in-session and opens that instead. The connect
+nudge is reserved for the case where no local copy can be produced either.
 
 The full local JSON migration format includes cached archive bytes as base64 and
 restores version-one backups that predate this field. The portable Drive backup

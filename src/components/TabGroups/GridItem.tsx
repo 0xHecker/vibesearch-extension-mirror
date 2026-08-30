@@ -15,6 +15,10 @@ import {
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../ui/tooltip";
+import {
+  itemCloudSyncLabel,
+  useItemCloudSyncState,
+} from "./use-item-cloud-sync-state";
 import { ConfirmDialog } from "@components/ui/confirm-dialog";
 import { EyeOpen } from "@components/icons/eye-open";
 import { DeleteIcon } from "../icons/delete";
@@ -37,7 +41,13 @@ import {
   MorphingDialog,
   MorphingDialogTrigger,
 } from "@components/ui/morphing-dialog";
-import { Star, Maximize2 } from "lucide-react";
+import {
+  Star,
+  Maximize2,
+  CloudCheck as CloudCheckIcon,
+  CloudUpload as CloudUploadIcon,
+  CloudOff as CloudOffIcon,
+} from "lucide-react";
 import { useSelection } from "./SelectionContext";
 import { WebsitePreview } from "./WebsitePreview";
 import { ItemMediaPreview } from "./ItemMediaPreview";
@@ -99,6 +109,9 @@ export const GridItem = memo(({
 
   const { isSelectionMode, isSelected, toggleItem, selectItem } = useSelection();
   const itemIsSelected = isSelected(item.id);
+  // Only asked for once the card is hovered, so a long grid costs nothing.
+  const [syncStateWanted, setSyncStateWanted] = useState(false);
+  const cloudSyncState = useItemCloudSyncState(item.id, syncStateWanted);
   const isLoading = !item.isMetaFetched || isRefreshing;
   const description = useMemo(
     () => appendOcrTextToTextContent(item.textContent, item.ocrText),
@@ -279,7 +292,7 @@ export const GridItem = memo(({
       item.source === "youtube" ||
       !!getYouTubeVideoIdFromUrl(item.url) ||
       (item.media || []).some((m) =>
-        [m.embedUrl, m.originalUrl, m.pageUrl, m.thumbnailUrl]
+        [m.embedUrl, m.originalUrl, m.pageUrl, m.s3ThumbnailUrl, m.thumbnailUrl]
           .filter(Boolean)
           .some((url) => !!url && !!getYouTubeVideoIdFromUrl(url))
       );
@@ -289,6 +302,9 @@ export const GridItem = memo(({
       entries.push(e);
     };
     for (const m of item.media || []) {
+      // File attachments are synced and preserved, but this lightbox only
+      // renders visual/audio media. Keep its existing presentation contract.
+      if (m.type === "file") continue;
       let src: string | null = null;
       let embedType: LightboxEntry["embedType"];
       if (m.type === "video" && m.embedUrl) {
@@ -317,7 +333,7 @@ export const GridItem = memo(({
         type: m.type,
         src,
         embedType,
-        thumbnailSrc: m.thumbnailUrl,
+        thumbnailSrc: m.s3ThumbnailUrl || m.thumbnailUrl,
         width: m.width,
         height: m.height,
         altText: m.altText,
@@ -564,7 +580,33 @@ export const GridItem = memo(({
               "absolute right-3 top-3 z-20 flex items-center gap-2 text-foreground-tertiary transition-all duration-200",
               "opacity-0 group-hover/card:opacity-100"
             )}
+            onMouseEnter={() => setSyncStateWanted(true)}
+            onFocus={() => setSyncStateWanted(true)}
           >
+            {cloudSyncState !== "unknown" && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    aria-label={itemCloudSyncLabel(cloudSyncState)}
+                    className={cn(
+                      "flex size-5 items-center justify-center",
+                      cloudSyncState === "synced" && "text-foreground-positive",
+                      cloudSyncState === "pending" && "text-foreground-warning",
+                      cloudSyncState === "not-connected" && "text-foreground-tertiary",
+                    )}
+                  >
+                    {cloudSyncState === "synced" ? (
+                      <CloudCheckIcon size={16} />
+                    ) : cloudSyncState === "pending" ? (
+                      <CloudUploadIcon size={16} />
+                    ) : (
+                      <CloudOffIcon size={16} />
+                    )}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{itemCloudSyncLabel(cloudSyncState)}</TooltipContent>
+              </Tooltip>
+            )}
             <Button
               variant={"ghost"}
               className="size-5 p-1 text-foreground-tertiary transition-colors duration-300 hover:bg-transparent hover:text-accent"

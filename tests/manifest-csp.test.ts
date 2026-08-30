@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import manifest from "../manifest.base.json";
 import chromeManifest from "../manifest.chrome.json";
 import firefoxManifest from "../manifest.firefox.json";
@@ -62,6 +63,33 @@ describe("browser-specific production manifests", () => {
     expect(chrome.permissions).toContain("offscreen");
     expect(chrome.sandbox.pages).toContain("src/pages/ocr-sandbox/index.html");
     expect(chrome.host_permissions).toEqual(hostPermissions);
+  });
+
+  test("pins the production Chrome ID and Drive-only OAuth contract", () => {
+    const chrome = createChromeManifest(
+      manifest,
+      chromeManifest,
+      hostPermissions,
+      pkg.version
+    ) as any;
+    const digest = createHash("sha256")
+      .update(Buffer.from(chrome.key, "base64"))
+      .digest()
+      .subarray(0, 16);
+    const extensionId = Array.from(digest, (byte) =>
+      String.fromCharCode(97 + (byte >> 4), 97 + (byte & 0x0f))
+    ).join("");
+
+    expect(extensionId).toBe("heembgihcngbcadkkpcmkhhlldkidoph");
+    expect(chrome.permissions).toContain("identity");
+    expect(chrome.oauth2).toEqual({
+      client_id: "400575856806-8ie45ter3reqjm1f51adflijaan5rgta.apps.googleusercontent.com",
+      scopes: ["https://www.googleapis.com/auth/drive.file"],
+    });
+    expect(chrome.host_permissions).toContain("https://accounts.google.com/*");
+    expect(chrome.host_permissions).toContain("https://www.googleapis.com/*");
+    expect(chrome.content_security_policy.extension_pages).toContain("https://accounts.google.com");
+    expect(chrome.content_security_policy.extension_pages).toContain("https://www.googleapis.com");
   });
 
   test("emits a genuine Gecko MV3 background page and signing identity", () => {

@@ -239,6 +239,9 @@ export const TabEditorSheet = ({
 
       for (let i = 0; i < (mediaItems || []).length; i++) {
         const m = (mediaItems as NonNullable<ItemDocType["media"]>)[i];
+        // File attachments are data, not lightbox slides. They remain on the
+        // item and in sync/export payloads without changing this UI.
+        if (m.type === "file") continue;
         let src: string | null = null;
         let embedType: LightboxEntry["embedType"];
         if (m.type === "video" && m.embedUrl) {
@@ -268,7 +271,7 @@ export const TabEditorSheet = ({
           type: m.type,
           src,
           embedType,
-          thumbnailSrc: m.thumbnailUrl,
+          thumbnailSrc: m.s3ThumbnailUrl || m.thumbnailUrl,
           width: m.width,
           height: m.height,
           altText: m.altText,

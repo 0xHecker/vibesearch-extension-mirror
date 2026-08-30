@@ -4,10 +4,20 @@ import {
   DEVELOPMENT_CLOUD_AUTH_UID,
   DEFAULT_VIBESEARCH_AUTH_URL,
 } from "./cloud-config";
+import {
+  CLOUD_AUTH_EXPIRES_AT_KEY,
+  CLOUD_AUTH_OPT_IN_KEY,
+  CLOUD_AUTH_PROFILE_KEY,
+  CLOUD_AUTH_REJECTED_AT_KEY,
+  runtimeCloudAuthStorage,
+} from "./cloud-auth-storage-bridge";
 
-export const CLOUD_AUTH_EXPIRES_AT_KEY = "vibesearch:firebaseIdTokenExpiresAt";
-export const CLOUD_AUTH_PROFILE_KEY = "vibesearch:cloudAuthProfile:v1";
-export const CLOUD_AUTH_OPT_IN_KEY = "vibesearch:cloudAuthOptIn:v1";
+export {
+  CLOUD_AUTH_EXPIRES_AT_KEY,
+  CLOUD_AUTH_OPT_IN_KEY,
+  CLOUD_AUTH_PROFILE_KEY,
+  CLOUD_AUTH_REJECTED_AT_KEY,
+} from "./cloud-auth-storage-bridge";
 
 const TOKEN_REFRESH_SKEW_MS = 2 * 60 * 1000;
 const AUTH_FRAME_ID = "vibesearch-cloud-auth-frame";
@@ -43,6 +53,12 @@ export type CloudAuthStatus = {
 type HostedAuthRequest = {
   interactive: boolean;
   forceRefresh: boolean;
+  /**
+   * Ask the hosted page for the Google account chooser even when a web session
+   * is already live in this browser. Set for an explicit connect so logging out
+   * and back in confirms the account instead of silently reusing the last one.
+   */
+  selectAccount?: boolean;
 };
 
 type CloudAuthStorage = {
@@ -54,14 +70,22 @@ type CloudAuthStorage = {
 export type CloudAuthServiceOptions = {
   storage?: CloudAuthStorage;
   requestHostedToken?: (request: HostedAuthRequest) => Promise<CloudAuthToken>;
+  /** Ran after an explicit disconnect, to drop account-scoped local state. */
+  onDisconnected?: () => Promise<void>;
   now?: () => number;
   autoConnect?: boolean;
 };
 
 const chromeStorage: CloudAuthStorage = {
-  get: (keys) => chrome.storage.local.get(keys),
-  set: (values) => chrome.storage.local.set(values),
-  remove: (keys) => chrome.storage.local.remove(keys),
+  get: (keys) => chrome.storage?.local
+    ? chrome.storage.local.get(keys)
+    : runtimeCloudAuthStorage.get(keys),
+  set: (values) => chrome.storage?.local
+    ? chrome.storage.local.set(values)
+    : runtimeCloudAuthStorage.set(values),
+  remove: (keys) => chrome.storage?.local
+    ? chrome.storage.local.remove(keys)
+    : runtimeCloudAuthStorage.remove(keys),
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -162,9 +186,11 @@ const ensureAuthFrame = (): Promise<HTMLIFrameElement> => {
     if (!existing) {
       frame.id = AUTH_FRAME_ID;
       frame.src = authUrl.toString();
-      frame.hidden = true;
-      frame.setAttribute("aria-hidden", "true");
-      frame.setAttribute("tabindex", "-1");
+      // Firebase's MV3 popup flow must run in a rendered iframe hosted by the
+      // offscreen document. Setting `hidden` makes the frame `display: none`
+      // and Brave/Chromium can leave `signInWithPopup()` pending forever.
+      // The parent offscreen document is itself invisible to the user.
+      frame.title = "VibeSearch account authentication";
       document.body.append(frame);
     } else {
       frame.contentWindow?.postMessage(
@@ -218,6 +244,7 @@ export const requestHostedCloudToken = async (request: HostedAuthRequest): Promi
         requestId,
         interactive: request.interactive,
         forceRefresh: request.forceRefresh,
+        selectAccount: request.selectAccount === true,
       },
       authUrl.origin,
     );
@@ -240,7 +267,9 @@ export class CloudAuthService {
   private readonly requestToken: (request: HostedAuthRequest) => Promise<CloudAuthToken>;
   private readonly now: () => number;
   private readonly autoConnect: boolean;
+  private readonly onDisconnected?: () => Promise<void>;
   private refreshInFlight: Promise<string> | null = null;
+  private mutationGeneration = 0;
 
   constructor(options: CloudAuthServiceOptions = {}) {
     this.storage = options.storage ?? chromeStorage;
@@ -249,6 +278,7 @@ export class CloudAuthService {
     );
     this.now = options.now ?? Date.now;
     this.autoConnect = options.autoConnect ?? DEVELOPMENT_CLOUD_AUTH_ENABLED;
+    this.onDisconnected = options.onDisconnected;
   }
 
   private async read() {
@@ -257,14 +287,19 @@ export class CloudAuthService {
       CLOUD_AUTH_EXPIRES_AT_KEY,
       CLOUD_AUTH_PROFILE_KEY,
       CLOUD_AUTH_OPT_IN_KEY,
+      CLOUD_AUTH_REJECTED_AT_KEY,
     ]);
     const token = typeof row[CLOUD_SYNC_TOKEN_KEY] === "string" ? row[CLOUD_SYNC_TOKEN_KEY].trim() : "";
     const storedExpiry = Number.isSafeInteger(row[CLOUD_AUTH_EXPIRES_AT_KEY])
       ? Number(row[CLOUD_AUTH_EXPIRES_AT_KEY])
       : 0;
+    const rejectedAt = Number.isSafeInteger(row[CLOUD_AUTH_REJECTED_AT_KEY])
+      ? Number(row[CLOUD_AUTH_REJECTED_AT_KEY])
+      : 0;
     return {
       token,
       expiresAt: storedExpiry || firebaseTokenExpiresAt(token),
+      rejectedAt,
       user: normalizeProfile(row[CLOUD_AUTH_PROFILE_KEY]),
       optedIn: this.autoConnect || row[CLOUD_AUTH_OPT_IN_KEY] === true || Boolean(token),
     };
@@ -276,15 +311,36 @@ export class CloudAuthService {
       [CLOUD_AUTH_EXPIRES_AT_KEY]: result.expiresAt,
       [CLOUD_AUTH_PROFILE_KEY]: result.user,
       [CLOUD_AUTH_OPT_IN_KEY]: true,
+      // A freshly issued token clears any previous refusal.
+      [CLOUD_AUTH_REJECTED_AT_KEY]: 0,
     });
   }
 
+  /**
+   * The API refused this session (401/403). Local expiry claims cannot detect
+   * that — an opaque token reports no expiry and would otherwise read as
+   * "connected" forever — so the refusal is recorded and the stale token is
+   * dropped. `optedIn` survives, so the UI asks for a reconnect instead of
+   * pretending the account was never connected.
+   */
+  async markSessionRejected(): Promise<void> {
+    const current = await this.read();
+    if (!current.optedIn && !current.token) return;
+    this.mutationGeneration += 1;
+    this.refreshInFlight = null;
+    await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY]);
+    await this.storage.set({ [CLOUD_AUTH_REJECTED_AT_KEY]: this.now() });
+  }
+
   async connect(): Promise<CloudAuthStatus> {
+    const generation = ++this.mutationGeneration;
     const result = normalizeHostedToken(
-      await this.requestToken({ interactive: true, forceRefresh: true }),
+      // An explicit connect always confirms the account, so reconnecting after
+      // a disconnect never silently reuses the previous one.
+      await this.requestToken({ interactive: true, forceRefresh: true, selectAccount: true }),
       this.now(),
     );
-    await this.persist(result);
+    if (generation === this.mutationGeneration) await this.persist(result);
     try {
       void chrome.runtime.sendMessage({ target: "background", type: "CLOUD_SYNC_QUEUED" });
     } catch {}
@@ -292,30 +348,52 @@ export class CloudAuthService {
   }
 
   async disconnect(): Promise<CloudAuthStatus> {
+    this.mutationGeneration += 1;
     await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY, CLOUD_AUTH_PROFILE_KEY]);
-    await this.storage.set({ [CLOUD_AUTH_OPT_IN_KEY]: false });
+    await this.storage.set({ [CLOUD_AUTH_OPT_IN_KEY]: false, [CLOUD_AUTH_REJECTED_AT_KEY]: 0 });
+    // A read position belongs to the account that produced it.
+    await this.onDisconnected?.().catch(() => undefined);
     return this.status();
   }
 
   async invalidate(): Promise<void> {
+    this.mutationGeneration += 1;
     await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY]);
   }
 
   async getToken(forceRefresh = false): Promise<string> {
     const current = await this.read();
     if (!current.optedIn) return "";
-    const opaqueToken = current.token && current.expiresAt === 0;
+    // A recorded refusal means the stored session is dead: never hand it back,
+    // and never treat a missing expiry claim as proof of freshness.
+    if (current.rejectedAt > 0 && !forceRefresh) return "";
+    const opaqueToken = current.token && current.expiresAt === 0 && current.rejectedAt === 0;
     const freshToken = current.token && current.expiresAt > this.now() + TOKEN_REFRESH_SKEW_MS;
     if (!forceRefresh && (opaqueToken || freshToken)) return current.token;
     if (this.refreshInFlight) return this.refreshInFlight;
 
+    const generation = this.mutationGeneration;
     this.refreshInFlight = this.requestToken({ interactive: false, forceRefresh: true })
       .then(async (result) => {
         const normalized = normalizeHostedToken(result, this.now());
+        if (generation !== this.mutationGeneration) {
+          const latest = await this.read();
+          return latest.optedIn && latest.token &&
+            (latest.expiresAt === 0 || latest.expiresAt > this.now())
+            ? latest.token
+            : "";
+        }
         await this.persist(normalized);
         return normalized.token;
       })
-      .catch(() => {
+      .catch(async () => {
+        if (generation !== this.mutationGeneration) {
+          const latest = await this.read();
+          return latest.optedIn && latest.token &&
+            (latest.expiresAt === 0 || latest.expiresAt > this.now())
+            ? latest.token
+            : "";
+        }
         if (current.token && current.expiresAt > this.now()) return current.token;
         return "";
       })
@@ -329,14 +407,26 @@ export class CloudAuthService {
     const token = await this.getToken(forceRefresh);
     if (!token) return { token: "", userId: "" };
     const state = await this.read();
-    return { token, userId: state.user?.uid || firebaseTokenUserId(token) };
+    // Token and profile are persisted together. If another connect/disconnect
+    // wins between getToken() and this read, fail closed instead of pairing one
+    // account's bearer token with another account's document ownership.
+    if (state.token !== token) return { token: "", userId: "" };
+    const tokenUserId = firebaseTokenUserId(token);
+    const profileUserId = state.user?.uid || "";
+    if (tokenUserId && profileUserId && tokenUserId !== profileUserId) {
+      return { token: "", userId: "" };
+    }
+    return { token, userId: tokenUserId || profileUserId };
   }
 
   async status(options: { refresh?: boolean } = {}): Promise<CloudAuthStatus> {
     if (options.refresh) await this.getToken();
     const state = await this.read();
     const connected = Boolean(
-      state.optedIn && state.token && (state.expiresAt === 0 || state.expiresAt > this.now()),
+      state.optedIn &&
+      state.token &&
+      state.rejectedAt === 0 &&
+      (state.expiresAt === 0 || state.expiresAt > this.now()),
     );
     return {
       connected,
@@ -353,3 +443,10 @@ export const getCloudAuthToken = (forceRefresh = false): Promise<string> =>
   cloudAuthService.getToken(forceRefresh);
 export const getCloudAuthCredentials = (forceRefresh = false): Promise<CloudAuthCredentials> =>
   cloudAuthService.getCredentials(forceRefresh);
+/**
+ * Record that the API refused the stored session, so every surface stops
+ * claiming "Connected" and asks for a reconnect instead. Safe to call from any
+ * context that sees a 401/403 from a cloud route.
+ */
+export const markCloudSessionRejected = (): Promise<void> =>
+  cloudAuthService.markSessionRejected();

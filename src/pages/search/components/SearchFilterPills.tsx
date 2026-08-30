@@ -25,7 +25,7 @@ export type QuickFilter = {
 };
 
 // Exact brand logos for sources; generic lucide marks for non-brand concepts.
-const SOURCE_META: Record<Source, { label: string; icon: IconComponent }> = {
+const SOURCE_META = {
   web: { label: "Web Pages", icon: Globe },
   article: { label: "Articles", icon: Newspaper },
   note: { label: "Notes", icon: StickyNote },
@@ -37,10 +37,10 @@ const SOURCE_META: Record<Source, { label: string; icon: IconComponent }> = {
   instagram: { label: "Instagram", icon: SiInstagram },
   tiktok: { label: "TikTok", icon: SiTiktok },
   substack: { label: "Substack", icon: SiSubstack },
-};
+} satisfies Partial<Record<Source, { label: string; icon: IconComponent }>>;
 
 // Curated order: most-reached-for first, then sources by likely usefulness.
-const SOURCE_ORDER: Source[] = [
+const SOURCE_ORDER = [
   "web",
   "article",
   "note",
@@ -52,7 +52,7 @@ const SOURCE_ORDER: Source[] = [
   "instagram",
   "tiktok",
   "substack",
-];
+] as const satisfies readonly Source[];
 
 // Universal filters that aren't tied to a single source.
 const ALL_FILTERS: QuickFilter[] = [

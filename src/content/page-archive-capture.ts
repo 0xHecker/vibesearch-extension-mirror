@@ -11,6 +11,10 @@ import {
   type ArchiveProtocolResponse,
   type PageArchiveCaptureRequest,
 } from "@src/services/archive-capture-protocol";
+import {
+  ARCHIVE_EXCLUDED_ELEMENT_SELECTOR,
+  ARCHIVE_FILENAME_REPLACED_CHARACTERS,
+} from "@src/services/archive-capture-options";
 import { isSafeArchiveResourceUrl } from "@src/services/archive-resource-url";
 import { mergeCapturedCssWithOriginal } from "@src/services/archive-resource-hints";
 
@@ -154,7 +158,7 @@ const fetchForCapture = async (input: RequestInfo | URL, init: RequestInit = {})
 
 const singleFileOptions = (deadlineAt: number) => ({
   removeHiddenElements: false,
-  removedElementsSelector: "",
+  removedElementsSelector: ARCHIVE_EXCLUDED_ELEMENT_SELECTOR,
   removeUnusedStyles: false,
   removeUnusedFonts: false,
   removeFrames: true,
@@ -164,7 +168,7 @@ const singleFileOptions = (deadlineAt: number) => ({
   filenameTemplate: "archive.html",
   filenameMaxLength: 192,
   filenameMaxLengthUnit: "bytes",
-  filenameReplacedCharacters: ["~", "+", "?", "%", "*", ":", "|", "\"", "<", ">", "\\", "\\x00-\\x1f", "\\x7F"],
+  filenameReplacedCharacters: ARCHIVE_FILENAME_REPLACED_CHARACTERS,
   filenameReplacementCharacter: "_",
   filenameReplacementCharacters: [],
   replaceEmojisInFilename: false,

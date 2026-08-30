@@ -1,12 +1,19 @@
 import { getCloudAuthToken } from "./cloud-auth";
+import { getArchiveDeviceKey } from "./device-key";
 import {
   CLOUD_SYNC_API_BASE_KEY,
   DEFAULT_VIBESEARCH_API_BASE,
 } from "./cloud-config";
 import { getArchiveCache } from "./archive-cache";
+import { normalizeArchiveItemId } from "./archive-identity";
+import {
+  readPendingArchiveUpload,
+  type PendingArchiveUpload,
+} from "./archive-outbox";
+import { sanitizeArchivePreviewBlob } from "./archive-preview-sanitizer";
 
 /** Matches the API's maximum extension archive size and bounds viewer memory. */
-export const ARCHIVE_PREVIEW_MAX_BYTES = 28 * 1024 * 1024;
+export const ARCHIVE_PREVIEW_MAX_BYTES = 40 * 1024 * 1024;
 export const ARCHIVE_PREVIEW_TIMEOUT_MS = 45_000;
 
 /**
@@ -17,14 +24,17 @@ export const ARCHIVE_PREVIEW_DOCUMENT_CSP =
   "default-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'; " +
   "img-src data:; media-src data:; font-src data:; style-src 'unsafe-inline'";
 
-const ARCHIVE_PREVIEW_POLICY_PREFIX =
-  `<!doctype html><meta http-equiv="Content-Security-Policy" content="${ARCHIVE_PREVIEW_DOCUMENT_CSP}">` +
-  "<style data-vs-archive-viewport>" +
-  "html,body{max-width:100%;min-height:100%;}" +
+// iframe sandboxing prevents script/top-level escape but still permits the
+// child frame to navigate itself when a user activates a saved link. Making
+// the root document inert keeps View a read-only archive surface; the sheet's
+// explicit Open live page button is the only network-navigation path.
+const ARCHIVE_PREVIEW_VIEWPORT_CSS =
+  "html[data-vs-archive-document],html[data-vs-archive-document] body{" +
+  "max-width:100%;min-height:100%;overflow-y:auto!important;overscroll-behavior:auto!important;}" +
+  "a,area,button,input,select,textarea,[contenteditable]{pointer-events:none!important;}" +
   "img,svg,video,canvas,iframe,embed,object{max-width:100%!important;height:auto!important;}" +
   "audio,video{max-width:100%!important;}" +
-  "pre{max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;}" +
-  "</style>";
+  "pre{max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;}";
 
 export type ArchivePreviewErrorCode =
   | "ARCHIVE_PREVIEW_ABORTED"
@@ -51,11 +61,14 @@ export class ArchivePreviewError extends Error {
 export type ArchivePreviewConnection = {
   token: string;
   apiBase: string;
+  /** Login-less identity: unlocks the anonymous per-device archive namespace. */
+  deviceKey?: string;
 };
 
 export type ArchivePreviewDocument = {
   url: string;
   sourceByteSize: number;
+  capturedAt?: number;
 };
 
 export type ArchivePreviewSessionOptions = {
@@ -66,12 +79,54 @@ export type ArchivePreviewSessionOptions = {
   maxBytes?: number;
   timeoutMs?: number;
   preferFresh?: boolean;
+  sanitizeSource?: (source: Blob) => Promise<Blob>;
+  /** One bounded repair attempt for legacy items that predate snapshots. */
+  recoverMissing?: (itemId: string) => Promise<boolean>;
   cache?: {
     get(itemId: string): Promise<Blob | null>;
     put(itemId: string, body: Blob, updatedAt?: number): Promise<unknown>;
     putCloud?(itemId: string, body: Blob, updatedAt?: number): Promise<unknown>;
     putIfAbsent?(itemId: string, body: Blob, updatedAt?: number): Promise<unknown>;
   };
+};
+
+type ArchivePreviewCache = NonNullable<ArchivePreviewSessionOptions["cache"]>;
+
+/**
+ * The preview's local source includes both acknowledged cache entries and
+ * completed captures that are still queued for upload. Pending bytes win: a
+ * deliberate re-capture is newer local intent than an older cloud mirror.
+ */
+export const createArchivePreviewLocalCache = (
+  cache: ArchivePreviewCache,
+  readPending?: (itemId: string) => Promise<PendingArchiveUpload | null>,
+): ArchivePreviewCache => {
+  const pendingReader = readPending ?? (
+    typeof chrome === "undefined"
+      ? async () => null
+      : readPendingArchiveUpload
+  );
+  return ({
+  async get(itemId) {
+    try {
+      const pending = await pendingReader(itemId);
+      if (pending?.body) return pending.body;
+    } catch (error) {
+      // A transient outbox read must not hide an older but readable cache copy.
+      if (typeof console !== "undefined") {
+        console.warn("[archive-preview] could not read pending device capture", error);
+      }
+    }
+    return cache.get(itemId);
+  },
+  put: (itemId, body, updatedAt) => cache.put(itemId, body, updatedAt),
+  ...(cache.putCloud
+    ? { putCloud: (itemId: string, body: Blob, updatedAt?: number) => cache.putCloud!(itemId, body, updatedAt) }
+    : {}),
+  ...(cache.putIfAbsent
+    ? { putIfAbsent: (itemId: string, body: Blob, updatedAt?: number) => cache.putIfAbsent!(itemId, body, updatedAt) }
+    : {}),
+  });
 };
 
 const normalizeApiBase = (value: string): string => {
@@ -86,12 +141,13 @@ const normalizeApiBase = (value: string): string => {
 };
 
 const defaultConnection = async (forceRefresh: boolean): Promise<ArchivePreviewConnection> => {
-  const [row, token] = await Promise.all([
+  const [row, token, deviceKey] = await Promise.all([
     chrome.storage.local
       .get(CLOUD_SYNC_API_BASE_KEY)
       .then((value) => value as Record<string, unknown>)
       .catch((): Record<string, unknown> => ({})),
-    getCloudAuthToken(forceRefresh),
+    getCloudAuthToken(forceRefresh).catch(() => ""),
+    getArchiveDeviceKey(),
   ]);
   const configured = typeof row[CLOUD_SYNC_API_BASE_KEY] === "string"
     ? row[CLOUD_SYNC_API_BASE_KEY].trim()
@@ -99,6 +155,7 @@ const defaultConnection = async (forceRefresh: boolean): Promise<ArchivePreviewC
   return {
     token,
     apiBase: normalizeApiBase(configured || DEFAULT_VIBESEARCH_API_BASE),
+    deviceKey,
   };
 };
 
@@ -113,7 +170,7 @@ const errorForResponse = (response: Response): ArchivePreviewError => {
   if (response.status === 404) {
     return new ArchivePreviewError(
       "ARCHIVE_PREVIEW_NOT_FOUND",
-      "This offline copy is not ready yet. It may still be uploading.",
+      "No snapshot exists yet.",
       response.status,
     );
   }
@@ -136,6 +193,15 @@ const declaredByteSize = (response: Response): number | null => {
   if (!raw) return null;
   const value = Number(raw);
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
+};
+
+const responseCapturedAt = (response: Response): number | undefined => {
+  const raw = response.headers.get("x-vs-archive-captured-at")?.trim() || "";
+  if (!raw) return undefined;
+  const numeric = Number(raw);
+  if (Number.isSafeInteger(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 };
 
 const readBoundedArchive = async (
@@ -210,6 +276,8 @@ export class ArchivePreviewSession {
   private readonly maxBytes: number;
   private readonly timeoutMs: number;
   private readonly preferFresh: boolean;
+  private readonly sanitizeSource: (source: Blob) => Promise<Blob>;
+  private readonly recoverMissing?: (itemId: string) => Promise<boolean>;
   private readonly cache: NonNullable<ArchivePreviewSessionOptions["cache"]>;
   private readonly controller = new AbortController();
   private objectUrl: string | null = null;
@@ -220,7 +288,9 @@ export class ArchivePreviewSession {
 
   constructor(options: ArchivePreviewSessionOptions = {}) {
     this.getConnection = options.getConnection ?? defaultConnection;
-    this.fetcher = options.fetcher ?? fetch;
+    // `fetch` must keep its global receiver: calling a detached reference
+    // throws "Illegal invocation" in window contexts.
+    this.fetcher = options.fetcher ?? fetch.bind(globalThis);
     this.createObjectUrl = options.createObjectUrl ?? ((blob) => URL.createObjectURL(blob));
     this.revokeObjectUrl = options.revokeObjectUrl ?? ((url) => URL.revokeObjectURL(url));
     this.maxBytes = Math.max(1, Math.min(
@@ -229,7 +299,13 @@ export class ArchivePreviewSession {
     ));
     this.timeoutMs = Math.max(1_000, Math.floor(options.timeoutMs ?? ARCHIVE_PREVIEW_TIMEOUT_MS));
     this.preferFresh = options.preferFresh === true;
-    this.cache = options.cache ?? getArchiveCache();
+    this.sanitizeSource = options.sanitizeSource ?? ((source) => sanitizeArchivePreviewBlob(
+      source,
+      ARCHIVE_PREVIEW_DOCUMENT_CSP,
+      ARCHIVE_PREVIEW_VIEWPORT_CSS,
+    ));
+    this.recoverMissing = options.recoverMissing;
+    this.cache = options.cache ?? createArchivePreviewLocalCache(getArchiveCache());
   }
 
   async load(itemIdRaw: string): Promise<ArchivePreviewDocument> {
@@ -238,7 +314,7 @@ export class ArchivePreviewSession {
     }
     this.started = true;
     const loadStartedAt = Date.now();
-    const itemId = itemIdRaw.trim();
+    const itemId = normalizeArchiveItemId(itemIdRaw);
     if (!itemId) {
       throw new ArchivePreviewError(
         "ARCHIVE_PREVIEW_INVALID_RESPONSE",
@@ -253,28 +329,54 @@ export class ArchivePreviewSession {
 
     let cachedFallback: Blob | null = null;
     try {
-      const cached = await this.cache.get(itemId).catch(() => null);
+      const cached = await this.awaitWhileActive(
+        this.cache.get(itemId).catch(() => null),
+      );
       cachedFallback = cached;
       this.assertActive();
       if (cached && !this.preferFresh) {
-        return this.createDocument(cached, cached.size);
+        return await this.createDocument(cached, cached.size, this.localCapturedAt(cached));
       }
 
-      let connection = await this.getConnection(false);
+      let connection = await this.awaitWhileActive(this.getConnection(false));
       this.assertActive();
-      let response = await this.request(itemId, connection);
+      // `null` means cloud storage will not serve this copy to this device —
+      // treated below exactly like "no cloud copy exists".
+      const cloud = await this.fetchCloudCopy(itemId, connection);
+      connection = cloud.connection;
+      let response = cloud.response;
 
-      if (response.status === 401 || response.status === 403) {
-        await response.body?.cancel().catch(() => {});
-        connection = await this.getConnection(true);
+      if ((response === null || response.status === 404) && this.recoverMissing) {
+        await response?.body?.cancel().catch(() => {});
+        const recovered = await this.awaitWhileActive(this.recoverMissing(itemId));
         this.assertActive();
-        response = await this.request(itemId, connection);
+        // Browser capture is authoritative as soon as its OPFS/outbox file is
+        // complete. Never wait for a large cloud upload before opening it.
+        const recoveredLocal = await this.awaitWhileActive(
+          this.cache.get(itemId).catch(() => null),
+        );
+        this.assertActive();
+        if (recoveredLocal) {
+          return await this.createDocument(
+            recoveredLocal,
+            recoveredLocal.size,
+            this.localCapturedAt(recoveredLocal),
+          );
+        }
+        if (recovered) response = await this.request(itemId, connection);
       }
 
+      if (!response) {
+        throw new ArchivePreviewError(
+          "ARCHIVE_PREVIEW_AUTH_REQUIRED",
+          "This copy is not on this device, and cloud storage is unavailable without a connected account.",
+        );
+      }
       if (!response.ok) {
         await response.body?.cancel().catch(() => {});
         throw errorForResponse(response);
       }
+      const capturedAt = responseCapturedAt(response);
       const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
       if (!contentType.startsWith("text/html") && !contentType.startsWith("application/xhtml+xml")) {
         await response.body?.cancel().catch(() => {});
@@ -312,20 +414,25 @@ export class ArchivePreviewSession {
         : this.cache.putIfAbsent
           ? this.cache.putIfAbsent(itemId, sourceBlob, loadStartedAt)
           : this.cache.put(itemId, sourceBlob, loadStartedAt);
-      await cacheRemote.catch((error) => {
-        if (typeof chrome !== "undefined") {
-          console.warn("[archive-preview] could not retain offline copy", error);
-        }
-      });
+      await this.awaitWhileActive(
+        cacheRemote.catch((error) => {
+          if (typeof chrome !== "undefined") {
+            console.warn("[archive-preview] could not retain offline copy", error);
+          }
+        }),
+      );
       this.assertActive();
       // A newer local capture may have filled the cache while the cloud read
       // was in flight. Render that authoritative copy instead of briefly
       // showing the older response that putIfAbsent correctly refused.
-      const authoritativeBlob = await this.cache.get(itemId).catch(() => null);
+      const authoritativeBlob = await this.awaitWhileActive(
+        this.cache.get(itemId).catch(() => null),
+      );
       this.assertActive();
-      return this.createDocument(
+      return await this.createDocument(
         authoritativeBlob || sourceBlob,
         authoritativeBlob?.size || byteSize,
+        this.localCapturedAt(authoritativeBlob) || capturedAt,
       );
     } catch (error) {
       if (
@@ -335,7 +442,11 @@ export class ArchivePreviewSession {
         !this.controller.signal.aborted &&
         !isAbortError(error)
       ) {
-        return this.createDocument(cachedFallback, cachedFallback.size);
+        return await this.createDocument(
+          cachedFallback,
+          cachedFallback.size,
+          this.localCapturedAt(cachedFallback),
+        );
       }
       if (this.timedOut) {
         throw new ArchivePreviewError(
@@ -347,9 +458,16 @@ export class ArchivePreviewSession {
         throw new ArchivePreviewError("ARCHIVE_PREVIEW_ABORTED", "The archive preview was closed.");
       }
       if (error instanceof ArchivePreviewError) throw error;
+      // Surface the original failure before wrapping it: the generic
+      // "check your connection" copy hides auth, storage, and stream errors.
+      if (typeof console !== "undefined") {
+        console.warn("[archive-preview] load failed with unexpected error:", error);
+      }
       throw new ArchivePreviewError(
         "ARCHIVE_PREVIEW_NETWORK_ERROR",
-        "The saved copy could not be reached. Check your connection and try again.",
+        typeof navigator !== "undefined" && navigator.onLine === false
+          ? "You’re offline, and this device has no saved snapshot for this page yet."
+          : "The saved copy could not be reached. Check your connection and try again.",
       );
     } finally {
       if (this.timeout) clearTimeout(this.timeout);
@@ -367,20 +485,23 @@ export class ArchivePreviewSession {
     this.objectUrl = null;
   }
 
-  private async request(itemId: string, connection: ArchivePreviewConnection): Promise<Response> {
+  /** `null` when this device holds no credential cloud storage would accept. */
+  private async request(
+    itemId: string,
+    connection: ArchivePreviewConnection,
+  ): Promise<Response | null> {
     const token = connection.token.trim();
-    if (!token) {
-      throw new ArchivePreviewError(
-        "ARCHIVE_PREVIEW_AUTH_REQUIRED",
-        "Connect your Vibesearch cloud account to open this saved copy.",
-      );
-    }
+    const deviceKey = connection.deviceKey?.trim() ?? "";
+    if (!token && !deviceKey) return null;
     const apiBase = normalizeApiBase(connection.apiBase.trim());
     return this.fetcher(`${apiBase}/v1/items/${encodeURIComponent(itemId)}/archive`, {
       method: "GET",
       headers: {
         accept: "text/html, application/xhtml+xml",
-        authorization: `Bearer ${token}`,
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        // Login-less reads resolve to the anonymous per-device namespace; the
+        // signed-in token always wins when both exist.
+        ...(!token && deviceKey ? { "x-vs-device-key": deviceKey } : {}),
       },
       credentials: "omit",
       cache: "no-store",
@@ -388,7 +509,50 @@ export class ArchivePreviewSession {
     });
   }
 
-  private createDocument(source: Blob, sourceByteSize: number): ArchivePreviewDocument {
+  /**
+   * Ask cloud storage for this item's snapshot.
+   *
+   * Returns `response: null` when cloud storage will not serve the copy to this
+   * device at all — no credential, or a refusal that no identity on this device
+   * can satisfy. Callers treat that the same as "no cloud copy exists", because
+   * a library that lives on this device should not be gated behind an account.
+   *
+   * A bearer session gets one refresh: it can come back as a different identity
+   * (or as the device key once the session is gone). A device key is stable, so
+   * re-asking with it would be refused identically and is skipped.
+   */
+  private async fetchCloudCopy(
+    itemId: string,
+    connection: ArchivePreviewConnection,
+  ): Promise<{ response: Response | null; connection: ArchivePreviewConnection }> {
+    const refused = (response: Response | null): boolean =>
+      response !== null && (response.status === 401 || response.status === 403);
+    const discard = async (response: Response | null): Promise<null> => {
+      await response?.body?.cancel().catch(() => {});
+      return null;
+    };
+
+    let response = await this.request(itemId, connection);
+    if (!refused(response)) return { response, connection };
+    await discard(response);
+    if (!connection.token) return { response: null, connection };
+
+    const refreshed = await this.awaitWhileActive(this.getConnection(true));
+    this.assertActive();
+    const sameIdentity =
+      refreshed.token === connection.token && refreshed.deviceKey === connection.deviceKey;
+    if (sameIdentity) return { response: null, connection: refreshed };
+
+    response = await this.request(itemId, refreshed);
+    if (refused(response)) response = await discard(response);
+    return { response, connection: refreshed };
+  }
+
+  private async createDocument(
+    source: Blob,
+    sourceByteSize: number,
+    capturedAt?: number,
+  ): Promise<ArchivePreviewDocument> {
     if (sourceByteSize <= 0) {
       throw new ArchivePreviewError(
         "ARCHIVE_PREVIEW_INVALID_RESPONSE",
@@ -401,21 +565,56 @@ export class ArchivePreviewSession {
         "This saved copy is too large to preview safely.",
       );
     }
-    const blob = new Blob([ARCHIVE_PREVIEW_POLICY_PREFIX, source], {
-      type: "text/html; charset=utf-8",
-    });
+    const blob = await this.awaitWhileActive(this.sanitizeSource(source));
+    this.assertActive();
     const objectUrl = this.createObjectUrl(blob);
     if (!this.active || this.controller.signal.aborted) {
       this.revokeObjectUrl(objectUrl);
       this.assertActive();
     }
     this.objectUrl = objectUrl;
-    return { url: objectUrl, sourceByteSize };
+    return { url: objectUrl, sourceByteSize, ...(capturedAt ? { capturedAt } : {}) };
+  }
+
+  private localCapturedAt(source: Blob | null): number | undefined {
+    if (typeof File === "undefined" || !(source instanceof File)) return undefined;
+    return Number.isSafeInteger(source.lastModified) && source.lastModified > 0
+      ? source.lastModified
+      : undefined;
   }
 
   private assertActive(): void {
     if (!this.active || this.controller.signal.aborted) {
       throw new ArchivePreviewError("ARCHIVE_PREVIEW_ABORTED", "The archive preview was closed.");
     }
+  }
+
+  /**
+   * OPFS and identity calls do not accept an AbortSignal. Race each one with
+   * this session so closing the sheet (or hitting the overall deadline) does
+   * not leave a permanently pending load retaining the component/session.
+   * The original promise remains observed, so a later rejection cannot become
+   * an unhandled rejection.
+   */
+  private awaitWhileActive<T>(work: Promise<T>): Promise<T> {
+    const signal = this.controller.signal;
+    if (signal.aborted) {
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        callback();
+      };
+      const abort = () => finish(() => reject(new DOMException("Aborted", "AbortError")));
+      signal.addEventListener("abort", abort, { once: true });
+      work.then(
+        (value) => finish(() => resolve(value)),
+        (error) => finish(() => reject(error)),
+      );
+    });
   }
 }

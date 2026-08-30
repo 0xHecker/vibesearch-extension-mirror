@@ -13,6 +13,7 @@ import {
   withStableAffectedSpaceLocks,
 } from "@src/services/entity-mutation-lock";
 import { getArchiveCache, type ArchiveCache } from "@src/services/archive-cache";
+import { normalizeArchiveItemId } from "@src/services/archive-identity";
 import {
   createChromeArchiveOutboxStorage,
   createOpfsArchiveOutboxFiles,
@@ -29,11 +30,11 @@ const RESTORE_BATCH_SIZE = 400;
 // ceiling well below browser renderer/OOM territory until the format has a
 // streaming parser; oversized libraries fail explicitly instead of exhausting
 // every tab's RAM.
-export const LOCAL_MIGRATION_MAX_JSON_BYTES = 96 * 1024 * 1024;
-export const LOCAL_MIGRATION_MAX_DECODED_BYTES = 56 * 1024 * 1024;
+export const LOCAL_MIGRATION_MAX_JSON_BYTES = 192 * 1024 * 1024;
+export const LOCAL_MIGRATION_MAX_DECODED_BYTES = 112 * 1024 * 1024;
 export const LOCAL_MIGRATION_MAX_MEDIA_FILE_BYTES = 32 * 1024 * 1024;
-export const LOCAL_MIGRATION_MAX_ARCHIVE_FILE_BYTES = 28 * 1024 * 1024;
-export const LOCAL_MIGRATION_MAX_ARCHIVE_TOTAL_BYTES = 56 * 1024 * 1024;
+export const LOCAL_MIGRATION_MAX_ARCHIVE_FILE_BYTES = 40 * 1024 * 1024;
+export const LOCAL_MIGRATION_MAX_ARCHIVE_TOTAL_BYTES = 112 * 1024 * 1024;
 const LOCAL_MIGRATION_MAX_BINARY_FILES = 50_000;
 const MIGRATION_EXPORT_PAGE_SIZE = 400;
 const MIGRATION_JSON_STRUCTURAL_RESERVE_BYTES = 64 * 1024;
@@ -75,8 +76,13 @@ type MigrationArchiveCache = Pick<ArchiveCache, "listFiles" | "put"> & {
   putWithinMutationLock?: ArchiveCache["putWithinMutationLock"];
 };
 
+type MigrationArchiveOutboxJob = Pick<
+  ArchiveOutboxJob,
+  "itemId" | "mode" | "fileName" | "byteSize" | "updatedAt"
+>;
+
 type MigrationArchiveOutbox = {
-  list(): Promise<ArchiveOutboxJob[]>;
+  list(): Promise<MigrationArchiveOutboxJob[]>;
   read(fileName: string): Promise<File | Blob | null>;
 };
 
@@ -583,9 +589,7 @@ export const validateLocalExtensionMigrationBundle = (
   for (const file of archiveFiles) {
     if (
       !file ||
-      typeof file.itemId !== "string" ||
-      !file.itemId.trim() ||
-      file.itemId.length > 160 ||
+      !normalizeArchiveItemId(file.itemId) ||
       typeof file.mimeType !== "string" ||
       typeof file.base64 !== "string" ||
       !Number.isSafeInteger(file.updatedAt) ||

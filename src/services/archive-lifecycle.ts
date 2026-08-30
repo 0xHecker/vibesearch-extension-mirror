@@ -1,3 +1,5 @@
+import { collectArchiveItemIds } from "./archive-identity";
+
 const ARCHIVE_PURGE_MESSAGE_BATCH = 2_000;
 
 /**
@@ -7,9 +9,7 @@ const ARCHIVE_PURGE_MESSAGE_BATCH = 2_000;
  * reached, so cleanup never turns a committed database deletion into an error.
  */
 export const notifyArchivedItemsPurged = async (itemIdsRaw: Iterable<string>): Promise<void> => {
-  const itemIds = Array.from(
-    new Set(Array.from(itemIdsRaw, (itemId) => itemId.trim()).filter(Boolean)),
-  );
+  const itemIds = collectArchiveItemIds(itemIdsRaw);
   for (let offset = 0; offset < itemIds.length; offset += ARCHIVE_PURGE_MESSAGE_BATCH) {
     try {
       const response = await chrome.runtime.sendMessage({

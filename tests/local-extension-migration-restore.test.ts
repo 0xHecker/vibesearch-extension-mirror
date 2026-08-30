@@ -150,6 +150,29 @@ describe("whole-origin migration restore safety", () => {
     })).toThrow("MIGRATION_FILE_ARCHIVES_INVALID");
   });
 
+  test("accepts archived item identities up to the shared 512-character contract", () => {
+    const itemId = `item/${"x".repeat(500)}`;
+    const validated = validateLocalExtensionMigrationBundle({
+      ...bundle({
+        items: [{
+          id: itemId,
+          folderId: "",
+          spaceId: "space_public_default",
+          url: "https://example.com/long-id",
+        }],
+      }),
+      version: 2,
+      archiveFiles: [{
+        itemId,
+        mimeType: "text/html",
+        updatedAt: 1,
+        base64: btoa("<html>saved archive</html>"),
+      }],
+    });
+
+    expect(validated.archiveFiles?.[0]?.itemId).toBe(itemId);
+  });
+
   test("rejects malformed archive bytes before committing any database rows", async () => {
     db = makeDb();
     const invalid = {

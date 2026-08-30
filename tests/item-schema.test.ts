@@ -88,6 +88,109 @@ describe("item schema", () => {
     }
   });
 
+  it("accepts the current shared content contract without losing fields", async () => {
+    const database = await createRxDatabase({
+      name: `item-schema-shared-${crypto.randomUUID()}`,
+      storage: wrappedValidateZSchemaStorage({ storage: getRxStorageMemory() }),
+    });
+
+    try {
+      const { items } = await database.addCollections({
+        items: { schema: itemSchema, migrationStrategies: itemMigrationStrategies },
+      });
+      const shared = item({
+        userId: "",
+        source: "threads" as ItemDocType["source"],
+        updatedAt: 3,
+        folderChangedAt: 2,
+        fields: {
+          provenance: { importer: "extension", revisions: [1, 2] },
+        },
+        media: [{
+          id: "attachment-1",
+          type: "file",
+          originalUrl: "https://example.com/brief.pdf",
+          storageType: "s3",
+          s3Url: "https://cdn.example.com/brief.pdf",
+          mimeType: "application/pdf",
+          fileName: "brief.pdf",
+          byteSize: 4096,
+          contentHash: `sha256:${"a".repeat(64)}`,
+          provider: "threads",
+          externalId: "external-1",
+        }],
+        blocks: [{
+          id: "body",
+          kind: "text",
+          text: "Shared body",
+          createdAt: 2,
+          updatedAt: 3,
+        }],
+        textArtifacts: [{
+          key: "text/user/item/transcript.txt",
+          purpose: "transcript",
+          contentType: "text/plain",
+          byteSize: 11,
+          hash: `sha256:${"b".repeat(64)}`,
+          createdAt: 3,
+          language: "en",
+        }],
+        metadata: {
+          schemaVersion: 1,
+          social: { platform: "threads", postId: "post-1" },
+          provenance: { method: "extension", capturedAt: 2 },
+        },
+        ai: {
+          status: "done",
+          generatedUnderstanding: {
+            schemaVersion: "1",
+            inputHash: "input-hash",
+            generatedAt: 3,
+            extractor: { identity: "server", version: "1" },
+            summary: "Current generated summary",
+            retrievalTerms: [],
+            tagCandidates: [],
+          },
+        },
+      } as Partial<ItemDocType>);
+
+      await items.insert(shared);
+
+      expect((await items.findOne("item-1").exec())?.toMutableJSON()).toMatchObject({
+        userId: "",
+        source: "threads",
+        folderChangedAt: 2,
+        fields: {
+          provenance: { importer: "extension", revisions: [1, 2] },
+        },
+        media: [{
+          id: "attachment-1",
+          type: "file",
+          mimeType: "application/pdf",
+          fileName: "brief.pdf",
+          byteSize: 4096,
+          provider: "threads",
+          externalId: "external-1",
+        }],
+        blocks: [{ id: "body", updatedAt: 3 }],
+        textArtifacts: [{ purpose: "transcript", contentType: "text/plain" }],
+        metadata: {
+          schemaVersion: 1,
+          social: { platform: "threads", postId: "post-1" },
+        },
+        ai: {
+          status: "done",
+          generatedUnderstanding: {
+            schemaVersion: "1",
+            summary: "Current generated summary",
+          },
+        },
+      });
+    } finally {
+      await database.remove();
+    }
+  });
+
   it("migrates an existing v0 item database in place", async () => {
     const name = `item-schema-migration-${crypto.randomUUID()}`;
     const storage = wrappedValidateZSchemaStorage({ storage: getRxStorageMemory() });
@@ -120,7 +223,7 @@ describe("item schema", () => {
     legacy.vector_index = Number.NaN;
     legacy.deletedAt = -1;
 
-    const migrated = itemMigrationStrategies[9](legacy as ItemDocType);
+    const migrated = itemMigrationStrategies[itemSchema.version](legacy as ItemDocType);
 
     expect(migrated).toMatchObject({
       userId: "",

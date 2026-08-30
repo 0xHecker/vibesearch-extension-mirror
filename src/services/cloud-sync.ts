@@ -15,6 +15,12 @@ import {
   CLOUD_SYNC_TOKEN_KEY,
   DEFAULT_VIBESEARCH_API_BASE,
 } from "./cloud-config";
+import { forEachIdKeysetPage } from "./rxdb-keyset-pagination";
+import {
+  cloudPullItemKeys,
+  planCloudPullMerge,
+  type CloudPullChange,
+} from "./cloud-pull-merge";
 
 export {
   CLOUD_SYNC_API_BASE_KEY,
@@ -27,6 +33,25 @@ export const CLOUD_SYNC_CLIENT_ID_KEY = "vibesearch:cloudSyncClientId";
 
 export const CLOUD_SYNC_PUSH_BATCH_SIZE = 10;
 export const CLOUD_SYNC_PUSH_BATCH_MAX = 10;
+/** Where this device stopped reading the server's change log. */
+export const CLOUD_SYNC_PULL_STATE_KEY = "vibesearch:cloudSyncPullState:v1";
+/**
+ * Whether this device accepts rows from the account's other devices. Off by
+ * default: backup leaves this extension one-way unless the user asks for the
+ * return direction. Even when on, a pull only ever adds rows it has never seen.
+ */
+export const CLOUD_PULL_ENABLED_KEY = "vibesearch:cloudPullEnabled:v1";
+/**
+ * Stamped on every document this extension pushes, and required on every
+ * document it accepts back. The cloud library is shared with the web app, and
+ * the web app's rows must never flow into a local library — so "authored by an
+ * extension" travels with the document itself. The marker is stripped again
+ * before a local insert, so no local schema has to know about it.
+ */
+export const CLOUD_SYNC_ORIGIN_FIELD = "syncOrigin";
+export const CLOUD_SYNC_ORIGIN_EXTENSION = "extension";
+export const CLOUD_SYNC_PULL_PAGE_SIZE = 250;
+export const CLOUD_SYNC_PULL_MAX_PAGES = 8;
 
 export type CloudSyncCollectionName = "items" | "folders" | "spaces" | "spaceGroups" | "tags" | "itemTags";
 
@@ -86,6 +111,19 @@ export type CloudSyncBatchOptions = {
   batchSize?: number;
   maxBatches?: number;
   priorityRefs?: Array<Pick<CloudSyncQueueRef, "collection" | "id">>;
+  /** Guard a full-library scan against an account switch before its drain. */
+  expectedUserId?: string;
+};
+
+export type CloudSyncAllOptions = Pick<CloudSyncBatchOptions, "maxBatches"> & {
+  pageSize?: number;
+};
+
+export type CloudSyncAllResult = {
+  scanned: number;
+  enqueued: number;
+  queued: number;
+  push: CloudSyncDrainResult;
 };
 
 export type CloudSyncPushItemResult = {
@@ -94,10 +132,49 @@ export type CloudSyncPushItemResult = {
   push?: CloudSyncDrainResult;
 };
 
+/** What this device knows about one item's backup state. */
+export type CloudSyncItemState = "synced" | "pending" | "not-connected";
+
+
+/** Where this device stopped reading the server log, and any bootstrap replay. */
+export type CloudSyncPullState = {
+  checkpoint: number;
+  /** Set while the server is rebuilding a snapshot for a compacted cursor. */
+  bootstrapCursor?: string;
+  /**
+   * The account this checkpoint belongs to. Sequence numbers are per user, so
+   * reusing another account's checkpoint would silently skip its whole library:
+   * "seq > 5000" matches nothing in a store that starts at 1.
+   */
+  userId?: string;
+};
+
+export type CloudSyncPullResult = {
+  /** Rows from other devices that this device did not have. */
+  inserted: number;
+  /** Rows deliberately left alone (already local, duplicate URL, remote delete). */
+  skipped: number;
+  /** Rows that should have been written but the store refused. */
+  rejected: number;
+  pages: number;
+  checkpoint: number;
+  /** More pages are waiting; the next run continues from the checkpoint. */
+  hasMore: boolean;
+  reason?:
+    | "empty"
+    | "disabled"
+    | "missing-token"
+    | "invalid-auth"
+    | "http-error"
+    | "network-error"
+    | "invalid-response";
+  error?: string;
+};
+
 export type CloudSyncServiceOptions = {
   fetcher?: typeof fetch;
   getCollectionResolver?: () => Promise<CloudSyncCollectionResolver>;
-  getCredentials?: () => Promise<CloudAuthCredentials>;
+  getCredentials?: (forceRefresh?: boolean) => Promise<CloudAuthCredentials>;
 };
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -138,34 +215,85 @@ const parseIdList = (value: unknown): string[] | null => {
   return value as string[];
 };
 
-const parsePushCount = (value: unknown, fallback: number, maximum: number): number | null => {
-  if (value === undefined) return fallback;
-  if (!Number.isFinite(value) || (value as number) < 0) return null;
-  return Math.min(maximum, Math.floor(value as number));
-};
-
 const parseCloudSyncPushResult = (
   value: unknown,
   changes: CloudSyncChange[],
 ): ParsedCloudSyncPushResult | null => {
-  if (!isObject(value)) return null;
-  const applied = parsePushCount(value.applied, changes.length, changes.length);
-  const conflicts = parsePushCount(value.conflicts, 0, changes.length);
-  if (applied === null || conflicts === null) return null;
-  const qualified = "acceptedRefs" in value || "conflictRefs" in value;
-  if (qualified) {
-    const accepted = parseEntityRefList(value.acceptedRefs ?? []);
-    const conflicted = parseEntityRefList(value.conflictRefs ?? []);
-    if (!accepted || !conflicted) return null;
-    return { applied, conflicts, acknowledgements: [...accepted, ...conflicted] };
+  if (
+    !isObject(value) ||
+    !Number.isSafeInteger(value.checkpoint) ||
+    (value.checkpoint as number) < 0 ||
+    !Number.isSafeInteger(value.applied) ||
+    (value.applied as number) < 0 ||
+    !Number.isSafeInteger(value.conflicts) ||
+    (value.conflicts as number) < 0
+  ) return null;
+
+  const applied = value.applied as number;
+  const conflicts = value.conflicts as number;
+  if (applied + conflicts !== changes.length) return null;
+
+  const changeByKey = new Map(changes.map((change) => [queueKey(change), change]));
+  const changeById = new Map(changes.map((change) => [change.id, change]));
+  if (changeByKey.size !== changes.length || changeById.size !== changes.length) return null;
+
+  const qualifiedKeys = (input: unknown): Set<string> | null | undefined => {
+    if (input === undefined) return undefined;
+    const refs = parseEntityRefList(input);
+    if (!refs) return null;
+    const keys = new Set<string>();
+    for (const ref of refs) {
+      const key = queueKey(ref);
+      if (!changeByKey.has(key) || keys.has(key)) return null;
+      keys.add(key);
+    }
+    return keys;
+  };
+  const legacyKeys = (input: unknown): Set<string> | null | undefined => {
+    if (input === undefined) return undefined;
+    const ids = parseIdList(input);
+    if (!ids) return null;
+    const keys = new Set<string>();
+    for (const id of ids) {
+      const change = changeById.get(id);
+      if (!change) return null;
+      const key = queueKey(change);
+      if (keys.has(key)) return null;
+      keys.add(key);
+    }
+    return keys;
+  };
+
+  const qualified = value.acceptedRefs !== undefined || value.conflictRefs !== undefined;
+  const legacy = !qualified && (value.acceptedIds !== undefined || value.conflictIds !== undefined);
+  let acceptedKeys = qualified
+    ? qualifiedKeys(value.acceptedRefs)
+    : legacy
+      ? legacyKeys(value.acceptedIds)
+      : undefined;
+  let conflictKeys = qualified
+    ? qualifiedKeys(value.conflictRefs)
+    : legacy
+      ? legacyKeys(value.conflictIds)
+      : undefined;
+  if (acceptedKeys === null || conflictKeys === null) return null;
+
+  const allKeys = new Set(changeByKey.keys());
+  if (!acceptedKeys && !conflictKeys) {
+    if (applied !== changes.length || conflicts !== 0) return null;
+    acceptedKeys = allKeys;
+    conflictKeys = new Set();
+  } else {
+    acceptedKeys ??= new Set([...allKeys].filter((key) => !conflictKeys?.has(key)));
+    conflictKeys ??= new Set([...allKeys].filter((key) => !acceptedKeys?.has(key)));
   }
-  const legacy = "acceptedIds" in value || "conflictIds" in value;
-  if (legacy) {
-    const accepted = parseIdList(value.acceptedIds ?? []);
-    const conflicted = parseIdList(value.conflictIds ?? []);
-    if (!accepted || !conflicted) return null;
-    return { applied, conflicts, acknowledgements: [...accepted, ...conflicted] };
+
+  if (acceptedKeys.size !== applied || conflictKeys.size !== conflicts) return null;
+  for (const key of acceptedKeys) {
+    if (conflictKeys.has(key)) return null;
   }
+  if (acceptedKeys.size + conflictKeys.size !== changes.length) return null;
+
   return {
     applied,
     conflicts,
@@ -203,20 +331,32 @@ export const mergeCloudSyncQueue = (
     if (!ref) continue;
     const key = queueKey(ref);
     const prev = merged.get(key);
-    if (!prev || ref.updatedAt >= prev.updatedAt || ref.deletedAt > prev.deletedAt) {
+    const wins = !prev ||
+      ref.updatedAt > prev.updatedAt ||
+      (ref.updatedAt === prev.updatedAt && ref.deletedAt >= prev.deletedAt);
+    if (wins) {
       merged.set(key, { ...ref, attempts: prev && ref.updatedAt === prev.updatedAt ? prev.attempts : 0 });
     }
   }
   return Array.from(merged.values()).sort((a, b) => a.queuedAt - b.queuedAt || a.updatedAt - b.updatedAt);
 };
 
+const SOCIAL_CLOUD_SOURCES = new Set<ItemDocType["source"]>([
+  "twitter",
+  "instagram",
+  "tiktok",
+  "linkedin",
+  "threads",
+  "mastodon",
+  "bluesky",
+]);
+
 const inferCloudItemType = (item: ItemDocType): string => {
   const media = item.media || [];
   if (item.source === "github") return "repo";
-  if (item.source === "youtube") return "video";
-  if (item.source === "twitter" || item.source === "instagram" || item.source === "tiktok" || item.source === "linkedin") {
-    return "social";
-  }
+  if (item.source === "youtube" || item.source === "vimeo") return "video";
+  if (item.source === "spotify" || item.source === "ytmusic" || item.source === "soundcloud") return "audio";
+  if (SOCIAL_CLOUD_SOURCES.has(item.source)) return "social";
   if (item.source === "reddit") return "forum";
   if (item.source === "note") return "note";
   if (item.source === "article" || item.source === "substack") return "article";
@@ -239,7 +379,7 @@ const deriveCloudFields = (item: ItemDocType): Record<string, unknown> => {
     if (!existing.author && item.authorUsername) existing.author = item.authorUsername;
     if (!existing.upvotes && Number.isFinite(item.upvotes)) existing.upvotes = item.upvotes;
   }
-  if (item.source === "twitter" || item.source === "instagram" || item.source === "tiktok" || item.source === "linkedin") {
+  if (SOCIAL_CLOUD_SOURCES.has(item.source)) {
     if (!existing.platform) existing.platform = item.source;
     if (!existing.author && item.authorUsername) existing.author = item.authorUsername;
     if (!existing.likes && Number.isFinite(item.likes)) existing.likes = item.likes;
@@ -248,6 +388,18 @@ const deriveCloudFields = (item: ItemDocType): Record<string, unknown> => {
 };
 
 export const normalizeCloudDoc = (
+  collection: CloudSyncCollectionName,
+  doc: ItemDocType | FolderDocType | SpaceDocType | SpaceGroupDocType | TagDocType | ItemTagDocType,
+  cloudUserId = "",
+): Record<string, unknown> => {
+  const stamped = (value: Record<string, unknown>): Record<string, unknown> => ({
+    ...value,
+    [CLOUD_SYNC_ORIGIN_FIELD]: CLOUD_SYNC_ORIGIN_EXTENSION,
+  });
+  return stamped(normalizeCloudDocFields(collection, doc, cloudUserId));
+};
+
+const normalizeCloudDocFields = (
   collection: CloudSyncCollectionName,
   doc: ItemDocType | FolderDocType | SpaceDocType | SpaceGroupDocType | TagDocType | ItemTagDocType,
   cloudUserId = "",
@@ -311,6 +463,44 @@ export const cloudSyncRefsForDocs = (docs: CloudSyncDocBatch, now = Date.now()):
     queuedAt: now,
   })),
 ];
+
+/** Convert RxDB bulk/single change events into compact live refs or tombstones. */
+export const cloudSyncRefsForRxChange = (
+  collection: CloudSyncCollectionName,
+  changeEvent: unknown,
+  now = Date.now(),
+): CloudSyncQueueRef[] => {
+  const queuedAt = clampTimestamp(now, Date.now());
+  const envelope = isObject(changeEvent) ? changeEvent : {};
+  const events = Array.isArray(envelope.events) ? envelope.events : [envelope];
+  const refs: CloudSyncQueueRef[] = [];
+
+  for (const candidate of events) {
+    if (!isObject(candidate)) continue;
+    const documentData = isObject(candidate.documentData) ? candidate.documentData : null;
+    const previousDocumentData = isObject(candidate.previousDocumentData)
+      ? candidate.previousDocumentData
+      : null;
+    const deleted = candidate.operation === "DELETE" || documentData?._deleted === true;
+    const source = deleted ? previousDocumentData ?? documentData : documentData ?? previousDocumentData;
+    const rawId = source?.id ?? candidate.documentId;
+    const id = typeof rawId === "string" && rawId.trim() ? rawId : "";
+    if (!id) continue;
+
+    if (deleted) {
+      const previousUpdatedAt = clampTimestamp(source?.updatedAt, 0);
+      const deletedAt = Math.max(queuedAt, Math.min(Number.MAX_SAFE_INTEGER - 1, previousUpdatedAt + 1));
+      refs.push({ collection, id, updatedAt: deletedAt, deletedAt, queuedAt });
+      continue;
+    }
+
+    const deletedAt = clampTimestamp(source?.deletedAt, 0);
+    const updatedAt = Math.max(clampTimestamp(source?.updatedAt, queuedAt), deletedAt);
+    refs.push({ collection, id, updatedAt, deletedAt, queuedAt });
+  }
+
+  return refs;
+};
 
 export const selectAcknowledgedQueueRefs = (
   refs: CloudSyncQueueRef[],
@@ -401,6 +591,26 @@ const readQueue = async (): Promise<CloudSyncQueueRef[]> => {
   return Array.isArray(raw) ? mergeCloudSyncQueue(raw as CloudSyncQueueRef[], []) : [];
 };
 
+/**
+ * Queue mutations only need to preserve the already-normalized durable order.
+ * Re-normalizing and sorting the entire remaining outbox after every ten-row
+ * acknowledgement turns a large drain quadratic. Keep a strict shape guard,
+ * while reserving full dedupe/normalization for queue hydration and enqueue.
+ */
+const readQueueForMutation = async (): Promise<CloudSyncQueueRef[]> => {
+  const raw = await storageGet<unknown[]>(CLOUD_SYNC_QUEUE_KEY, []);
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((value): value is CloudSyncQueueRef =>
+    isObject(value) &&
+    isCloudSyncCollection(value.collection) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    Number.isFinite(value.updatedAt) &&
+    Number.isFinite(value.deletedAt) &&
+    Number.isFinite(value.queuedAt)
+  );
+};
+
 const writeQueue = async (queue: CloudSyncQueueRef[]): Promise<void> => {
   await storageSet(CLOUD_SYNC_QUEUE_KEY, queue);
 };
@@ -439,6 +649,88 @@ const getApiBase = async (): Promise<string> => {
 
 const getToken = (): Promise<string> => getCloudAuthToken();
 
+export const isCloudPullEnabled = async (): Promise<boolean> =>
+  (await storageGet<boolean>(CLOUD_PULL_ENABLED_KEY, false)) === true;
+
+export const setCloudPullEnabled = async (enabled: boolean): Promise<void> => {
+  await storageSet(CLOUD_PULL_ENABLED_KEY, enabled === true);
+};
+
+const readPullState = async (userId = ""): Promise<CloudSyncPullState> => {
+  const raw = await storageGet<unknown>(CLOUD_SYNC_PULL_STATE_KEY, null);
+  if (!isObject(raw)) return { checkpoint: 0, ...(userId ? { userId } : {}) };
+  const storedUserId = typeof raw.userId === "string" ? raw.userId : "";
+  // A different account — or a checkpoint written before accounts were recorded
+  // — must start from scratch instead of inheriting a foreign sequence number.
+  if (userId && storedUserId !== userId) return { checkpoint: 0, userId };
+  const checkpoint = Number.isSafeInteger(raw.checkpoint) && Number(raw.checkpoint) >= 0
+    ? Number(raw.checkpoint)
+    : 0;
+  const cursor = typeof raw.bootstrapCursor === "string" && raw.bootstrapCursor.trim()
+    ? raw.bootstrapCursor.trim()
+    : undefined;
+  return {
+    checkpoint,
+    ...(cursor ? { bootstrapCursor: cursor } : {}),
+    ...(storedUserId ? { userId: storedUserId } : {}),
+  };
+};
+
+/** Forget the read position, e.g. on disconnect or a local data reset. */
+export const clearCloudPullState = async (): Promise<void> => {
+  await storageSet(CLOUD_SYNC_PULL_STATE_KEY, { checkpoint: 0 });
+};
+
+const writePullState = async (state: CloudSyncPullState): Promise<void> => {
+  await storageSet(CLOUD_SYNC_PULL_STATE_KEY, state);
+};
+
+/**
+ * Trim a server document to what the local schema actually accepts.
+ *
+ * The cloud carries fields this device has no column for, and RxDB rejects a
+ * whole insert over one stray key. Reading `properties` at runtime means schema
+ * drift never turns into a failed sync. A row missing a required field is
+ * skipped rather than repaired with invented values.
+ */
+export const localizePulledDoc = (
+  doc: Record<string, unknown>,
+  schema?: CloudSyncLocalCollection["schema"],
+): Record<string, unknown> | null => {
+  const properties = schema?.jsonSchema?.properties;
+  const localized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(doc)) {
+    if (!properties || key in properties) localized[key] = value;
+  }
+  // Local bookkeeping the server never sends: a pulled row is already in sync.
+  if ((!properties || "isDirty" in properties) && localized.isDirty === undefined) {
+    localized.isDirty = false;
+  }
+  // Vector slots are offsets into THIS device's vector store. Carrying another
+  // device's offset over would point the row at a local neighbour's embedding
+  // and silently corrupt semantic search, so a pulled row enters the normal
+  // embedding queue exactly like a restored or imported one does.
+  for (const [key, value] of Object.entries(PULLED_DEVICE_LOCAL_FIELDS)) {
+    if (!properties || key in properties) localized[key] = value;
+  }
+  for (const key of schema?.jsonSchema?.required ?? []) {
+    if (localized[key] === undefined) return null;
+  }
+  return localized;
+};
+
+/**
+ * Fields whose values only mean something on the device that wrote them. Kept
+ * in step with the other cross-device ingestion paths (share restore, backup
+ * restore, bookmark and star imports).
+ */
+const PULLED_DEVICE_LOCAL_FIELDS: Record<string, unknown> = {
+  vector_index: -1,
+  vector_indexes: [],
+  isEmbedded: false,
+  isDirty: false,
+};
+
 const collectionForRef = (db: any, collection: CloudSyncCollectionName) => {
   if (collection === "spaceGroups") return db.space_groups;
   if (collection === "itemTags") return db.item_tags;
@@ -447,8 +739,23 @@ const collectionForRef = (db: any, collection: CloudSyncCollectionName) => {
 
 type CloudSyncLocalRecord = Record<string, unknown>;
 
+export type CloudSyncLocalDocument = {
+  primary?: string;
+  get?(field: string): unknown;
+  toMutableJSON(): CloudSyncLocalRecord;
+};
+
 export type CloudSyncLocalCollection = {
-  findByIds(ids: string[]): { exec(): Promise<Map<string, { toMutableJSON(): CloudSyncLocalRecord }>> };
+  findByIds(ids: string[]): { exec(): Promise<Map<string, CloudSyncLocalDocument>> };
+  find?(query: {
+    selector: Record<string, unknown>;
+    sort?: Array<{ id: "asc" }>;
+    limit?: number;
+  }): { exec(): Promise<CloudSyncLocalDocument[]> };
+  /** Used by a pull to add rows this device has never seen. */
+  bulkInsert?(docs: Record<string, unknown>[]): Promise<{ error?: unknown[] } | unknown>;
+  /** Read at runtime so an incoming doc is trimmed to what this schema accepts. */
+  schema?: { jsonSchema?: { properties?: Record<string, unknown>; required?: string[] } };
 };
 
 export type CloudSyncCollectionResolver = (collection: CloudSyncCollectionName) => CloudSyncLocalCollection;
@@ -502,10 +809,12 @@ const buildCloudSyncChanges = async (
   return changes;
 };
 
-const removeQueueRefs = async (refs: CloudSyncQueueRef[]): Promise<void> => {
-  await withQueueMutationLock(async () => {
-    const current = await readQueue();
-    await writeQueue(removeAcknowledgedQueueRefs(current, refs));
+const removeQueueRefs = async (refs: CloudSyncQueueRef[]): Promise<CloudSyncQueueRef[]> => {
+  return withQueueMutationLock(async () => {
+    const current = await readQueueForMutation();
+    const next = removeAcknowledgedQueueRefs(current, refs);
+    await writeQueue(next);
+    return next;
   });
 };
 
@@ -583,6 +892,165 @@ const readBoundedCloudSyncJson = async (
   }
 };
 
+/**
+ * Every spelling of one URL that `itemDedupeKey` treats as the same page.
+ *
+ * `url` is stored verbatim, so an exact-match lookup would miss the local row
+ * that differs only by a trailing slash, a fragment, or host case. Listing the
+ * handful of equivalent spellings keeps the dedupe check honest without needing
+ * a normalized column to query.
+ */
+export const equivalentUrlSpellings = (rawUrl: string): string[] => {
+  const spellings = new Set<string>([rawUrl]);
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return [...spellings];
+    parsed.hash = "";
+    parsed.hostname = parsed.hostname.toLowerCase();
+    const withSlash = parsed.toString();
+    spellings.add(withSlash);
+    const trimmedPath = parsed.pathname.length > 1 ? parsed.pathname.replace(/\/+$/, "") : parsed.pathname;
+    spellings.add(`${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search}`);
+    spellings.add(`${parsed.protocol}//${parsed.host}${trimmedPath}/${parsed.search}`);
+  } catch {
+    // A URL the local store could only hold verbatim.
+  }
+  return [...spellings];
+};
+
+/** Validate a pull page before it is allowed to touch the local database. */
+export const normalizePulledPage = (value: unknown): {
+  changes: CloudPullChange[];
+  checkpoint: number;
+  hasMore: boolean;
+  bootstrap?: { complete: boolean; cursor?: string };
+} | null => {
+  if (!isObject(value) || !Array.isArray(value.changes)) return null;
+  if (!Number.isSafeInteger(value.checkpoint) || Number(value.checkpoint) < 0) return null;
+  if (typeof value.hasMore !== "boolean") return null;
+
+  const changes: CloudPullChange[] = [];
+  for (const raw of value.changes) {
+    if (!isObject(raw) || !isCloudSyncCollection(raw.collection)) continue;
+    if (typeof raw.id !== "string" || !raw.id.trim()) continue;
+    changes.push({
+      collection: raw.collection,
+      id: raw.id,
+      doc: isObject(raw.doc) ? raw.doc : null,
+      updatedAt: clampTimestamp(raw.updatedAt, 0),
+      deletedAt: clampTimestamp(raw.deletedAt, 0),
+    });
+  }
+
+  const bootstrap = isObject(value.bootstrap)
+    ? {
+        complete: value.bootstrap.complete === true,
+        ...(typeof value.bootstrap.cursor === "string" && value.bootstrap.cursor
+          ? { cursor: value.bootstrap.cursor }
+          : {}),
+      }
+    : undefined;
+
+  return {
+    changes,
+    checkpoint: Number(value.checkpoint),
+    hasMore: value.hasMore,
+    ...(bootstrap ? { bootstrap } : {}),
+  };
+};
+
+/**
+ * Apply one validated page.
+ *
+ * The local index is built from just this page's ids and URLs rather than the
+ * whole library, so a pull costs the same whether the device holds ten items or
+ * fifty thousand.
+ */
+const applyPulledChanges = async (
+  changes: CloudPullChange[],
+  resolveCollection: CloudSyncCollectionResolver,
+): Promise<{ inserted: number; skipped: number; rejected: number }> => {
+  if (changes.length === 0) return { inserted: 0, skipped: 0, rejected: 0 };
+
+  const byCollection = new Map<CloudSyncCollectionName, CloudPullChange[]>();
+  for (const change of changes) {
+    const grouped = byCollection.get(change.collection) ?? [];
+    grouped.push(change);
+    byCollection.set(change.collection, grouped);
+  }
+
+  // What does this device already hold, among exactly these rows?
+  const ids: Partial<Record<CloudSyncCollectionName, Set<string>>> = {};
+  await Promise.all(
+    Array.from(byCollection.entries()).map(async ([collection, group]) => {
+      const found = await resolveCollection(collection)
+        .findByIds(Array.from(new Set(group.map((change) => change.id))))
+        .exec();
+      ids[collection] = new Set(found.keys());
+    }),
+  );
+
+  // And which of the incoming pages are already saved under a different id?
+  // The lookup has to cover every spelling that normalizes to the same key,
+  // otherwise itemDedupeKey's normalization is dead in the real path and
+  // "https://host/page/" gets saved a second time as "https://host/page".
+  const incomingUrls = Array.from(new Set(
+    (byCollection.get("items") ?? []).flatMap((change) =>
+      typeof change.doc?.url === "string" ? equivalentUrlSpellings(change.doc.url) : []),
+  ));
+  let itemKeys = new Set<string>();
+  if (incomingUrls.length > 0) {
+    const items = resolveCollection("items");
+    const existing = await items.find?.({
+      // A binned row must not block re-adding the page, matching how the rest of
+      // the app queries live items.
+      selector: { url: { $in: incomingUrls }, deletedAt: { $eq: 0 } },
+    }).exec();
+    itemKeys = cloudPullItemKeys((existing ?? []).map((document) => document.toMutableJSON()));
+  }
+
+  const plan = planCloudPullMerge(changes, { ids, itemKeys });
+  let inserted = 0;
+  let rejected = 0;
+  for (const [collection, group] of groupInserts(plan.inserts)) {
+    const target = resolveCollection(collection);
+    const docs = group
+      .map((change) => localizePulledDoc(change.doc as Record<string, unknown>, target.schema))
+      .filter((doc): doc is Record<string, unknown> => doc !== null);
+    rejected += group.length - docs.length;
+    if (docs.length === 0 || !target.bulkInsert) {
+      rejected += docs.length;
+      continue;
+    }
+    // RxDB bulk writes report per-row outcomes instead of throwing, so a
+    // conflict must not be counted as an insert (the checkpoint would advance
+    // past a row that was never written).
+    const outcome = await target.bulkInsert(docs);
+    const failures = Array.isArray((outcome as { error?: unknown[] })?.error)
+      ? (outcome as { error: unknown[] }).error.length
+      : 0;
+    inserted += Math.max(0, docs.length - failures);
+    rejected += failures;
+  }
+
+  return {
+    inserted,
+    skipped: Math.max(0, changes.length - inserted - rejected),
+    rejected,
+  };
+};
+
+const groupInserts = (inserts: CloudPullChange[]): Map<CloudSyncCollectionName, CloudPullChange[]> => {
+  // Parents before children: a folder's space must exist before the folder does.
+  const order: CloudSyncCollectionName[] = ["spaceGroups", "spaces", "folders", "tags", "items", "itemTags"];
+  const grouped = new Map<CloudSyncCollectionName, CloudPullChange[]>();
+  for (const collection of order) {
+    const group = inserts.filter((change) => change.collection === collection);
+    if (group.length > 0) grouped.set(collection, group);
+  }
+  return grouped;
+};
+
 export class CloudSyncService {
   constructor(private readonly options: CloudSyncServiceOptions = {}) {}
 
@@ -593,11 +1061,27 @@ export class CloudSyncService {
   }
 
   private request(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    return (this.options.fetcher ?? fetch)(input, init);
+    // Bound like archive-preview: a detached fetch reference throws
+    // "Illegal invocation" in window contexts.
+    return (this.options.fetcher ?? fetch.bind(globalThis))(input, init);
   }
 
   async enqueueDocs(docs: CloudSyncDocBatch): Promise<{ queued: number; added: number }> {
     const refs = cloudSyncRefsForDocs(docs).map(normalizeRef).filter((ref): ref is CloudSyncQueueRef => ref !== null);
+    return this.enqueueRefs(refs);
+  }
+
+  async enqueueRxChange(
+    collection: CloudSyncCollectionName,
+    changeEvent: unknown,
+  ): Promise<{ queued: number; added: number }> {
+    return this.enqueueRefs(cloudSyncRefsForRxChange(collection, changeEvent));
+  }
+
+  private async enqueueRefs(
+    refs: CloudSyncQueueRef[],
+    notify = true,
+  ): Promise<{ queued: number; added: number }> {
     if (refs.length === 0) {
       const queue = await readQueue();
       return { queued: queue.length, added: 0 };
@@ -608,8 +1092,204 @@ export class CloudSyncService {
       await writeQueue(next);
       return { queued: next.length, added: refs.length };
     });
-    notifyCloudSyncQueueUpdated();
+    if (notify) notifyCloudSyncQueueUpdated();
     return result;
+  }
+
+  /**
+   * Explicitly backfill every local syncable collection, then drain a bounded
+   * first run. Remaining work stays in the durable queue and the background
+   * continuation alarm resumes it. Authentication is refreshed before any
+   * local document is read so a disconnected account cannot accidentally
+   * stage a full-library upload.
+   */
+  /**
+   * Read this account's changes from other devices and add what is missing.
+   *
+   * Additive by construction (see `planCloudPullMerge`): nothing local is
+   * overwritten or deleted, so a pull needs no conflict resolution. The
+   * checkpoint only advances after a page has been applied, so an interrupted
+   * run re-reads that page instead of skipping it.
+   */
+  async pull(payload: { maxPages?: number } = {}): Promise<CloudSyncPullResult> {
+    const maxPages = Math.max(1, Math.min(
+      CLOUD_SYNC_PULL_MAX_PAGES,
+      Math.floor(payload.maxPages ?? 4),
+    ));
+    // Backup is one-way out of this extension unless the user turned the return
+    // direction on, so the default costs no network call at all.
+    const enabled = await isCloudPullEnabled();
+    const credentials = enabled
+      ? await (this.options.getCredentials ?? getCloudAuthCredentials)()
+      : { token: "", userId: "" };
+    // The read position belongs to one account: sequence numbers are per user,
+    // so another account's checkpoint would silently skip its whole library.
+    let state = await readPullState(credentials.userId);
+    const result: CloudSyncPullResult = {
+      inserted: 0,
+      skipped: 0,
+      rejected: 0,
+      pages: 0,
+      checkpoint: state.checkpoint,
+      hasMore: false,
+    };
+    if (!enabled) return { ...result, reason: "disabled" };
+    if (!credentials.token) return { ...result, reason: "missing-token" };
+    const [apiBase, clientId] = await Promise.all([getApiBase(), getClientId()]);
+    const resolveCollection = await this.getCollectionResolver();
+
+    while (result.pages < maxPages) {
+      const query = new URLSearchParams({
+        since: String(state.checkpoint),
+        limit: String(CLOUD_SYNC_PULL_PAGE_SIZE),
+        clientId,
+      });
+      if (state.bootstrapCursor) query.set("cursor", state.bootstrapCursor);
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), CLOUD_SYNC_REQUEST_TIMEOUT_MS);
+      let body: unknown;
+      try {
+        const response = await this.request(`${apiBase}/v1/sync/pull?${query}`, {
+          method: "GET",
+          headers: { authorization: `Bearer ${credentials.token}`, accept: "application/json" },
+          credentials: "omit",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (response.status === 401 || response.status === 403) {
+          await response.body?.cancel().catch(() => {});
+          return { ...result, reason: "invalid-auth" };
+        }
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => {});
+          return { ...result, reason: "http-error", error: `${response.status} ${response.statusText}`.trim() };
+        }
+        body = await readBoundedCloudSyncJson(response, controller.signal);
+      } catch (cause) {
+        return {
+          ...result,
+          reason: "network-error",
+          error: cause instanceof Error ? cause.message : "pull failed",
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const page = normalizePulledPage(body);
+      if (!page) return { ...result, reason: "invalid-response" };
+
+      const applied = await applyPulledChanges(page.changes, resolveCollection);
+      result.inserted += applied.inserted;
+      result.skipped += applied.skipped;
+      result.rejected += applied.rejected;
+      result.pages += 1;
+
+      // Only now is it safe to forget this page.
+      state = {
+        // Never move backwards: a repeated checkpoint must not rewind this
+        // device's read position.
+        checkpoint: Math.max(state.checkpoint, page.checkpoint),
+        ...(page.bootstrap && !page.bootstrap.complete && page.bootstrap.cursor
+          ? { bootstrapCursor: page.bootstrap.cursor }
+          : {}),
+        ...(credentials.userId ? { userId: credentials.userId } : {}),
+      };
+      await writePullState(state);
+      result.checkpoint = state.checkpoint;
+      result.hasMore = page.hasMore;
+      if (!page.hasMore) break;
+    }
+
+    if (result.pages === 0) return { ...result, reason: "empty" };
+    return result;
+  }
+
+  /**
+   * Whether each item is backed up, per this device's own records.
+   *
+   * The queue is the source of truth: an item leaves it only when the server has
+   * acknowledged it. So "queued" means waiting, absence means acknowledged, and
+   * without a session nothing is backed up at all. No extra bookkeeping to drift
+   * out of step with reality.
+   */
+  async itemSyncState(itemIds: string[]): Promise<Record<string, CloudSyncItemState>> {
+    const ids = Array.from(new Set(itemIds.filter((id) => typeof id === "string" && id.trim())));
+    const state: Record<string, CloudSyncItemState> = {};
+    if (ids.length === 0) return state;
+
+    const credentials = await (this.options.getCredentials ?? getCloudAuthCredentials)();
+    if (!credentials.token) {
+      for (const id of ids) state[id] = "not-connected";
+      return state;
+    }
+
+    const queued = new Set(
+      (await readQueue())
+        .filter((ref) => ref.collection === "items")
+        .map((ref) => ref.id),
+    );
+    for (const id of ids) state[id] = queued.has(id) ? "pending" : "synced";
+    return state;
+  }
+
+  async syncAll(payload: CloudSyncAllOptions = {}): Promise<CloudSyncAllResult> {
+    const credentials = this.options.getCredentials
+      ? await this.options.getCredentials(true)
+      : await getCloudAuthCredentials(true);
+    if (!credentials.token || !credentials.userId) {
+      throw new Error("CLOUD_SYNC_AUTH_REQUIRED");
+    }
+
+    const resolveCollection = await this.getCollectionResolver();
+    const pageSize = boundedPositiveInteger(payload.pageSize, 250, 1_000);
+    const refs: CloudSyncQueueRef[] = [];
+    let scanned = 0;
+
+    for (const collection of CLOUD_SYNC_COLLECTIONS) {
+      const localCollection = resolveCollection(collection);
+      if (typeof localCollection.find !== "function") {
+        throw new Error(`CLOUD_SYNC_SCAN_UNAVAILABLE:${collection}`);
+      }
+      scanned += await forEachIdKeysetPage({
+        collection: localCollection as Required<Pick<CloudSyncLocalCollection, "find">>,
+        selector: {},
+        pageSize,
+        onPage: (documents) => {
+          const queuedAt = Date.now();
+          for (const document of documents) {
+            const row = document.toMutableJSON();
+            const rawId = typeof row.id === "string"
+              ? row.id
+              : typeof document.primary === "string"
+                ? document.primary
+                : document.get?.("id");
+            const id = typeof rawId === "string" && rawId.trim() ? rawId : "";
+            if (!id) continue;
+            const normalized = normalizeRef({
+              collection,
+              id,
+              updatedAt: clampTimestamp(row.updatedAt, queuedAt),
+              deletedAt: clampTimestamp(row.deletedAt, 0),
+              queuedAt,
+            });
+            if (normalized) refs.push(normalized);
+          }
+        },
+      });
+    }
+
+    const queued = await this.enqueueRefs(refs, false);
+    const push = await this.drain({
+      maxBatches: payload.maxBatches,
+      expectedUserId: credentials.userId,
+    });
+    return {
+      scanned,
+      enqueued: refs.length,
+      queued: queued.queued,
+      push,
+    };
   }
 
   async status(): Promise<{ queued: number; hasToken: boolean; apiBase: string }> {
@@ -618,7 +1298,11 @@ export class CloudSyncService {
   }
 
   async drain(payload?: CloudSyncBatchOptions): Promise<CloudSyncDrainResult> {
-    if (drainInFlight) return drainInFlight;
+    if (drainInFlight) {
+      if (!payload?.expectedUserId) return drainInFlight;
+      await drainInFlight;
+      return this.drain(payload);
+    }
     const generation = drainGeneration;
     const controller = new AbortController();
     drainController = controller;
@@ -634,11 +1318,14 @@ export class CloudSyncService {
     drainController?.abort();
     await drainInFlight?.catch(() => {});
     await withQueueMutationLock(() => storageRemove(CLOUD_SYNC_QUEUE_KEY));
+    // The read position describes a library that no longer exists here; keeping
+    // it would make every already-pulled row invisible to a future pull.
+    await clearCloudPullState();
   }
 
   /** Ensure one local item reaches the API before a dependent archive upload. */
   async pushItem(itemIdRaw: string): Promise<CloudSyncPushItemResult> {
-    const itemId = typeof itemIdRaw === "string" ? itemIdRaw.trim() : "";
+    const itemId = typeof itemIdRaw === "string" && itemIdRaw.trim() ? itemIdRaw : "";
     if (!itemId) return { ready: false, reason: "missing-local-item" };
     const resolveCollection = await this.getCollectionResolver();
     const found = await resolveCollection("items").findByIds([itemId]).exec();
@@ -694,6 +1381,18 @@ export class CloudSyncService {
         error: "Cloud account identity is unavailable.",
       };
     }
+    if (payload?.expectedUserId && credentials.userId !== payload.expectedUserId) {
+      return {
+        pushed: 0,
+        skipped: 0,
+        conflicts: 0,
+        batches: 0,
+        queued: initialQueued,
+        remaining: initialQueued,
+        reason: "invalid-auth",
+        error: "Cloud account changed during sync.",
+      };
+    }
 
     const batchSize = boundedPositiveInteger(
       payload?.batchSize,
@@ -729,10 +1428,9 @@ export class CloudSyncService {
       const missingRefs = refs.filter((ref) => !changes.some((change) => change.collection === ref.collection && change.id === ref.id));
       if (missingRefs.length > 0) {
         skipped += missingRefs.length;
-        await removeQueueRefs(missingRefs);
+        queue = await removeQueueRefs(missingRefs);
       }
       if (changes.length === 0) {
-        queue = await readQueue();
         continue;
       }
 
@@ -826,8 +1524,7 @@ export class CloudSyncService {
 
       pushed += result.applied;
       conflicts += result.conflicts;
-      await removeQueueRefs(acknowledgedRefs);
-      queue = await readQueue();
+      queue = await removeQueueRefs(acknowledgedRefs);
     }
 
     return {

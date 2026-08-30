@@ -102,6 +102,17 @@ test("archive cache keeps a successful snapshot readable after the network is go
   ]);
 });
 
+test("archive cache preserves the full shared opaque item identity", async () => {
+  const harness = createHarness();
+  const itemId = ` item/${"x".repeat(480)} `;
+  const archive = new Blob(["<html>opaque identity</html>"], { type: "text/html" });
+
+  await harness.cache.put(itemId, archive);
+
+  expect(await (await harness.cache.get(itemId))?.text()).toBe("<html>opaque identity</html>");
+  expect(await harness.cache.list()).toMatchObject([{ itemId }]);
+});
+
 test("archive cache replaces an item's older bytes without leaking the old file", async () => {
   const harness = createHarness();
   await harness.cache.put("item-1", new Blob(["old"]));

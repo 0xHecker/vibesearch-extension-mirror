@@ -25,30 +25,114 @@ interface WebsitePreviewProps {
 }
 
 type PreviewState =
-  | { status: "loading" }
-  | { status: "ready"; url: string; sourceByteSize: number }
+  | { status: "loading"; message?: string }
+  | { status: "ready"; url: string; sourceByteSize: number; capturedAt?: number }
   | { status: "error"; message: string };
+
+const formatCaptureTime = (value: number): string => {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(new Date(value));
+  } catch {
+    return "recently";
+  }
+};
+
+type ArchiveCaptureResult = {
+  captured: boolean;
+  reason?: string;
+};
+
+const captureArchiveNow = async (itemId: string, url: string): Promise<ArchiveCaptureResult> => {
+  const response = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "ARCHIVE_CAPTURE_NOW",
+    payload: { itemId, url },
+  });
+  if (response?.success === false) {
+    throw new Error(response?.error || "Capture request failed");
+  }
+  const payload = response?.payload ?? {};
+  return {
+    captured: payload.captured === true,
+    ...(typeof payload.reason === "string" && payload.reason
+      ? { reason: payload.reason }
+      : {}),
+  };
+};
 
 /** The card's View sheet renders the cloud archive, never the live website. */
 export const WebsitePreview = ({ url, title, open, onOpenChange, item }: WebsitePreviewProps) => {
   const [retryNonce, setRetryNonce] = useState(0);
   const [frameLoading, setFrameLoading] = useState(false);
   const [preview, setPreview] = useState<PreviewState>({ status: "loading" });
+  const [cloudConnected, setCloudConnected] = useState<boolean | null>(null);
+  const [canCapture, setCanCapture] = useState(false);
+  const [capturing, setCapturing] = useState(false);
   const activeSessionRef = useRef<ArchivePreviewSession | null>(null);
   const forceRefreshRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    // Login-optional archives: surface whether this copy lives in the
+    // ephemeral device namespace so the connect nudge makes sense.
+    chrome.runtime
+      .sendMessage({ service: "cloudAuth", type: "status", target: "offscreen", payload: {} })
+      .then((response) => {
+        if (cancelled) return;
+        const payload = response?.payload ?? response;
+        setCloudConnected(payload?.connected === true);
+      })
+      .catch(() => {
+        if (!cancelled) setCloudConnected(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
     const preferFresh = forceRefreshRef.current;
     forceRefreshRef.current = false;
-    const session = new ArchivePreviewSession({ preferFresh });
+    const session = new ArchivePreviewSession({
+      preferFresh,
+      recoverMissing: async () => {
+        if (!cancelled) {
+          setCanCapture(false);
+          setCapturing(true);
+          setPreview({
+            status: "loading",
+            message: "No snapshot existed, so Vibesearch is capturing this page now…",
+          });
+        }
+        try {
+          const result = await captureArchiveNow(item.id, url);
+          if (!result.captured) {
+            throw new ArchivePreviewError(
+              "ARCHIVE_PREVIEW_NETWORK_ERROR",
+              result.reason
+                ? `Capture did not finish: ${result.reason}`
+                : "Capture is queued but has not finished yet.",
+            );
+          }
+          return true;
+        } finally {
+          if (!cancelled) setCapturing(false);
+        }
+      },
+    });
     activeSessionRef.current = session;
     setPreview({ status: "loading" });
     setFrameLoading(false);
 
     void session.load(item.id).then((document) => {
       if (cancelled) return;
+      setCanCapture(false);
       setFrameLoading(true);
       setPreview({ status: "ready", ...document });
     }).catch((error: unknown) => {
@@ -57,6 +141,15 @@ export const WebsitePreview = ({ url, title, open, onOpenChange, item }: Website
         (error instanceof ArchivePreviewError && error.code === "ARCHIVE_PREVIEW_ABORTED")
       ) {
         return;
+      }
+      if (error instanceof ArchivePreviewError) {
+        console.warn(`[archive-preview] failed code=${error.code} status=${error.status ?? "-"}`, error);
+        if (
+          error.code === "ARCHIVE_PREVIEW_NOT_FOUND" ||
+          error.code === "ARCHIVE_PREVIEW_NETWORK_ERROR"
+        ) {
+          setCanCapture(true);
+        }
       }
       setFrameLoading(false);
       setPreview({
@@ -73,6 +166,41 @@ export const WebsitePreview = ({ url, title, open, onOpenChange, item }: Website
       if (activeSessionRef.current === session) activeSessionRef.current = null;
     };
   }, [item.id, open, retryNonce]);
+
+  useEffect(() => {
+    if (!open) return;
+    setCanCapture(false);
+    setCapturing(false);
+  }, [open, retryNonce]);
+
+  const requestServerCapture = () => {
+    if (capturing) return;
+    setCapturing(true);
+    captureArchiveNow(item.id, url)
+      .then((payload) => {
+        setCapturing(false);
+        if (payload.captured === true) {
+          requestFreshCopy();
+          return;
+        }
+        setCanCapture(true);
+        setPreview({
+          status: "error",
+          message: payload.reason
+            ? `Capture is queued but not finished: ${payload.reason}`
+            : "Capture is queued. Try again after you’re back online.",
+        });
+      })
+      .catch((error) => {
+        console.warn("[archive-preview] server capture request failed", error);
+        setCapturing(false);
+        setCanCapture(true);
+        setPreview({
+          status: "error",
+          message: error instanceof Error ? error.message : "Capture request failed.",
+        });
+      });
+  };
 
   const requestFreshCopy = () => {
     forceRefreshRef.current = true;
@@ -104,11 +232,34 @@ export const WebsitePreview = ({ url, title, open, onOpenChange, item }: Website
                 <ShieldCheck size={12} className="shrink-0 text-foreground-positive" />
                 <span className="shrink-0">Archived copy</span>
                 <span aria-hidden className="text-foreground-tertiary">·</span>
+                {preview.status === "ready" && (
+                  <>
+                    <span className="shrink-0">
+                      Captured {formatCaptureTime(
+                        preview.capturedAt || Math.max(
+                          item.updatedAt || 0,
+                          ...(item.blobs || [])
+                            .filter((blob) => blob.kind === "archive")
+                            .map((blob) => blob.capturedAt || 0),
+                        )
+                      )}
+                    </span>
+                    <span aria-hidden className="text-foreground-tertiary">·</span>
+                  </>
+                )}
                 <span className="truncate">{url}</span>
               </SheetDescription>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2 pl-4">
+            {cloudConnected === false && (
+              <span
+                className="hidden sm:inline-flex items-center gap-1 rounded-full bg-background-neutral px-2 py-0.5 text-[10px] font-medium text-foreground-tertiary"
+                title="This copy is stored on this device only. The oldest copies are dropped once this device is holding 5,000 snapshots or 256 MB, and copies backed up without an account are cleared after 30 days. Log in with Google to keep them permanently and open them on your other devices."
+              >
+                Saved on this device
+              </span>
+            )}
             {preview.status === "ready" && (
               <Button
                 variant="outline"
@@ -133,7 +284,9 @@ export const WebsitePreview = ({ url, title, open, onOpenChange, item }: Website
               <Loader2 className="mb-4 h-8 w-8 animate-spin text-accent-primary" />
               <p className="text-sm font-medium text-foreground-secondary">Loading archived copy…</p>
               <p className="mt-1 text-xs text-foreground-tertiary">
-                Reading the sanitized snapshot from offline storage or the archive cloud
+                {preview.status === "loading" && preview.message
+                  ? preview.message
+                  : "Reading the sanitized snapshot from offline storage or the archive cloud"}
               </p>
             </div>
           )}
@@ -156,7 +309,7 @@ export const WebsitePreview = ({ url, title, open, onOpenChange, item }: Website
                   message: "The archived document could not be rendered safely.",
                 });
               }}
-              sandbox="allow-downloads"
+              sandbox=""
               referrerPolicy="no-referrer"
             />
           )}
@@ -182,6 +335,18 @@ export const WebsitePreview = ({ url, title, open, onOpenChange, item }: Website
                     <RefreshCw size={14} />
                     Try again
                   </Button>
+                  {canCapture && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="gap-2"
+                      onClick={requestServerCapture}
+                      disabled={capturing}
+                    >
+                      <Archive size={14} />
+                      {capturing ? "Capturing…" : "Capture this page now"}
+                    </Button>
+                  )}
                   <Button variant="outline" size="sm" className="gap-2" onClick={handleOpenLivePage}>
                     <OpenArrowIcon size={14} />
                     Open live page

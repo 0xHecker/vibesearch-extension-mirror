@@ -412,14 +412,16 @@ const updateFolder = (existing: FolderDocType | undefined, candidate: FolderDocT
 
 const updateBookmark = (existing: ItemDocType | undefined, candidate: ItemDocType, now: number) => {
   if (!existing) return candidate;
+  // Items moved to the Bin by the user stay in the Bin. The Chrome bookmark tree
+  // still contains them, but reconciliation must never resurrect binned rows.
+  if (existing.deletedAt !== 0) return null;
   const urlChanged = existing.url !== candidate.url;
   const locationChanged =
     existing.title !== candidate.title ||
     existing.folderId !== candidate.folderId ||
     existing.spaceId !== candidate.spaceId ||
     existing.chunkOrder !== candidate.chunkOrder ||
-    existing.source !== candidate.source ||
-    existing.deletedAt !== 0;
+    existing.source !== candidate.source;
   if (!urlChanged && !locationChanged) return null;
   return {
     ...existing,

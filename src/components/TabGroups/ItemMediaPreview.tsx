@@ -59,7 +59,7 @@ const resolveMedia = async (item: ItemDocType): Promise<ResolvedMedia | null> =>
         type: "video",
         src: embedUrl,
         embedType: "iframe",
-        thumbnailSrc: candidate.thumbnailUrl || item.displayImageUrl,
+        thumbnailSrc: candidate.s3ThumbnailUrl || candidate.thumbnailUrl || item.displayImageUrl,
         width: candidate.width,
         height: candidate.height,
         isVertical,

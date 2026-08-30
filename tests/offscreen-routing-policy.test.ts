@@ -26,6 +26,9 @@ test("raw offscreen forwarding cannot bypass full-library orchestration", () => 
     expect(isInternalOnlyOffscreenCall({ service: "dbManager", type })).toBe(true);
   }
   expect(isInternalOnlyOffscreenCall({ service: "dbManager", type: "getAllFolders" })).toBe(false);
+  expect(isInternalOnlyOffscreenCall({ service: "cloudSync", type: "syncAll" })).toBe(true);
+  expect(isInternalOnlyOffscreenCall({ service: "cloudSync", type: "status" })).toBe(false);
+  expect(isInternalOnlyOffscreenCall({ service: "items", type: "findLiveByUrls" })).toBe(true);
 });
 
 test("ordinary privileged editor operations remain search-page scoped", () => {

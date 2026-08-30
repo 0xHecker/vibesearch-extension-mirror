@@ -13,8 +13,11 @@ justifications) · [PRIVACY.md](PRIVACY.md) (privacy policy).
   description in `manifest.base.json`.
 - ☑ **Production build verified** — `bun run build:chrome` succeeds and emits `dist_chrome/`
   with the correct manifest. No source maps, no dev icons (stripped in production).
-- ☐ **Rebuild the upload zip** after the archive/cloud-sync changes. Existing versioned zip
-  files predate the current source and must not be submitted as current artifacts.
+- ☐ **Rebuild the upload zip** after the archive/cloud-sync and Google Drive changes. Existing
+  versioned zip files predate the current source and must not be submitted as current artifacts.
+  The published `v1.4.4` Chrome release asset was inspected on 2026-08-09: its manifest has the
+  `identity` permission but neither the stable `key` nor the Chrome `oauth2` block, so that asset
+  cannot ship the current Google Drive connection flow.
 - ☑ **Privacy policy drafted** — `docs/PRIVACY.md`.
 - ☑ **Listing copy + permission justifications drafted** — `docs/chrome-web-store-listing.md`.
 
@@ -71,8 +74,11 @@ Google sign-in flow depends on that ID:
 - That redirect URI is registered against your Google OAuth client. Removing the `key` changes
   the extension ID and **breaks Google backup/restore**.
 
-- ☐ Confirm the ID produced by this `key` matches the ID registered in your Google OAuth client
-  (and the one you'll publish under).
+- ☑ The checked-in key deterministically produces extension ID
+  **`heembgihcngbcadkkpcmkhhlldkidoph`**; the production build retains the same key and ID.
+- ☐ Confirm **`heembgihcngbcadkkpcmkhhlldkidoph`** is also the Chrome Web Store Item ID and the
+  Item ID bound to the Chrome Extension OAuth client. Those two dashboard values are not publicly
+  introspectable from source or Wrangler.
 
 ---
 
@@ -82,7 +88,16 @@ The backup feature requests only `drive.file`: it can create, find, update, and 
 Vibesearch JSON files it created, but it cannot browse arbitrary Drive contents.
 
 - ☑ The public Chrome Extension client is present in `manifest.chrome.json` with `drive.file`.
-- ☑ The fallback web client and stable unpacked Chrome callback are configured in Google Cloud.
+- ☑ The fallback web client accepts the exact callback
+  `https://heembgihcngbcadkkpcmkhhlldkidoph.chromiumapp.org/google`. A read-only
+  `prompt=none` authorization probe on 2026-08-09 returned the callback with
+  `interaction_required`, not `redirect_uri_mismatch`.
+- ☑ `drive.googleapis.com` is enabled for OAuth project number `400575856806` (verified with a
+  read-only Google Cloud service metadata query on 2026-08-09).
+- ☐ Before release, smoke-test the production Chrome build with a real Google account: Connect,
+  create a backup, update the same file, list it, restore it, disconnect, and confirm a silent
+  status probe stays disconnected. This is the only way to prove the Chrome Extension OAuth
+  client binding, consent-screen publication, and user grant together.
 - ☐ Before publishing under a different Chrome Web Store id, register that exact id/client and
   its `https://<EXTENSION_ID>.chromiumapp.org/google` fallback callback.
 - ☐ **Firefox release blocker:** register and smoke-test the exact Firefox loopback callback
@@ -94,8 +109,9 @@ Vibesearch JSON files it created, but it cannot browse arbitrary Drive contents.
 ## 5. Secrets / environment
 
 - ☑ Local build works (`.env.production.local` provides `VITE_IMPORT_MEDIA_UPLOAD_TOKEN`).
-- ☐ CI (`.github/workflows/ci.yml`) needs repo secret **`VITE_IMPORT_MEDIA_UPLOAD_TOKEN`** (same
-  value as the metadata worker's `IMPORT_MEDIA_TOKEN`).
+- ☑ CI (`.github/workflows/ci.yml`) has repo secret **`VITE_IMPORT_MEDIA_UPLOAD_TOKEN`** (its
+  presence and update timestamp were verified read-only on 2026-08-09; the value was not read).
+  It must remain the same upload-only value as the metadata worker's `IMPORT_MEDIA_TOKEN`.
 - ⚠️ This token is a `VITE_` var, so it is **embedded in the shipped bundle**. Make sure it's an
   upload-only token with no broader privileges, and rotate it if it ever leaks.
 

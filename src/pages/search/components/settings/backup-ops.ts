@@ -6,6 +6,7 @@ import type {
 import { LOCAL_MIGRATION_MAX_JSON_BYTES } from "@src/services/local-extension-migration";
 import { createLocalMigrationJsonBlob } from "@src/services/local-extension-migration-json";
 import {
+  deleteStagedPayloadFile,
   stagePayloadFile,
   takeStagedPayloadFile,
 } from "@src/services/large-payload-staging";
@@ -56,10 +57,33 @@ export const formatMigrationSummary = (summary: LocalExtensionMigrationSummary) 
 export const buildBackupDownload = () =>
   callBackground<StagedLocalMigrationDownload>("LOCAL_BACKUP_BUILD_DOWNLOAD");
 
-export const stageBackupFile = async (file: File): Promise<StagedLocalMigration> => {
+type StageBackupFileDependencies = {
+  stage: typeof stagePayloadFile;
+  remove: typeof deleteStagedPayloadFile;
+  submit: (fileName: string) => Promise<StagedLocalMigration>;
+};
+
+export const stageBackupFile = async (
+  file: File,
+  dependencies: StageBackupFileDependencies = {
+    stage: stagePayloadFile,
+    remove: deleteStagedPayloadFile,
+    submit: (fileName) =>
+      callBackground<StagedLocalMigration>("LOCAL_BACKUP_STAGE_FILE", { fileName }),
+  },
+): Promise<StagedLocalMigration> => {
   assertBackupFileSize(file.size);
-  const fileName = await stagePayloadFile(file, "local-import");
-  return callBackground<StagedLocalMigration>("LOCAL_BACKUP_STAGE_FILE", { fileName });
+  const fileName = await dependencies.stage(file, "local-import");
+  try {
+    return await dependencies.submit(fileName);
+  } catch (error) {
+    // The offscreen handler removes the payload in its own finally block once
+    // it receives the request. If the background reset barrier rejects before
+    // forwarding, that finally block never runs; clean up idempotently here so
+    // repeated failed restores cannot retain up to 96 MiB each for an hour.
+    await dependencies.remove(fileName).catch(() => {});
+    throw error;
+  }
 };
 
 export const assertBackupFileSize = (byteSize: number): void => {

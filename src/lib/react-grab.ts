@@ -19,6 +19,8 @@ function showReactGrabToolbar(api: ReactGrabAPI) {
 
 export function loadReactGrabInDevelopment() {
   if (import.meta.env.MODE !== "development") return;
+  // Off by default; opt in with VITE_REACT_GRAB=on in the env file.
+  if (import.meta.env.VITE_REACT_GRAB !== "on") return;
 
   void import("react-grab/core")
     .then(({ init }) => {

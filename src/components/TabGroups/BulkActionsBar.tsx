@@ -11,6 +11,8 @@ import {
   Share2,
   X,
   RefreshCw,
+  CloudUpload,
+  Loader2,
   TagsIcon,
   Check,
   Minus,
@@ -74,6 +76,7 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
   const [isOpenMenuOpen, setIsOpenMenuOpen] = useState(false);
   const [isMoveMenuOpen, setIsMoveMenuOpen] = useState(false);
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
+  const [syncingSelection, setSyncingSelection] = useState(false);
 
   if (!isSelectionMode) return null;
 
@@ -81,6 +84,39 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
   const selectedItemIds = Array.from(selectedIds);
   const selectedLabel = `${selectedCount} tab${selectedCount === 1 ? "" : "s"}`;
   const { allVisibleSelected, someVisibleSelected } = getVisibleSelectionState(items, selectedIds);
+
+  /**
+   * Back up exactly these items now instead of waiting for the next cycle. The
+   * queue is per item, so this only ever moves the selection to the front.
+   */
+  const syncSelectionNow = async () => {
+    if (selectedItemIds.length === 0) return;
+    setSyncingSelection(true);
+    try {
+      const response = await chrome.runtime.sendMessage({
+        target: "background",
+        type: "CLOUD_SYNC_ITEMS",
+        payload: { itemIds: selectedItemIds },
+      });
+      if (response?.success === false) throw new Error(response?.error || "Backup failed.");
+      const synced = Number(response?.payload?.synced ?? 0);
+      const pending = Number(response?.payload?.pending ?? 0);
+      showSuccessToast(
+        pending > 0
+          ? `Backed up ${synced} of ${selectedItemIds.length}; ${pending} still uploading in the background.`
+          : `Backed up ${selectedLabel} to your web library.`,
+      );
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : "Could not back up the selection.";
+      showErrorToast(
+        /session|auth|token/i.test(detail)
+          ? "Your session expired. Reconnect your cloud account in Settings, then try again."
+          : detail,
+      );
+    } finally {
+      setSyncingSelection(false);
+    }
+  };
 
   const assertResponseSuccess = (response: any, fallbackMessage: string) => {
     if (response?.success === false || response?.payload?.success === false) {
@@ -109,23 +145,42 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
   };
 
   const handleDelete = async () => {
+    let failedCount = 0;
     await withToast({
       loading: `Moving ${selectedLabel} to Bin...`,
-      success: `Moved ${selectedLabel} to Bin.`,
+      success: (result: { deletedCount: number; failedCount: number }) =>
+        result.failedCount > 0
+          ? `Moved ${result.deletedCount} to Bin. ${result.failedCount} failed.`
+          : `Moved ${selectedLabel} to Bin.`,
       error: (err) => resolveToastErrorMessage(err, `Failed to delete ${selectedLabel}.`),
       action: async () => {
+        let deletedCount = 0;
+        const failedIds: string[] = [];
         for (const id of selectedItemIds) {
-          const response = await chrome.runtime.sendMessage({
-            service: "items",
-            type: "delete",
-            target: "offscreen",
-            payload: { id },
-          });
-          assertResponseSuccess(response, "Failed to delete selected tab.");
+          try {
+            const response = await chrome.runtime.sendMessage({
+              service: "items",
+              type: "delete",
+              target: "offscreen",
+              payload: { id },
+            });
+            assertResponseSuccess(response, "Failed to delete selected tab.");
+            deletedCount += 1;
+          } catch (err) {
+            console.error(`Failed to delete item ${id}:`, err);
+            failedIds.push(id);
+          }
         }
+        failedCount = failedIds.length;
+        if (deletedCount === 0 && failedCount > 0) {
+          throw new Error(`Failed to delete ${selectedLabel}.`);
+        }
+        return { deletedCount, failedCount };
       },
     });
-    exitSelectionMode();
+    if (failedCount === 0) {
+      exitSelectionMode();
+    }
   };
 
   const handleMoveToFolder = async (targetFolderId: string) => {
@@ -476,6 +531,19 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
         >
           <Tag size={16} />
           <span className="hidden sm:inline">Tags</span>
+        </Button>
+
+        {/* Back up the selection to the cloud right now */}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="text-white/90 hover:text-white hover:bg-white/10 gap-1.5"
+          onClick={() => void syncSelectionNow()}
+          disabled={syncingSelection}
+          title="Back up the selected items to your web library now"
+        >
+          {syncingSelection ? <Loader2 size={16} className="animate-spin" /> : <CloudUpload size={16} />}
+          <span className="hidden sm:inline">{syncingSelection ? "Backing up…" : "Back up"}</span>
         </Button>
 
         {/* Delete */}

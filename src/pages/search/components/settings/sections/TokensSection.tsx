@@ -1,18 +1,29 @@
 import * as React from "react";
-import { Check, Cloud, KeyRound, Loader2, Plug, Unplug } from "lucide-react";
+import { Check, Cloud, KeyRound, Loader2, Plug, RefreshCw, TriangleAlert, Unplug } from "lucide-react";
+import { invalidateItemCloudSyncState } from "@components/TabGroups/use-item-cloud-sync-state";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
 import { showErrorToast, showSuccessToast } from "@src/utils/toast-feedback";
-import { SectionHeading, SettingGroup, SettingRow } from "../SettingsPrimitives";
+import { SectionHeading, SettingGroup, SettingRow, SettingSwitch } from "../SettingsPrimitives";
 import { GitHubIcon, GoogleIcon, NotionIcon } from "../BrandIcons";
 import { SocialConnectors } from "./SocialConnectors";
 import type { CloudAuthStatus } from "@src/services/cloud-auth";
+import type { CloudSyncAllResult } from "@src/services/cloud-sync";
 import type { NotionConnectionStatus } from "@src/services/notion-auth";
 
 /** chrome.storage.local key for the persisted GitHub personal access token. */
 export const GITHUB_TOKEN_STORAGE_KEY = "vibesearch:githubToken";
 
 type RuntimeResponse<T> = { success?: boolean; payload?: T; error?: string };
+
+type ManualCloudSyncResult = CloudSyncAllResult & {
+  archive: {
+    attempted: number;
+    uploaded: number;
+    remaining: number;
+    reason?: string;
+  };
+};
 
 type GoogleConnection = { connected: true; accountId: string };
 
@@ -41,10 +52,69 @@ const callCloudAuth = async <T,>(type: "status" | "connect" | "disconnect", payl
   return response.payload as T;
 };
 
+/** Read, or set then read, whether this device accepts incoming rows. */
+const callCloudAuthPullPreference = async (enabled?: boolean): Promise<boolean> => {
+  const response = await chrome.runtime.sendMessage({
+    service: "cloudSync",
+    type: "pullPreference",
+    target: "offscreen",
+    payload: enabled === undefined ? {} : { enabled },
+  }) as RuntimeResponse<{ enabled?: boolean }>;
+  if (!response?.success) throw new Error(response?.error || "Could not read that setting.");
+  return response.payload?.enabled === true;
+};
+
 const maskToken = (token: string) => {
   const trimmed = token.trim();
   if (trimmed.length <= 8) return "•".repeat(Math.max(trimmed.length, 4));
   return `${trimmed.slice(0, 4)}${"•".repeat(6)}${trimmed.slice(-4)}`;
+};
+
+/**
+ * The four states this row can actually be in. Derived from one status object so
+ * the badge, the description, and the buttons can never disagree with each other
+ * — the bug that let a dead session keep showing "Connected".
+ */
+type CloudRowState = "checking" | "disconnected" | "connected" | "expired";
+
+const cloudRowState = (status: CloudAuthStatus | null): CloudRowState => {
+  if (status === null) return "checking";
+  if (status.connected) return "connected";
+  return status.needsReconnect ? "expired" : "disconnected";
+};
+
+const cloudRowDescription = (state: CloudRowState, email: string | null): string => {
+  switch (state) {
+    case "checking":
+      return "Checking your cloud connection…";
+    case "connected":
+      return email
+        ? `Signed in as ${email}. Saves here back up one-way to your web and mobile library; edits there never overwrite this device.`
+        : "Saves here back up one-way to your web and mobile library; edits there never overwrite this device.";
+    case "expired":
+      return email
+        ? `Your session for ${email} ended, so backups are paused. Everything you save still works on this device — reconnect to resume uploading.`
+        : "Your session ended, so backups are paused. Everything you save still works on this device — reconnect to resume uploading.";
+    case "disconnected":
+      return "Log in with Google to back up this library to the web app and your other devices. Nothing on this device is overwritten.";
+  }
+};
+
+/** Uses the browser's own connectivity, so "Sync now" cannot promise the impossible. */
+const useOnline = (): boolean => {
+  const [online, setOnline] = React.useState(
+    () => typeof navigator === "undefined" || navigator.onLine !== false,
+  );
+  React.useEffect(() => {
+    const update = () => setOnline(navigator.onLine !== false);
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
+  return online;
 };
 
 export function TokensSection() {
@@ -61,6 +131,56 @@ export function TokensSection() {
   const [notionBusy, setNotionBusy] = React.useState(false);
   const [cloudState, setCloudState] = React.useState<CloudAuthStatus | null>(null);
   const [cloudBusy, setCloudBusy] = React.useState(false);
+  const [cloudSyncBusy, setCloudSyncBusy] = React.useState(false);
+  const cloudRow = cloudRowState(cloudState);
+  const online = useOnline();
+  const [pullEnabled, setPullEnabled] = React.useState<boolean | null>(null);
+
+  React.useEffect(() => {
+    let active = true;
+    void callCloudAuthPullPreference()
+      .then((enabled) => active && setPullEnabled(enabled))
+      .catch(() => active && setPullEnabled(false));
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const toggleIncomingSync = async (next: boolean) => {
+    setPullEnabled(next);
+    try {
+      const enabled = await callCloudAuthPullPreference(next);
+      setPullEnabled(enabled);
+      if (enabled) {
+        showSuccessToast("This device will now bring in items added on your other devices.");
+        void chrome.runtime.sendMessage({ target: "background", type: "CLOUD_SYNC_QUEUED" });
+      } else {
+        showSuccessToast("This device will only send saves out. Nothing will be brought in.");
+      }
+    } catch (cause) {
+      setPullEnabled(!next);
+      showErrorToast(cause instanceof Error ? cause.message : "Could not change that setting.");
+    }
+  };
+
+  // A drain in the background worker can discover that the session died, so the
+  // badge follows the stored auth state instead of only the last poll.
+  React.useEffect(() => {
+    const onChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== "local") return;
+      const authChanged = Object.keys(changes).some((key) => key.startsWith("vibesearch:cloudAuth") ||
+        key === "vibesearch:firebaseIdToken");
+      if (!authChanged) return;
+      void callCloudAuth<CloudAuthStatus>("status")
+        .then(setCloudState)
+        .catch(() => undefined);
+    };
+    chrome.storage.onChanged.addListener(onChanged);
+    return () => chrome.storage.onChanged.removeListener(onChanged);
+  }, []);
 
   // Load persisted GitHub token + probe Google connection (non-interactive).
   React.useEffect(() => {
@@ -181,9 +301,19 @@ export function TokensSection() {
     try {
       const status = await callCloudAuth<CloudAuthStatus>("connect");
       setCloudState(status);
-      showSuccessToast("Cloud backup connected. Pending saves are uploading now.");
+      showSuccessToast(
+        status.user?.email
+          ? `Signed in as ${status.user.email}. Pending saves are uploading now.`
+          : "Signed in. Pending saves are uploading now.",
+      );
     } catch (cause) {
-      showErrorToast(cause instanceof Error ? cause.message : "Could not connect cloud backup.");
+      const detail = cause instanceof Error ? cause.message : "";
+      // The chooser being dismissed is a normal outcome, not a failure.
+      showErrorToast(
+        /cancel|popup|closed|user-cancelled/i.test(detail)
+          ? "Sign-in was cancelled. Nothing changed."
+          : detail || "Could not sign in to cloud backup.",
+      );
     } finally {
       setCloudBusy(false);
     }
@@ -193,11 +323,46 @@ export function TokensSection() {
     setCloudBusy(true);
     try {
       setCloudState(await callCloudAuth<CloudAuthStatus>("disconnect"));
-      showSuccessToast("Cloud backup disconnected. Local capture still works.");
+      showSuccessToast(
+        "Signed out of cloud backup. Your library stays on this device, and anything already backed up stays in your web library.",
+      );
     } catch (cause) {
       showErrorToast(cause instanceof Error ? cause.message : "Could not disconnect cloud backup.");
     } finally {
       setCloudBusy(false);
+    }
+  };
+
+  const syncCloudNow = async () => {
+    setCloudSyncBusy(true);
+    try {
+      const response = await chrome.runtime.sendMessage({
+        target: "background",
+        type: "CLOUD_SYNC_NOW",
+      }) as RuntimeResponse<ManualCloudSyncResult>;
+      if (!response?.success || !response.payload) {
+        throw new Error(response?.error || "Cloud sync failed.");
+      }
+
+      // Backup state changed for potentially every card.
+      invalidateItemCloudSyncState();
+      const { scanned, push, archive } = response.payload;
+      const remaining = push.remaining + archive.remaining;
+      const completed = push.pushed + archive.uploaded;
+      showSuccessToast(
+        remaining > 0
+          ? `Checked ${scanned.toLocaleString()} local records. ${remaining.toLocaleString()} uploads will continue in the background.`
+          : `Cloud sync complete. Checked ${scanned.toLocaleString()} local records and uploaded ${completed.toLocaleString()} changes.`,
+      );
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : "Could not sync the cloud library.";
+      showErrorToast(
+        detail.includes("CLOUD_SYNC_AUTH_REQUIRED")
+          ? "Your Vibesearch session expired. Reconnect your cloud account and try again."
+          : detail,
+      );
+    } finally {
+      setCloudSyncBusy(false);
     }
   };
 
@@ -216,59 +381,85 @@ export function TokensSection() {
               Cloud library
             </span>
           }
-          description={
-            cloudState?.user?.email
-              ? `One-way backup from this extension to ${cloudState.user.email}. Web and mobile edits never overwrite this local library.`
-              : "Back up extension saves one-way to your web and mobile library. Web and mobile edits never overwrite this local library."
-          }
+          description={cloudRowDescription(cloudRow, cloudState?.user?.email ?? null)}
         >
           <span
             className={
-              cloudState?.connected
+              cloudRow === "connected"
                 ? "inline-flex items-center gap-1 rounded-full bg-background-positive-faded px-2 py-0.5 text-xs font-medium text-foreground-positive"
-                : cloudState?.needsReconnect
+                : cloudRow === "expired"
                   ? "inline-flex items-center gap-1 rounded-full bg-background-warning px-2 py-0.5 text-xs font-medium text-foreground-warning"
                   : "inline-flex items-center gap-1 rounded-full bg-background-page-secondary px-2 py-0.5 text-xs font-medium text-foreground-tertiary"
             }
           >
-            {cloudState?.connected ? (
+            {cloudRow === "connected" ? (
               <Check className="size-3" />
+            ) : cloudRow === "expired" ? (
+              <TriangleAlert className="size-3" />
             ) : (
               <span className="size-1.5 rounded-full bg-current opacity-70" />
             )}
-            {cloudState === null
+            {cloudRow === "checking"
               ? "Checking…"
-              : cloudState.connected
+              : cloudRow === "connected"
                 ? "Connected"
-                : cloudState.needsReconnect
-                  ? "Reconnect"
+                : cloudRow === "expired"
+                  ? "Session expired"
                   : "Not connected"}
           </span>
-          {cloudState?.connected ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => void disconnectCloud()}
-              disabled={cloudBusy}
-              className="text-foreground-tertiary hover:text-foreground-danger"
-            >
-              {cloudBusy ? <Loader2 className="size-4 animate-spin" /> : <Unplug className="size-4" />}
-              Disconnect
-            </Button>
+          {cloudRow === "connected" ? (
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void syncCloudNow()}
+                disabled={cloudBusy || cloudSyncBusy || !online}
+                static={cloudSyncBusy}
+                title={online ? "Upload pending changes now" : "You're offline — reconnect to sync"}
+              >
+                {cloudSyncBusy ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                {cloudSyncBusy ? "Syncing…" : online ? "Sync now" : "Offline"}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => void disconnectCloud()}
+                disabled={cloudBusy || cloudSyncBusy}
+                className="text-foreground-tertiary hover:text-foreground-danger"
+                title="Sign out of cloud backup. Uploads stop; your library stays on this device and nothing already backed up is deleted."
+              >
+                {cloudBusy ? <Loader2 className="size-4 animate-spin" /> : <Unplug className="size-4" />}
+                Disconnect
+              </Button>
+            </>
           ) : (
             <Button
               type="button"
               variant="outline"
               size="sm"
               onClick={() => void connectCloud()}
-              disabled={cloudBusy || cloudState === null}
+              disabled={cloudBusy || cloudRow === "checking" || !online}
               static={cloudBusy}
+              title={online ? undefined : "You're offline — reconnect to log in"}
             >
               {cloudBusy ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
-              {cloudState?.needsReconnect ? "Reconnect" : "Connect"}
+              {cloudRow === "expired" ? "Reconnect with Google" : "Log in with Google"}
             </Button>
           )}
+        </SettingRow>
+
+        <SettingRow
+          title="Bring in items from my other devices"
+          description="Saving always goes one way: out of this extension to your web library. Turn this on and this device will also pull in items saved by Vibesearch on your other browsers. Items created in the web app stay there, and nothing already here is changed or removed."
+        >
+          <SettingSwitch
+            checked={pullEnabled === true}
+            onCheckedChange={(next) => void toggleIncomingSync(next)}
+            disabled={pullEnabled === null || cloudRow !== "connected"}
+            label="Bring in items added on your other devices"
+          />
         </SettingRow>
       </SettingGroup>
 
@@ -334,10 +525,10 @@ export function TokensSection() {
           title={
             <span className="flex items-center gap-2">
               <GoogleIcon className="size-4" />
-              Google account
+              Google Drive backup
             </span>
           }
-          description="Connect to back up and restore from Google Drive. Disconnecting clears the cached sign-in on this device."
+          description="Keep a private, portable VibeSearch backup in your Drive. VibeSearch can only manage backup files it creates."
         >
           <span
             className={

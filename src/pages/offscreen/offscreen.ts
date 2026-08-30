@@ -13,7 +13,12 @@ import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordin
 import { queryRankerService } from "@src/services/query-ranker.service";
 import { browserBookmarkImportService } from "@src/services/browser-bookmark-import";
 import { githubStarsImportService } from "@src/services/github-stars-import";
-import { cloudSyncService } from "@src/services/cloud-sync";
+import {
+  clearCloudPullState,
+  cloudSyncService,
+  isCloudPullEnabled,
+  setCloudPullEnabled,
+} from "@src/services/cloud-sync";
 import { cloudAuthService } from "@src/services/cloud-auth";
 import {
   ocrService,
@@ -136,6 +141,18 @@ const scheduleDbChange = (
 
   if (dbChangeFlushTimer !== null) return;
   dbChangeFlushTimer = window.setTimeout(flushDbChanges, DB_CHANGE_FLUSH_MS);
+};
+
+const queueCloudCollectionChange = (
+  collection: Parameters<typeof cloudSyncService.enqueueRxChange>[0],
+  changeEvent: unknown,
+): void => {
+  void cloudSyncService.enqueueRxChange(collection, changeEvent).catch((error) => {
+    console.error(
+      `[Offscreen] Failed to queue ${collection} cloud change:`,
+      error instanceof Error ? error.message : error,
+    );
+  });
 };
 
 const collectItemIdsFromCollectionChange = (changeEvent: any): string[] => {
@@ -277,6 +294,21 @@ const cloudSyncController = {
   async pushItem(payload: { itemId?: string }) {
     return cloudSyncService.pushItem(typeof payload?.itemId === "string" ? payload.itemId : "");
   },
+  async syncAll(payload: Parameters<typeof cloudSyncService.syncAll>[0]) {
+    return cloudSyncService.syncAll(payload);
+  },
+  async pull(payload: Parameters<typeof cloudSyncService.pull>[0]) {
+    return cloudSyncService.pull(payload);
+  },
+  async pullPreference(payload: { enabled?: unknown }) {
+    if (typeof payload?.enabled === "boolean") await setCloudPullEnabled(payload.enabled);
+    return { enabled: await isCloudPullEnabled() };
+  },
+  async itemSyncState(payload: { itemIds?: unknown }) {
+    return cloudSyncService.itemSyncState(
+      Array.isArray(payload?.itemIds) ? payload.itemIds.filter((id): id is string => typeof id === "string") : [],
+    );
+  },
   async cancelAndClear() {
     return cloudSyncService.cancelAndClear();
   },
@@ -287,10 +319,21 @@ const cloudAuthController = {
     return cloudAuthService.status(payload);
   },
   async connect() {
-    return cloudAuthService.connect();
+    const status = await cloudAuthService.connect();
+    if (status.connected) {
+      // First signed-in moment: pull any login-less device archives into the
+      // account. Fire-and-forget — a failed claim retries on the next sync.
+      void chrome.runtime.sendMessage({ target: "background", type: "ARCHIVE_CLAIM_ANON" }).catch(() => {});
+    }
+    return status;
   },
   async disconnect() {
-    return cloudAuthService.disconnect();
+    const status = await cloudAuthService.disconnect();
+    // The read position and the incoming-sync opt-in both belong to the account
+    // that was just disconnected.
+    await clearCloudPullState().catch(() => undefined);
+    await setCloudPullEnabled(false).catch(() => undefined);
+    return status;
   },
 };
 
@@ -322,7 +365,16 @@ router.registerService("githubStars", githubStarsImportController, {
   methods: ["importStars"],
 });
 router.registerService("cloudSync", cloudSyncController, {
-  methods: ["status", "drain", "pushItem", "cancelAndClear"],
+  methods: [
+    "status",
+    "drain",
+    "pushItem",
+    "syncAll",
+    "pull",
+    "pullPreference",
+    "cancelAndClear",
+    "itemSyncState",
+  ],
 });
 router.registerService("cloudAuth", cloudAuthController, {
   methods: ["status", "connect", "disconnect"],
@@ -334,6 +386,7 @@ router.registerService("items", itemsController, {
   methods: [
     "saveFetchedMetadata",
     "getByIds",
+    "findLiveByUrls",
     "markSearchIndexDirty",
     "queryLocal",
     "addToFolder",
@@ -1151,6 +1204,7 @@ const initializeApp = async () => {
 
     // Subscribe to item changes and trigger embedding
     db.items.$.subscribe((changeEvent: any) => {
+      queueCloudCollectionChange("items", changeEvent);
       const changedIds = collectItemIdsFromCollectionChange(changeEvent);
       if (!isEmbeddingStateOnlyItemChange(changeEvent)) {
         itemsController.scheduleSearchIndexSync(changedIds);
@@ -1166,20 +1220,24 @@ const initializeApp = async () => {
     });
 
     db.folders.$.subscribe((changeEvent: any) => {
+      queueCloudCollectionChange("folders", changeEvent);
       if (isFolderCollapseOnlyChange(changeEvent)) return;
       scheduleDbChange("folders");
     });
 
-    db.spaces.$.subscribe(() => {
+    db.spaces.$.subscribe((changeEvent: any) => {
+      queueCloudCollectionChange("spaces", changeEvent);
       scheduleDbChange("spaces");
     });
 
     db.space_groups.$.subscribe((changeEvent: any) => {
+      queueCloudCollectionChange("spaceGroups", changeEvent);
       if (isSpaceGroupCollapseOnlyChange(changeEvent)) return;
       scheduleDbChange("space_groups");
     });
 
     db.tags.$.subscribe((changeEvent: any) => {
+      queueCloudCollectionChange("tags", changeEvent);
       if (didTagNameChange(changeEvent)) {
         itemsController.markSearchIndexDirty();
         scheduleDbChange("items");
@@ -1189,6 +1247,7 @@ const initializeApp = async () => {
     });
 
     db.item_tags.$.subscribe((changeEvent: any) => {
+      queueCloudCollectionChange("itemTags", changeEvent);
       const changedItemIds = collectItemIdsFromItemTagsChange(changeEvent);
       if (changedItemIds.length > 0) {
         itemsController.scheduleSearchIndexSync(changedItemIds);

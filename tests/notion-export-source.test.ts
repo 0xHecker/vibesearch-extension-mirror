@@ -68,6 +68,19 @@ const db = {
       updatedAt: 20,
       deletedAt: 99,
     },
+    {
+      id: "item-c",
+      title: "Later item",
+      url: "https://example.com/c",
+      source: "web",
+      folderId: "",
+      spaceId: "",
+      textContent: "Second live export row",
+      isFavorite: false,
+      createdAt: 30,
+      updatedAt: 40,
+      deletedAt: 0,
+    },
   ]),
   folders: collection([{ id: "folder-a", name: "Reading" }]),
   spaces: collection([{ id: "space-a", name: "Research" }]),
@@ -82,7 +95,7 @@ mock.module("@src/services/DatabaseService", () => ({
 const { loadNotionExportBatch } = await import("../src/services/notion-export-source");
 
 test("Notion export batches include live content and portable organization metadata", async () => {
-  const batch = await loadNotionExportBatch({ limit: 10 });
+  const batch = await loadNotionExportBatch({ limit: 1 });
 
   expect(batch.items).toEqual([{
     id: "item-a",
@@ -98,6 +111,16 @@ test("Notion export batches include live content and portable organization metad
     createdAt: 10,
     updatedAt: 20,
   }]);
-  expect(batch.hasMore).toBe(false);
+  expect(batch.hasMore).toBe(true);
   expect(batch.nextCursor).toBe("item-a");
+});
+
+test("Notion export pagination advances across live rows without reviving deleted rows", async () => {
+  const second = await loadNotionExportBatch({ afterId: "item-a", limit: 1 });
+  expect(second.items.map((item) => item.id)).toEqual(["item-c"]);
+  expect(second.nextCursor).toBe("item-c");
+  expect(second.hasMore).toBe(true);
+
+  const exhausted = await loadNotionExportBatch({ afterId: "item-c", limit: 1 });
+  expect(exhausted).toEqual({ items: [], nextCursor: null, hasMore: false });
 });

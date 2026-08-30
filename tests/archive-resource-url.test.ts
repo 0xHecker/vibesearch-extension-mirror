@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   isBlockedArchiveResourceHost,
   isSafeArchiveResourceUrl,
+  isServerCapturableArchiveUrl,
 } from "@src/services/archive-resource-url";
 
 test("resource URL guard blocks private cross-origin targets and credentials", () => {
@@ -38,4 +39,23 @@ test("resource host guard covers IPv4, IPv6, mapped, and wildcard-local forms", 
 
   expect(isBlockedArchiveResourceHost("cdn.example.com")).toBe(false);
   expect(isBlockedArchiveResourceHost("2606:4700:4700::1111")).toBe(false);
+});
+
+test("server-capture guard mirrors the API's public-target contract", () => {
+  expect(isServerCapturableArchiveUrl("https://example.com/article")).toBe(true);
+  expect(isServerCapturableArchiveUrl("http://example.com:80/article")).toBe(true);
+  expect(isServerCapturableArchiveUrl("https://example.com:443/article")).toBe(true);
+
+  // Every rejection below is a target the API answers with an unusable-stub 400.
+  expect(isServerCapturableArchiveUrl("http://localhost:5173/dashboard")).toBe(false);
+  expect(isServerCapturableArchiveUrl("http://localhost/dashboard")).toBe(false);
+  expect(isServerCapturableArchiveUrl("http://192.168.1.20/admin")).toBe(false);
+  expect(isServerCapturableArchiveUrl("http://[::1]/admin")).toBe(false);
+  expect(isServerCapturableArchiveUrl("https://intranet.local/wiki")).toBe(false);
+  expect(isServerCapturableArchiveUrl("https://example.com:8443/report")).toBe(false);
+  expect(isServerCapturableArchiveUrl("https://user:pass@example.com/report")).toBe(false);
+  expect(isServerCapturableArchiveUrl("file:///Users/me/page.html")).toBe(false);
+  expect(isServerCapturableArchiveUrl("not a url")).toBe(false);
+  // Beyond this length the edge forwards no source URL at all.
+  expect(isServerCapturableArchiveUrl(`https://example.com/?q=${"a".repeat(8_200)}`)).toBe(false);
 });
