@@ -1,0 +1,9 @@
+- Do not create complex unnecessary heuristic based checks if its not absolutely needed.
+- Keep the code very readable, testable and simple.
+- Use human readable variables. use a proper maintainable folder structure and naming conventions
+- Do not keep any legacy code dangling around unnecessarly. 
+- Take good decisions that future us will be proud of.
+- do not use chained terinary operators and sphaggeti code
+- do not let the file cross 1000 lines, at that point refactor it into a new file. maintainability and readability without much cognitive load is very very important.
+- do not try to make the system unnecessarly complex, unless you have a good reason to do it.
+- add comments inplace where necessary while working  for complex code in compact human friendly language
