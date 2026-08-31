@@ -103,7 +103,7 @@ export type CloudSyncDrainResult = {
   batches: number;
   queued: number;
   remaining: number;
-  reason?: "empty" | "missing-token" | "invalid-auth" | "http-error" | "network-error" | "invalid-response" | "cancelled";
+  reason?: "empty" | "missing-token" | "invalid-auth" | "http-error" | "network-error" | "invalid-response" | "cancelled" | "unresolved";
   error?: string;
 };
 
@@ -1525,6 +1525,26 @@ export class CloudSyncService {
       pushed += result.applied;
       conflicts += result.conflicts;
       queue = await removeQueueRefs(acknowledgedRefs);
+    }
+
+    // A queued ref whose local document cannot be read is dropped from the queue
+    // so the drain cannot spin on it forever. Reporting that as success is what
+    // made a whole library look like it synced while nothing left the device: the
+    // loop emptied the queue, uploaded nothing, and returned no reason at all, so
+    // the caller showed "complete". Say it plainly instead. A later syncAll
+    // rebuilds the queue from whatever is still stored locally, so this stays
+    // recoverable rather than terminal.
+    if (pushed === 0 && skipped > 0) {
+      return {
+        pushed,
+        skipped,
+        conflicts,
+        batches,
+        queued: initialQueued,
+        remaining: queue.length,
+        reason: "unresolved",
+        error: `${skipped} queued record${skipped === 1 ? "" : "s"} could not be read from this device's local library, so nothing was uploaded.`,
+      };
     }
 
     return {
