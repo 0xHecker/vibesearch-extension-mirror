@@ -5,33 +5,39 @@
  * are extracted dynamically via the harvester — no hardcoded field paths. Fails
  * soft; the heartbeat flips the switch off if the session/endpoint stops working.
  */
-import type { CapturedItem } from "../cloud-sync.service";
+import type { CapturedItem } from "./cloud-push";
 import type { ConnectorAccount, ConnectorModule, FetchSavedResult } from "./types";
 import { findRedditCursor, findRedditEntryList, normalizeEntry, politeDelay } from "./harvest";
+import {
+  jsonObject,
+  jsonString,
+  tryReadJsonResponse,
+  type JsonValue,
+} from "@src/common/json-value";
 
-async function fetchJson(url: string): Promise<unknown | null> {
+async function fetchJson(url: string): Promise<JsonValue | undefined> {
   try {
     const res = await fetch(url, {
       credentials: "include",
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(20000),
     });
-    if (!res.ok) return null;
-    return await res.json();
+    if (!res.ok) return undefined;
+    return await tryReadJsonResponse(res);
   } catch {
-    return null;
+    return undefined;
   }
 }
 
 async function detectAccount(): Promise<ConnectorAccount | null> {
-  const me = (await fetchJson("https://www.reddit.com/api/me.json?raw_json=1")) as
-    | { data?: { name?: string; id?: string } }
-    | null;
-  const name = me?.data?.name;
+  const me = jsonObject(await fetchJson("https://www.reddit.com/api/me.json?raw_json=1"));
+  const account = jsonObject(me?.data);
+  const name = jsonString(account?.name);
   if (!name) return null;
+  const accountId = jsonString(account?.id);
   return {
     platform: "reddit",
-    accountId: me?.data?.id ? `t2_${me.data.id}` : name,
+    accountId: accountId ? `t2_${accountId}` : name,
     handle: name,
     displayName: `u/${name}`,
   };

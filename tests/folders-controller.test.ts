@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { FolderDocType } from "../src/schemas/folder_schema";
 import type { ItemDocType } from "../src/schemas/item_schema";
 import type { SpaceDocType } from "../src/schemas/space_schema";
@@ -136,23 +136,22 @@ let db = {
   items: collection(items),
 };
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => db,
-}));
-
-mock.module("@src/services/db-manager", () => ({
-  databaseManager: {
-    deleteItem: async ({ id }: { id: string }) => {
-      const item = items.find((entry) => entry.id === id);
-      if (item) item.deletedAt = Date.now();
-    },
-  },
-}));
-
-const { FoldersController, foldersController } = await import("../src/services/controllers/folders.controller");
+const { FoldersController } = await import("../src/services/controllers/folders.controller");
 const { ItemsController } = await import("../src/services/controllers/items.controller");
 const { SpacesController } = await import("../src/services/controllers/spaces.controller");
 const { withEntityMutationLock } = await import("../src/services/entity-mutation-lock");
+
+const getTestDb = async () => db as never;
+const createFoldersController = (
+  options: NonNullable<ConstructorParameters<typeof FoldersController>[0]> = {},
+) => new FoldersController({ ...options, getDb: getTestDb });
+const createItemsController = (
+  options: NonNullable<ConstructorParameters<typeof ItemsController>[0]> = {},
+) => new ItemsController({ ...options, getDb: getTestDb });
+const createSpacesController = (
+  options: NonNullable<ConstructorParameters<typeof SpacesController>[0]> = {},
+) => new SpacesController({ ...options, getDb: getTestDb });
+const foldersController = createFoldersController();
 
 const now = 1_764_000_000_000;
 
@@ -332,7 +331,7 @@ describe("folder tree deletion", () => {
     // The scheduled janitor only purges explicitly binned spaces. A folder's
     // retention label must never make it sweep relocated live rows by itself.
     const purgeAt = folders.find((folder) => folder.id === "root")?.purgeAt || now;
-    const purge = await new SpacesController({
+    const purge = await createSpacesController({
       getDb: async () => db as never,
       now: () => purgeAt + 1,
     }).purgeExpired();
@@ -358,7 +357,7 @@ describe("folder tree deletion", () => {
       makeItem("sibling-item", "sibling")
     );
 
-    const result = await new FoldersController().deleteForever({
+    const result = await createFoldersController().deleteForever({
       id: "legacy-root",
       expectedDeletedAt: now,
     });
@@ -400,7 +399,7 @@ describe("folder tree deletion", () => {
     };
 
     try {
-      const controller = new FoldersController({
+      const controller = createFoldersController({
         deleteUnreferencedOpfsItemDirectories: async () => {
           cleanupCalls += 1;
           return [];
@@ -428,7 +427,7 @@ describe("folder tree deletion", () => {
     items.splice(0, items.length, item);
     let itemExistedDuringCleanup = true;
 
-    const result = await new FoldersController({
+    const result = await createFoldersController({
       deleteUnreferencedOpfsItemDirectories: async () => {
         itemExistedDuringCleanup = items.some((row) => row.id === item.id);
         return [item.id];
@@ -513,8 +512,8 @@ describe("folder tree deletion", () => {
     };
 
     try {
-      const restoreController = new FoldersController();
-      const deleteController = new FoldersController();
+      const restoreController = createFoldersController();
+      const deleteController = createFoldersController();
       const restorePromise = restoreController.restoreFromBin({ id: "folder-race" });
       await restorePatchStarted.promise;
       const deletePromise = deleteController.deleteForever({
@@ -560,8 +559,8 @@ describe("folder tree deletion", () => {
     };
 
     try {
-      const deleteController = new FoldersController();
-      const restoreController = new FoldersController();
+      const deleteController = createFoldersController();
+      const restoreController = createFoldersController();
       const deletePromise = deleteController.deleteForever({
         id: "folder-race",
         expectedDeletedAt: now,
@@ -606,8 +605,8 @@ describe("folder tree deletion", () => {
     };
 
     try {
-      const itemController = new ItemsController();
-      const folderController = new FoldersController();
+      const itemController = createItemsController();
+      const folderController = createFoldersController();
       const restorePromise = itemController.restoreFromBin({ id: "child-item" });
       await childPatchStarted.promise;
       const deletePromise = folderController.deleteForever({
@@ -655,10 +654,10 @@ describe("folder live destination writes", () => {
     };
 
     try {
-      const binPromise = new SpacesController({ getDb: async () => db, now: () => now + 10 })
+      const binPromise = createSpacesController({ getDb: async () => db, now: () => now + 10 })
         .moveToBin({ id: "space-a" });
       await binPatchStarted.promise;
-      const createPromise = new FoldersController().create({
+      const createPromise = createFoldersController().create({
         name: "late folder",
         spaceId: "space-a",
       });
@@ -689,7 +688,7 @@ describe("folder live destination writes", () => {
     items.splice(0, items.length);
 
     await expect(
-      new FoldersController().create({
+      createFoldersController().create({
         name: "child",
         spaceId: "space-a",
         parentId: "binned-parent",
@@ -714,7 +713,7 @@ describe("folder live destination writes", () => {
     );
 
     await expect(
-      new FoldersController().moveToSpace({ folderId: "root", targetSpaceId: "space-b" })
+      createFoldersController().moveToSpace({ folderId: "root", targetSpaceId: "space-b" })
     ).resolves.toEqual({ success: true, movedItems: 3 });
 
     expect(folders.find((folder) => folder.id === "outside")?.spaceId).toBe("space-a");
@@ -752,7 +751,7 @@ describe("folder live destination writes", () => {
 
     try {
       await expect(
-        new FoldersController().moveToSpace({ folderId: "root", targetSpaceId: "space-b" })
+        createFoldersController().moveToSpace({ folderId: "root", targetSpaceId: "space-b" })
       ).rejects.toThrow("injected item write failure");
       expect(folders.find((folder) => folder.id === "root")?.spaceId).toBe("space-a");
       expect(folders.find((folder) => folder.id === "child")?.spaceId).toBe("space-a");
@@ -760,7 +759,7 @@ describe("folder live destination writes", () => {
       expect(items.find((item) => item.id === "item-b")?.spaceId).toBe("space-a");
 
       await expect(
-        new FoldersController().moveToSpace({ folderId: "root", targetSpaceId: "space-b" })
+        createFoldersController().moveToSpace({ folderId: "root", targetSpaceId: "space-b" })
       ).resolves.toEqual({ success: true, movedItems: 2 });
       expect(folders.every((folder) => folder.spaceId === "space-b")).toBe(true);
       expect(items.every((item) => item.spaceId === "space-b")).toBe(true);
@@ -783,7 +782,7 @@ describe("folder live destination writes", () => {
     };
 
     try {
-      const move = new FoldersController().moveToSpace({
+      const move = createFoldersController().moveToSpace({
         folderId: "root",
         targetSpaceId: "space-b",
       });
@@ -831,7 +830,7 @@ describe("folder live destination writes", () => {
       makeItem("child-item", "child")
     );
 
-    const result = await new FoldersController({
+    const result = await createFoldersController({
       cloneOpfsMediaEntriesForItem: async (media, destinationItemId) => ({
         media: (media || []).map((entry) => ({
           ...entry,
@@ -875,7 +874,7 @@ describe("folder live destination writes", () => {
     items.splice(0, items.length, makeItem("source-item", "source"));
 
     await expect(
-      new FoldersController().mergeInto({
+      createFoldersController().mergeInto({
         sourceFolderId: "source",
         targetFolderId: "target",
       })
@@ -896,7 +895,7 @@ describe("folder live destination writes", () => {
     items.splice(0, items.length, makeItem("root-item", "root"));
 
     await expect(
-      new FoldersController().copyToSpace({
+      createFoldersController().copyToSpace({
         folderId: "root",
         targetSpaceId: PRIVATE_SPACE_ID,
       })

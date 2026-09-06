@@ -1,12 +1,10 @@
 import { addRxPlugin, createRxDatabase } from "rxdb";
-import { RxDBDevModePlugin } from "rxdb/plugins/dev-mode";
 import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
 import { wrappedValidateZSchemaStorage } from "rxdb/plugins/validate-z-schema";
 import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
 import { describe, expect, it } from "bun:test";
 import { spaceMigrationStrategies, spaceSchema } from "../src/schemas/space_schema";
 
-addRxPlugin(RxDBDevModePlugin);
 addRxPlugin(RxDBMigrationSchemaPlugin);
 
 describe("space schema", () => {

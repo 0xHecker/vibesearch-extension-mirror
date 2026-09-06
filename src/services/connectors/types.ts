@@ -6,7 +6,7 @@
  * `CapturedItem`s, and forwards them to the cloud. Connectors are toggled on/off
  * in settings; a heartbeat auto-toggles a connector off when its session dies.
  */
-import type { CapturedItem } from "../cloud-sync.service";
+import type { CapturedItem } from "./cloud-push";
 
 export type ConnectorPlatform = "x" | "reddit" | "instagram";
 

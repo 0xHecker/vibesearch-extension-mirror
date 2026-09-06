@@ -1,8 +1,9 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { FolderDocType } from "../src/schemas/folder_schema";
 import type { ItemDocType } from "../src/schemas/item_schema";
 import type { SpaceDocType } from "../src/schemas/space_schema";
 import { compareBinEntries, MAX_BIN_PAGE_SIZE } from "../src/common/bin";
+import { BinController } from "../src/services/controllers/bin.controller";
 
 type Row = { id: string; [key: string]: unknown };
 
@@ -83,15 +84,12 @@ const spaces: SpaceDocType[] = [];
 const folders: FolderDocType[] = [];
 const items: ItemDocType[] = [];
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => ({
-    spaces: collection(spaces),
-    folders: collection(folders),
-    items: collection(items),
-  }),
-}));
-
-const { binController } = await import("../src/services/controllers/bin.controller");
+const db = {
+  spaces: collection(spaces),
+  folders: collection(folders),
+  items: collection(items),
+};
+const binController = new BinController({ getDb: async () => db as never });
 
 const makeSpace = (id: string, name: string, isBinned = false): SpaceDocType =>
   ({

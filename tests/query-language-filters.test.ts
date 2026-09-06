@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { analyzeQuery, removePillRangesFromQuery } from "../src/search-core/query-language";
+import {
+  analyzeQuery,
+  removePillRangesFromQuery,
+} from "../src/search-core/query-language";
 import type { QueryAssistCatalogs } from "../src/search-core/contracts";
 
 const catalogs: QueryAssistCatalogs = {
@@ -36,8 +39,34 @@ describe("query language filters (UI ↔ typing share one state)", () => {
     expect(analysis.directives.scope).toBe("private");
   });
 
+  test("all current source families are valid structured filters", () => {
+    const analysis = analyze(
+      "source:threads source:mastodon source:bluesky source:spotify source:ytmusic source:vimeo source:soundcloud",
+    );
+    expect(analysis.filters.sources).toEqual([
+      "threads",
+      "mastodon",
+      "bluesky",
+      "spotify",
+      "ytmusic",
+      "vimeo",
+      "soundcloud",
+    ]);
+    expect(analysis.freeText).toBe("");
+  });
+
+  test("score directives and camel-case sort fields remain structured", () => {
+    const analysis = analyze("minscore:0.42 sort:updatedAt desc");
+    expect(analysis.directives.minScore).toBe(0.42);
+    expect(analysis.directives.sortBy).toBe("updatedAt");
+    expect(analysis.directives.sortOrder).toBe("desc");
+    expect(analysis.freeText).toBe("");
+  });
+
   test("multi-space, tag and site filters accumulate", () => {
-    const analysis = analyze('tag:music site:youtube.com space:Work space:"Side Projects"');
+    const analysis = analyze(
+      'tag:music site:youtube.com space:Work space:"Side Projects"',
+    );
     expect(analysis.filters.tagNames).toContain("music");
     expect(analysis.filters.domains).toContain("youtube.com");
     expect(analysis.filters.spaceIds).toEqual(["Work", "Side Projects"]);
@@ -45,10 +74,12 @@ describe("query language filters (UI ↔ typing share one state)", () => {
 
   test("a directive pill carries its source range so the UI can toggle it", () => {
     const analysis = analyze("has:embed");
-    const pill = analysis.pills.find((entry) => entry.field === "has" && entry.value === "embed");
+    const pill = analysis.pills.find(
+      (entry) => entry.field === "has" && entry.value === "embed",
+    );
     expect(pill).toBeTruthy();
-    expect(typeof pill?.start).toBe("number");
-    expect(typeof pill?.end).toBe("number");
+    expect(pill?.start).toBe(0);
+    expect(pill?.end).toBe("has:embed".length);
   });
 
   test("boolean AND remains an explicit text expression", () => {
@@ -67,7 +98,9 @@ describe("query language filters (UI ↔ typing share one state)", () => {
   test("NOT and dash exclusions remain visible while producing exclusions", () => {
     const notAnalysis = analyze("design NOT logo");
     expect(notAnalysis.excludedTerms).toEqual(["logo"]);
-    expect(removePillRangesFromQuery("design NOT logo", notAnalysis.pills)).toBe("design NOT logo");
+    expect(
+      removePillRangesFromQuery("design NOT logo", notAnalysis.pills),
+    ).toBe("design NOT logo");
 
     const dashAnalysis = analyze('-"some word"');
     expect(dashAnalysis.excludedTerms).toEqual(["some word"]);
@@ -75,14 +108,16 @@ describe("query language filters (UI ↔ typing share one state)", () => {
       type: "NOT",
       child: { type: "TERM", value: "some word" },
     });
-    expect(removePillRangesFromQuery('-"some word"', dashAnalysis.pills)).toBe('-"some word"');
+    expect(removePillRangesFromQuery('-"some word"', dashAnalysis.pills)).toBe(
+      '-"some word"',
+    );
   });
 
   test("query bar text splitting only removes structured pill ranges", () => {
     const analysis = analyze("source:web design NOT logo");
     expect(analysis.pills.map((pill) => pill.raw)).toEqual(["source:web"]);
-    expect(removePillRangesFromQuery("source:web design NOT logo", analysis.pills)).toBe(
-      "design NOT logo"
-    );
+    expect(
+      removePillRangesFromQuery("source:web design NOT logo", analysis.pills),
+    ).toBe("design NOT logo");
   });
 });

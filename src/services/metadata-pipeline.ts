@@ -1,565 +1,15 @@
-import { ItemDocType } from "@src/schemas/item_schema";
+import type { ItemDocType } from "@src/schemas/item_schema";
 import { setupOffscreenDocument } from "@src/services/offscreen-helper";
-import {
-  DEFAULT_METADATA_PREFERENCES,
-  getPreferencesForHost,
-  pickImageField,
-  pickStringField,
-} from "@src/utils/metadataPreferences";
-import { MEDIA_LIMITS } from "@src/services/media-storage";
-import { inferSource } from "@src/utils/infer-source";
-import {
-  getYouTubeVideoIdFromUrl,
-  isYouTubeShortsUrl,
-  normalizeIframeEmbedUrl,
-} from "@src/utils/media-embed";
+import { METADATA_API_MAX_URLS_PER_REQUEST } from "@src/services/metadata/constants";
+import { fetchMetadataForUrls } from "@src/services/metadata/fetch-client";
+import { normalizeMetadataUrls } from "@src/services/metadata/url-normalization";
 import {
   filterMetadataFetchableUrls,
   isMetadataFetchableUrl,
 } from "@src/utils/metadata-url";
+import { z } from "zod";
 
-// --- URL Normalization & Helpers ---
-
-const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
-// Retired custom domain (meta.vibesearch.app) — retry the live workers.dev origin
-// instead of a dead host on a transient primary failure.
-const LEGACY_METADATA_WORKER_BASE_URL = METADATA_WORKER_BASE_URL;
-const META_PREFIX = `${METADATA_WORKER_BASE_URL}/?url=`;
-// Kept as a literal so we still recognize & unwrap legacy-proxied URLs already
-// stored in items from older builds.
-const LEGACY_META_PREFIX = "https://meta.vibesearch.app/?url=";
-const METADATA_API_MAX_URLS_PER_REQUEST = 20;
-const METADATA_API_QUERY_CHAR_BUDGET = 12_000;
-// Abort a worker request that hangs so it can't permanently occupy a
-// concurrency slot and stall the whole pipeline.
-const METADATA_FETCH_TIMEOUT_MS = 15_000;
-
-function maybeDecode(raw: string): string {
-  try {
-    const decoded = decodeURIComponent(raw);
-    return decoded.includes("://") ? decoded : raw;
-  } catch {
-    return raw;
-  }
-}
-
-function normalizeIncomingUrls(input: unknown): string[] {
-  const out: string[] = [];
-  const add = (u: string) => {
-    const trimmed = u.trim();
-    if (!trimmed) return;
-    if (trimmed.startsWith("chrome://") || trimmed.startsWith("chrome-extension://")) return;
-    const metadataPrefix = trimmed.startsWith(META_PREFIX)
-      ? META_PREFIX
-      : trimmed.startsWith(LEGACY_META_PREFIX)
-        ? LEGACY_META_PREFIX
-        : null;
-    if (metadataPrefix) {
-      const after = trimmed.slice(metadataPrefix.length);
-      const beforeAmp = after.split("&")[0];
-      const rawParts = beforeAmp.split(",");
-      for (const part of rawParts) add(maybeDecode(part));
-      return;
-    }
-    if (!trimmed.includes("://") && /%[0-9a-fA-F]{2}/.test(trimmed)) {
-      const decoded = maybeDecode(trimmed);
-      out.push(decoded);
-      return;
-    }
-    if (trimmed.includes(",") && countSubstr(trimmed, "://") > 1) {
-      const parts = trimmed.split(",").map((s) => s.trim());
-      for (const p of parts) {
-        if (p.includes("://")) add(p);
-      }
-      return;
-    }
-    out.push(trimmed);
-  };
-
-  if (Array.isArray(input)) {
-    for (const u of input) if (typeof u === "string") add(u);
-  } else if (typeof input === "string") {
-    add(input);
-  }
-  return Array.from(new Set(out));
-}
-
-function countSubstr(haystack: string, needle: string): number {
-  let count = 0,
-    idx = 0;
-  while ((idx = haystack.indexOf(needle, idx)) !== -1) {
-    count++;
-    idx += needle.length;
-  }
-  return count;
-}
-
-// --- Core Fetching Logic ---
-
-type FetchResult = {
-  metadata: Record<string, Partial<ItemDocType>>;
-  successfulUrls: Set<string>; // URLs that got a successful API response (even if empty metadata)
-  failedUrls: Set<string>; // URLs that failed due to 4xx/5xx or network errors
-  queuedUrls: Set<string>; // URLs accepted by the worker queue but not refreshed locally yet
-  queuedRetryDelays: Map<string, number>; // URL -> suggested poll delay in ms
-  failedRetryDelays: Map<string, number>; // URL -> Retry-After delay in ms (429/503 etc.)
-};
-
-const fetchMetadataEndpoint = async (
-  urls: string[],
-  revalidate: boolean,
-  cacheOnly = false,
-  generation = pipelineGeneration,
-): Promise<Response> => {
-  const query = buildMetadataQuery(urls);
-  const usePost = query.length > METADATA_API_QUERY_CHAR_BUDGET;
-  const suffix = `/?${query}${revalidate ? "&re=1&img=1" : ""}${cacheOnly ? "&co=1" : ""}`;
-  const primaryUrl = usePost ? `${METADATA_WORKER_BASE_URL}/` : `${METADATA_WORKER_BASE_URL}${suffix}`;
-  const legacyUrl = `${LEGACY_METADATA_WORKER_BASE_URL}${suffix}`;
-  const primaryInit = usePost
-    ? {
-      method: "POST" as const,
-      headers: { "Content-Type": "application/json", "X-VS-Metadata-Source": "extension" },
-      body: JSON.stringify({ urls, revalidate, refreshImage: revalidate, cacheOnly }),
-    }
-    : { method: "GET" as const };
-
-  const timeoutFetch = (url: string, init: RequestInit): Promise<Response> => {
-    if (generation !== pipelineGeneration) {
-      return Promise.reject(new DOMException("Metadata pipeline reset", "AbortError"));
-    }
-    const controller = new AbortController();
-    activeFetchControllers.add(controller);
-    const timer = setTimeout(() => controller.abort(), METADATA_FETCH_TIMEOUT_MS);
-    return fetch(url, { ...init, signal: controller.signal }).finally(() => {
-      clearTimeout(timer);
-      activeFetchControllers.delete(controller);
-    });
-  };
-
-  try {
-    const primary = await timeoutFetch(primaryUrl, primaryInit);
-    if (primary.ok) return primary;
-    if (usePost) return primary;
-  } catch { }
-
-  return timeoutFetch(legacyUrl, { method: "GET" as const });
-};
-
-const normalizeMetadataAssetUrl = (assetUrl: string | undefined, baseUrl: string): string | undefined => {
-  if (!assetUrl || typeof assetUrl !== "string") return undefined;
-  const trimmed = assetUrl.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.startsWith("//")) return `https:${trimmed}`;
-  if (trimmed.startsWith("/")) {
-    try {
-      return new URL(trimmed, baseUrl).toString();
-    } catch {
-      return undefined;
-    }
-  }
-  if (!trimmed.includes("://")) {
-    try {
-      return new URL(trimmed, baseUrl).toString();
-    } catch {
-      return undefined;
-    }
-  }
-  return trimmed;
-};
-
-const normalizeYouTubeWatchThumbnail = (
-  imageUrl: string | undefined,
-  pageUrl: string
-): string | undefined => {
-  const videoId = getYouTubeVideoIdFromUrl(pageUrl);
-  if (!imageUrl || !videoId) return imageUrl;
-  try {
-    const parsed = new URL(imageUrl);
-    const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
-    if (host !== "i.ytimg.com" && host !== "img.youtube.com") return imageUrl;
-    if (!/\/(maxresdefault|sddefault)\.jpg$/i.test(parsed.pathname)) return imageUrl;
-    return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-  } catch {
-    return imageUrl;
-  }
-};
-
-type MetadataImageAsset = {
-  url: string;
-  width?: number;
-  height?: number;
-};
-
-const collectMetadataImageAssets = (
-  entry: Record<string, any>,
-  fields: string[],
-  baseUrl: string
-): MetadataImageAsset[] => {
-  const out: MetadataImageAsset[] = [];
-  const seen = new Set<string>();
-  const add = (raw: unknown) => {
-    const candidate =
-      typeof raw === "string"
-        ? raw
-        : raw && typeof raw === "object" && typeof (raw as { url?: unknown }).url === "string"
-          ? ((raw as { url: string }).url)
-          : undefined;
-    const normalized = normalizeMetadataAssetUrl(candidate, baseUrl);
-    if (!normalized || seen.has(normalized)) return;
-    seen.add(normalized);
-    const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
-    out.push({
-      url: normalized,
-      width: record ? parseMetadataDimension(record.width) : undefined,
-      height: record ? parseMetadataDimension(record.height) : undefined,
-    });
-  };
-
-  for (const field of fields) {
-    const value = entry[field];
-    if (Array.isArray(value)) {
-      for (const image of value) add(image);
-    } else {
-      add(value);
-    }
-  }
-
-  return out.slice(0, MEDIA_LIMITS.image);
-};
-
-type MetadataVideoAsset = {
-  url: string;
-  embedUrl?: string;
-  embedType?: "iframe";
-  width?: number;
-  height?: number;
-};
-
-const parseMetadataDimension = (value: unknown): number | undefined => {
-  const numberValue = typeof value === "string" ? Number(value) : value;
-  return Number.isFinite(numberValue) && (numberValue as number) > 0
-    ? Math.round(numberValue as number)
-    : undefined;
-};
-
-const getMetadataAssetUrl = (raw: unknown): string | undefined => {
-  if (typeof raw === "string") return raw;
-  if (!raw || typeof raw !== "object") return undefined;
-  const record = raw as Record<string, unknown>;
-  return (
-    (typeof record.secure_url === "string" && record.secure_url) ||
-    (typeof record.secureUrl === "string" && record.secureUrl) ||
-    (typeof record.url === "string" && record.url) ||
-    undefined
-  );
-};
-
-const isIframeVideoAsset = (raw: unknown, field: string, url: string): boolean => {
-  if (field === "twitterPlayer" || field === "ogVideoSecureURL") return true;
-  if (raw && typeof raw === "object") {
-    const type = `${(raw as Record<string, unknown>).type || ""}`.toLowerCase();
-    if (type === "text/html") return true;
-  }
-  try {
-    const parsed = new URL(url);
-    return /(^|\.)youtube\.com$/i.test(parsed.hostname) && parsed.pathname.startsWith("/embed/");
-  } catch {
-    return false;
-  }
-};
-
-const collectMetadataVideoAssets = (
-  entry: Record<string, any>,
-  baseUrl: string
-): MetadataVideoAsset[] => {
-  const fields = ["ogVideoSecureURL", "ogVideo", "twitterPlayer", "twitterPlayerStream"];
-  const out: MetadataVideoAsset[] = [];
-  const seen = new Set<string>();
-
-  const add = (raw: unknown, field: string) => {
-    const candidate = getMetadataAssetUrl(raw);
-    const normalized = normalizeMetadataAssetUrl(candidate, baseUrl);
-    if (!normalized || seen.has(normalized)) return;
-    seen.add(normalized);
-    const iframe = isIframeVideoAsset(raw, field, normalized);
-    out.push({
-      url: normalized,
-      embedUrl: iframe ? normalizeIframeEmbedUrl(normalized) || normalized : undefined,
-      embedType: iframe ? "iframe" : undefined,
-      width:
-        raw && typeof raw === "object"
-          ? parseMetadataDimension((raw as Record<string, unknown>).width)
-          : undefined,
-      height:
-        raw && typeof raw === "object"
-          ? parseMetadataDimension((raw as Record<string, unknown>).height)
-          : undefined,
-    });
-  };
-
-  for (const field of fields) {
-    const value = entry[field];
-    if (Array.isArray(value)) {
-      for (const asset of value) add(asset, field);
-    } else {
-      add(value, field);
-    }
-  }
-
-  return out.slice(0, MEDIA_LIMITS.video);
-};
-
-const isQueuedMetadataEntry = (entry: Record<string, any>): boolean => {
-  return entry.isMetadataQueued === true || entry.metadataQueued === true;
-};
-
-const buildMetadataQuery = (urls: string[]): string =>
-  urls.map((u) => `url=${encodeURIComponent(u)}`).join("&");
-
-export const chunkUrlsForMetadataRequest = (urls: string[]): string[][] => {
-  const batches: string[][] = [];
-  let current: string[] = [];
-  let currentQueryLength = 0;
-
-  for (const url of urls) {
-    const encodedLength = `url=${encodeURIComponent(url)}`.length;
-    const separatorLength = current.length > 0 ? 1 : 0;
-    const wouldExceedCount = current.length >= METADATA_API_MAX_URLS_PER_REQUEST;
-    const wouldExceedQueryBudget =
-      current.length > 0 &&
-      currentQueryLength + separatorLength + encodedLength > METADATA_API_QUERY_CHAR_BUDGET;
-
-    if (wouldExceedCount || wouldExceedQueryBudget) {
-      batches.push(current);
-      current = [];
-      currentQueryLength = 0;
-    }
-
-    current.push(url);
-    currentQueryLength += (current.length > 1 ? 1 : 0) + encodedLength;
-  }
-
-  if (current.length > 0) batches.push(current);
-  return batches;
-};
-
-const fetchMetadataForUrls = async (
-  urls: string[],
-  revalidate = false,
-  cacheOnly = false,
-  generation = pipelineGeneration,
-): Promise<FetchResult> => {
-  const result: FetchResult = {
-    metadata: {},
-    successfulUrls: new Set(),
-    failedUrls: new Set(),
-    queuedUrls: new Set(),
-    queuedRetryDelays: new Map(),
-    failedRetryDelays: new Map(),
-  };
-
-  if (urls.length === 0) return result;
-
-  const safeUrls = normalizeIncomingUrls(urls);
-  // The worker hashes cache keys, so a long URL is still valid metadata input.
-  // Keep it alone when it exceeds normal query budget; never drop it from a batch.
-  const batches = chunkUrlsForMetadataRequest(safeUrls);
-
-  for (const group of batches) {
-    if (generation !== pipelineGeneration) break;
-    try {
-      const res = await fetchMetadataEndpoint(group, revalidate, cacheOnly, generation);
-      if (generation !== pipelineGeneration) break;
-      if (!res.ok) {
-        // API returned 4xx/5xx - mark all URLs in this batch as failed and
-        // honor any Retry-After the worker sent (e.g. 429/503) so we back off
-        // by exactly as long as it asked instead of hammering it.
-        console.warn(`Metadata API returned ${res.status} for batch:`, group);
-        const retryAfterSeconds = Number(res.headers.get("Retry-After") || 0);
-        const retryDelayMs =
-          Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-            ? Math.ceil(retryAfterSeconds * 1000)
-            : 0;
-        for (const url of group) {
-          result.failedUrls.add(url);
-          if (retryDelayMs > 0) result.failedRetryDelays.set(url, retryDelayMs);
-        }
-        continue;
-      }
-      const responseRetryAfterSeconds = Number(res.headers.get("Retry-After") || 0);
-      const arr = (await res.json()) as any[];
-      if (generation !== pipelineGeneration) break;
-      if (Array.isArray(arr)) {
-        const accountedUrls = new Set<string>();
-        for (let i = 0; i < arr.length; i++) {
-          const entry = arr[i] ?? {};
-          const inputUrl = group[i];
-          const key = inputUrl || entry.url;
-          if (!key) continue;
-          accountedUrls.add(key);
-
-          if (isQueuedMetadataEntry(entry)) {
-            result.queuedUrls.add(key);
-            const entryRetryAfterSeconds = Number(entry.retryAfterSeconds || 0);
-            const retryAfterSeconds = Number.isFinite(entryRetryAfterSeconds) && entryRetryAfterSeconds > 0
-              ? entryRetryAfterSeconds
-              : responseRetryAfterSeconds;
-            result.queuedRetryDelays.set(
-              key,
-              Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-                ? Math.ceil(retryAfterSeconds * 1000)
-                : QUEUED_METADATA_POLL_DELAY
-            );
-            continue;
-          }
-
-          // Mark as successful - we got a response for this URL
-          result.successfulUrls.add(key);
-
-          // Map fields using preferences
-          let hostname: string | null = null;
-          try {
-            hostname = new URL(key).hostname;
-          } catch {
-            hostname = null;
-          }
-          const domainPrefs = hostname ? getPreferencesForHost(hostname) : {};
-          const preferYouTubeOpenGraph = !!getYouTubeVideoIdFromUrl(key);
-          const titleFields = preferYouTubeOpenGraph
-            ? ["ogTitle", "twitterTitle", "title"]
-            : domainPrefs.title || DEFAULT_METADATA_PREFERENCES.title;
-          const descriptionFields =
-            preferYouTubeOpenGraph
-              ? ["ogDescription", "twitterDescription", "description"]
-              : domainPrefs.description || DEFAULT_METADATA_PREFERENCES.description;
-          const imageFields = preferYouTubeOpenGraph
-            ? ["ogImage", "twitterImage", "image"]
-            : domainPrefs.image || DEFAULT_METADATA_PREFERENCES.image;
-          const imageAssets = collectMetadataImageAssets(entry, imageFields, key);
-          const preferredShortThumbnail = isYouTubeShortsUrl(key)
-            ? imageAssets.find(
-              (asset) =>
-                typeof asset.width === "number" &&
-                typeof asset.height === "number" &&
-                asset.height > asset.width
-            )
-            : undefined;
-          const orderedImageAssets = preferredShortThumbnail
-            ? [
-              preferredShortThumbnail,
-              ...imageAssets.filter((asset) => asset.url !== preferredShortThumbnail.url),
-            ]
-            : imageAssets;
-
-          const title = pickStringField(entry, titleFields);
-          const description = pickStringField(entry, descriptionFields);
-          let favicon = entry.favicon as string | undefined;
-          if (favicon && typeof favicon === "string") {
-            if (favicon.startsWith("//")) {
-              favicon = `https:${favicon}`;
-            } else if (favicon.startsWith("/")) {
-              try {
-                const origin = new URL(key).origin;
-                favicon = origin + favicon;
-              } catch { }
-            } else if (!favicon.includes("://")) {
-              try {
-                favicon = new URL(favicon, key).toString();
-              } catch { }
-            }
-          }
-          let displayImageUrl = preferredShortThumbnail?.url || pickImageField(entry, imageFields);
-          displayImageUrl = normalizeMetadataAssetUrl(displayImageUrl, key);
-          displayImageUrl = normalizeYouTubeWatchThumbnail(displayImageUrl, key);
-          const videoMedia = collectMetadataVideoAssets(entry, key).map((asset) => ({
-            type: "video" as const,
-            originalUrl: asset.url,
-            storageType: "hotlink" as const,
-            embedUrl: asset.embedUrl,
-            embedType: asset.embedType,
-            thumbnailUrl: displayImageUrl,
-            pageUrl: key,
-            width: asset.width,
-            height: asset.height,
-          }));
-          const imageMedia = orderedImageAssets.map((asset) => {
-            const normalizedImageUrl = normalizeYouTubeWatchThumbnail(asset.url, key) || asset.url;
-            const isWorkerR2Url = normalizedImageUrl.startsWith(`${METADATA_WORKER_BASE_URL}/r2/`);
-            return {
-              type: "image" as const,
-              originalUrl: normalizedImageUrl,
-              storageType: isWorkerR2Url ? ("s3" as const) : ("hotlink" as const),
-              s3Url: isWorkerR2Url ? normalizedImageUrl : undefined,
-              pageUrl: key,
-              width: asset.width,
-              height: asset.height,
-            };
-          });
-          const media = preferYouTubeOpenGraph
-            ? [...imageMedia, ...videoMedia]
-            : [...videoMedia, ...imageMedia];
-
-          const validSources = [
-            "web",
-            "twitter",
-            "reddit",
-            "note",
-            "youtube",
-            "instagram",
-            "tiktok",
-            "substack",
-            "linkedin",
-            "github",
-            "article",
-          ];
-          const source = validSources.includes(entry.ogType) ? entry.ogType : inferSource(key);
-
-          const mapped: Partial<ItemDocType> = {
-            title: title,
-            textContent: description,
-            iconUrl: favicon,
-            displayImageUrl: displayImageUrl,
-            media: media.length > 0 ? media : undefined,
-            source: source as any,
-            createdAt: entry.ogDate ? new Date(entry.ogDate).getTime() : undefined,
-            updatedAt: entry.articleModifiedTime
-              ? new Date(entry.articleModifiedTime).getTime()
-              : undefined,
-            authorUsername: entry.ogSiteName,
-          } as Partial<ItemDocType>;
-
-          result.metadata[key] = mapped;
-          if (entry.url && entry.url !== key) {
-            result.metadata[entry.url] = mapped;
-            result.successfulUrls.add(entry.url);
-            accountedUrls.add(entry.url);
-          }
-        }
-        for (const url of group) {
-          if (
-            !accountedUrls.has(url) &&
-            !result.successfulUrls.has(url) &&
-            !result.queuedUrls.has(url) &&
-            !result.failedUrls.has(url)
-          ) {
-            result.successfulUrls.add(url);
-          }
-        }
-      } else {
-        for (const url of group) result.failedUrls.add(url);
-      }
-    } catch (e) {
-      console.error("Error fetching metadata for group:", group, e);
-      // Network error or parsing error - mark all URLs in this batch as failed
-      for (const url of group) {
-        result.failedUrls.add(url);
-      }
-    }
-  }
-
-  return result;
-};
+export { chunkUrlsForMetadataRequest } from "@src/services/metadata/url-normalization";
 
 // --- Manual, Reliable Request Pipeline ---
 
@@ -583,6 +33,13 @@ type StoredFailedMetadataUrl = {
   nextRetryAt: number;
   updatedAt: number;
 };
+
+const storedFailedMetadataSchema = z.array(z.object({
+  url: z.string(),
+  periodicRetryCount: z.coerce.number(),
+  nextRetryAt: z.coerce.number(),
+  updatedAt: z.coerce.number(),
+}));
 
 // Hard failures (4xx/5xx/network) get a small retry budget.
 const MAX_ATTEMPTS = 3;
@@ -762,7 +219,7 @@ const clearQueuedPollTimer = (url: string) => {
 
 const getStorageLocal = (): chrome.storage.LocalStorageArea | null => {
   try {
-    return (globalThis as typeof globalThis & { chrome?: typeof chrome }).chrome?.storage?.local ?? null;
+    return globalThis.chrome?.storage?.local ?? null;
   } catch {
     return null;
   }
@@ -772,12 +229,11 @@ const readStoredFailedMetadata = async (): Promise<Map<string, StoredFailedMetad
   const storage = getStorageLocal();
   if (!storage) return new Map();
   const row = await storage.get(FAILED_METADATA_STORAGE_KEY);
-  const raw = row?.[FAILED_METADATA_STORAGE_KEY];
-  const entries = Array.isArray(raw) ? raw : [];
+  const parsed = storedFailedMetadataSchema.safeParse(row?.[FAILED_METADATA_STORAGE_KEY]);
+  const entries = parsed.success ? parsed.data : [];
   const out = new Map<string, StoredFailedMetadataUrl>();
 
   for (const entry of entries) {
-    if (!entry || typeof entry.url !== "string") continue;
     const url = entry.url.trim();
     if (!isMetadataFetchableUrl(url, { blockedHosts: ["local.vibesearch.invalid"] })) continue;
     const periodicRetryCount = Math.max(0, Math.floor(Number(entry.periodicRetryCount) || 0));
@@ -1080,7 +536,7 @@ const processQueue = () => {
 const fetchAndProcessBatch = async (batch: QueueItem[], generation = pipelineGeneration) => {
   if (generation !== pipelineGeneration) return;
   const urls = batch.map((b) => b.url);
-  const safeUrls = normalizeIncomingUrls(urls);
+  const safeUrls = normalizeMetadataUrls(urls);
   if (safeUrls.length === 0) return;
   pipelineStats.fetchedBatches += 1;
 
@@ -1089,7 +545,7 @@ const fetchAndProcessBatch = async (batch: QueueItem[], generation = pipelineGen
   const shouldCacheOnly = batch.every((b) => b.cacheOnly);
   const shouldApplyForceRefresh = batch.some((b) => b.revalidate || b.applyForceRefresh);
   const forceRefreshUrlSet = new Set(
-    normalizeIncomingUrls(
+    normalizeMetadataUrls(
       batch.filter((b) => b.revalidate || b.applyForceRefresh).map((b) => b.url)
     )
   );
@@ -1123,7 +579,11 @@ const fetchAndProcessBatch = async (batch: QueueItem[], generation = pipelineGen
       safeUrls,
       shouldRevalidate,
       shouldCacheOnly,
-      generation,
+      {
+        generation,
+        isCurrentGeneration: (candidate) => candidate === pipelineGeneration,
+        activeControllers: activeFetchControllers,
+      },
     );
     if (generation !== pipelineGeneration) return;
 
@@ -1297,7 +757,7 @@ const addUrlToPipeline = (
  */
 export const scheduleForProcessing = (urls: string[], forceRefresh = false) => {
   cleanupUrlState();
-  const normalized = normalizeIncomingUrls(urls);
+  const normalized = normalizeMetadataUrls(urls);
   const fetchable = filterMetadataFetchableUrls(normalized, {
     blockedHosts: ["local.vibesearch.invalid"],
   });

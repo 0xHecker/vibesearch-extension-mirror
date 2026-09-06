@@ -1,8 +1,12 @@
 import { PUBLIC_SPACE_ID } from "@src/common/spaces";
+import type { FolderDocType } from "@src/schemas/folder_schema";
+import type { SpaceDocType } from "@src/schemas/space_schema";
+import type { MyDatabase } from "@src/services/DatabaseService";
 import {
   withSpaceMutationLock,
   withSpaceMutationLocks,
 } from "@src/services/entity-mutation-lock";
+import type { RxDocument } from "rxdb";
 
 export const DESTINATION_SPACE_NOT_FOUND = "DESTINATION_SPACE_NOT_FOUND";
 export const DESTINATION_SPACE_NOT_LIVE = "DESTINATION_SPACE_NOT_LIVE";
@@ -10,20 +14,19 @@ export const DESTINATION_FOLDER_NOT_FOUND = "DESTINATION_FOLDER_NOT_FOUND";
 export const DESTINATION_FOLDER_NOT_LIVE = "DESTINATION_FOLDER_NOT_LIVE";
 export const DESTINATION_FOLDER_CHANGED = "DESTINATION_FOLDER_CHANGED";
 
-type DestinationDocument = {
-  get: (field: string) => unknown;
-};
+type FolderDocument = RxDocument<FolderDocType>;
+type SpaceDocument = RxDocument<SpaceDocType>;
 
 export type LiveFolderDestination = {
-  folderDoc: DestinationDocument;
-  spaceDoc: DestinationDocument;
+  folderDoc: FolderDocument;
+  spaceDoc: SpaceDocument;
   spaceId: string;
 };
 
 export const requireLiveSpaceDestination = async (
-  db: any,
+  db: MyDatabase,
   rawSpaceId: string
-): Promise<DestinationDocument> => {
+): Promise<SpaceDocument> => {
   const spaceId = rawSpaceId.trim() || PUBLIC_SPACE_ID;
   const spaceDoc = await db.spaces.findOne(spaceId).exec();
   if (!spaceDoc) throw new Error(DESTINATION_SPACE_NOT_FOUND);
@@ -34,7 +37,7 @@ export const requireLiveSpaceDestination = async (
 };
 
 export const requireLiveFolderDestination = async (
-  db: any,
+  db: MyDatabase,
   folderId: string,
   expectedSpaceId?: string
 ): Promise<LiveFolderDestination> => {
@@ -43,16 +46,14 @@ export const requireLiveFolderDestination = async (
   if (folderDoc.get("deletedAt") !== 0) {
     throw new Error(DESTINATION_FOLDER_NOT_LIVE);
   }
-  const spaceId =
-    ((folderDoc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID).trim() ||
-    PUBLIC_SPACE_ID;
+  const spaceId = (folderDoc.get("spaceId") || PUBLIC_SPACE_ID).trim() || PUBLIC_SPACE_ID;
   if (expectedSpaceId && spaceId !== expectedSpaceId) {
     throw new Error(DESTINATION_FOLDER_CHANGED);
   }
   const spaceDoc = await requireLiveSpaceDestination(db, spaceId);
 
   const visited = new Set<string>([folderId]);
-  let parentId = (folderDoc.get("parentId") as string | null | undefined) || null;
+  let parentId = folderDoc.get("parentId") || null;
   while (parentId) {
     if (visited.has(parentId)) throw new Error(DESTINATION_FOLDER_NOT_LIVE);
     visited.add(parentId);
@@ -60,19 +61,17 @@ export const requireLiveFolderDestination = async (
     if (!parentDoc || parentDoc.get("deletedAt") !== 0) {
       throw new Error(DESTINATION_FOLDER_NOT_LIVE);
     }
-    const parentSpaceId =
-      ((parentDoc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID).trim() ||
-      PUBLIC_SPACE_ID;
+    const parentSpaceId = (parentDoc.get("spaceId") || PUBLIC_SPACE_ID).trim() || PUBLIC_SPACE_ID;
     if (parentSpaceId !== spaceId) throw new Error(DESTINATION_FOLDER_CHANGED);
-    parentId = (parentDoc.get("parentId") as string | null | undefined) || null;
+    parentId = parentDoc.get("parentId") || null;
   }
   return { folderDoc, spaceDoc, spaceId };
 };
 
 export const withLiveSpaceDestination = async <Result>(
-  db: any,
+  db: MyDatabase,
   rawSpaceId: string,
-  operation: (spaceDoc: DestinationDocument, spaceId: string) => Promise<Result>
+  operation: (spaceDoc: SpaceDocument, spaceId: string) => Promise<Result>
 ): Promise<Result> => {
   const spaceId = rawSpaceId.trim() || PUBLIC_SPACE_ID;
   return withSpaceMutationLock(db, spaceId, async () => {
@@ -82,15 +81,13 @@ export const withLiveSpaceDestination = async <Result>(
 };
 
 export const withLiveFolderDestination = async <Result>(
-  db: any,
+  db: MyDatabase,
   folderId: string,
   operation: (destination: LiveFolderDestination) => Promise<Result>
 ): Promise<Result> => {
   const initialFolder = await db.folders.findOne(folderId).exec();
   if (!initialFolder) throw new Error(DESTINATION_FOLDER_NOT_FOUND);
-  const initialSpaceId =
-    ((initialFolder.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID).trim() ||
-    PUBLIC_SPACE_ID;
+  const initialSpaceId = (initialFolder.get("spaceId") || PUBLIC_SPACE_ID).trim() || PUBLIC_SPACE_ID;
   return withSpaceMutationLock(db, initialSpaceId, async () => {
     const destination = await requireLiveFolderDestination(db, folderId, initialSpaceId);
     return operation(destination);
@@ -98,7 +95,7 @@ export const withLiveFolderDestination = async <Result>(
 };
 
 export const withLiveSpaceDestinations = async <Result>(
-  db: any,
+  db: MyDatabase,
   spaceIds: Iterable<string>,
   operation: () => Promise<Result>
 ): Promise<Result> => {

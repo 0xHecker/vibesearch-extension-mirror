@@ -7,9 +7,25 @@
  * harvester (`findEntryList` + `normalizeEntry` + `findCursor`), so field/nesting
  * changes don't break extraction. Only the endpoint + auth + cursor param are here.
  */
-import type { CapturedItem } from "../cloud-sync.service";
+import type { CapturedItem } from "./cloud-push";
 import type { ConnectorAccount, ConnectorModule, FetchSavedResult } from "./types";
-import { findXCursor, findXEntryList, normalizeEntry, politeDelay } from "./harvest";
+import {
+  findXCursor,
+  findXEntryList,
+  normalizeEntry,
+  politeDelay,
+} from "./harvest";
+import {
+  jsonObject,
+  jsonString,
+  readJsonResponse,
+  tryReadJsonResponse,
+  type JsonValue,
+} from "@src/common/json-value";
+import {
+  selectSavedSyncWindow,
+  SOCIAL_SAVED_SYNC_ITEM_LIMIT,
+} from "./saved-sync-window";
 
 const BEARER =
   "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -44,6 +60,12 @@ export interface XCredentials {
   ct0: string;
 }
 
+type XBookmarkVariables = {
+  count: number;
+  includePromotedContent: boolean;
+  cursor?: string;
+};
+
 async function readCookie(url: string, name: string): Promise<string | null> {
   try {
     const cookie = await chrome.cookies.get({ url, name });
@@ -64,8 +86,13 @@ export async function readXCredentials(): Promise<XCredentials | null> {
   return { authToken, ct0 };
 }
 
-async function fetchPage(creds: XCredentials, cursor?: string): Promise<unknown> {
-  const variables = JSON.stringify({ count: 100, includePromotedContent: false, ...(cursor ? { cursor } : {}) });
+async function fetchPage(creds: XCredentials, cursor?: string): Promise<JsonValue> {
+  const requestVariables: XBookmarkVariables = {
+    count: 100,
+    includePromotedContent: false,
+  };
+  if (cursor) requestVariables.cursor = cursor;
+  const variables = JSON.stringify(requestVariables);
   const url = `https://x.com/i/api/graphql/${QUERY_ID}/Bookmarks?variables=${encodeURIComponent(
     variables,
   )}&features=${encodeURIComponent(FEATURES)}`;
@@ -94,7 +121,7 @@ async function fetchPage(creds: XCredentials, cursor?: string): Promise<unknown>
     if (res.status === 429) throw new Error("X is rate-limiting requests — pausing this sync; it'll resume on the next scheduled run.");
     throw new Error(`X API ${res.status}: ${text.slice(0, 160)}`);
   }
-  return res.json();
+  return readJsonResponse(res);
 }
 
 export interface XSyncOptions {
@@ -125,7 +152,7 @@ export async function fetchXBookmarks(
       console.log("[Vibesearch · X] cancelled by user.");
       break;
     }
-    let raw: unknown;
+    let raw: JsonValue;
     try {
       raw = await fetchPage(creds, cursor);
     } catch (error) {
@@ -135,27 +162,32 @@ export async function fetchXBookmarks(
     }
     const entries = findXEntryList(raw);
     console.log(`[Vibesearch · X] page ${page + 1}: found ${entries.length} entries`);
-    for (const el of entries) {
-      const item = normalizeEntry(el, {
-        source: "twitter",
-        idPrefix: "x",
-        connector: "x-bookmarks",
-        defaultType: "social",
-        buildUrl: ({ id, handle }) => `https://x.com/${handle || "i"}/status/${id}`,
-      });
-      if (!item) continue;
-      const rawId = item.externalId.slice("x:".length);
-      if (!newestId) newestId = rawId;
-      if (opts.sinceId && rawId === opts.sinceId) {
-        reachedKnown = true;
-        break;
-      }
-      items.push(item);
-    }
+    const candidates = entries
+      .map((entry) =>
+        normalizeEntry(entry, {
+          source: "twitter",
+          idPrefix: "x",
+          connector: "x-bookmarks",
+          defaultType: "social",
+          buildUrl: ({ id, handle }) => `https://x.com/${handle || "i"}/status/${id}`,
+        })
+      )
+      .filter((item): item is CapturedItem => item !== null);
+    const window = selectSavedSyncWindow(candidates, {
+      externalIdPrefix: "x:",
+      sinceId: opts.sinceId,
+      remaining: SOCIAL_SAVED_SYNC_ITEM_LIMIT - items.length,
+    });
+    newestId ??= window.newestId;
+    reachedKnown = window.stopReason === "known-item";
+    items.push(...window.items);
     const next = findXCursor(raw);
     console.log(`[Vibesearch · X] collected ${items.length} bookmark(s) so far${next ? " — more pages…" : " — last page."}`);
     opts.onProgress?.(`Read ${items.length} bookmark${items.length === 1 ? "" : "s"}${next ? " so far…" : "."}`);
-    if (reachedKnown || !next || next === cursor || entries.length === 0) {
+    if (window.stopReason === "item-limit") {
+      console.log(`[Vibesearch · X] stopping at the newest ${SOCIAL_SAVED_SYNC_ITEM_LIMIT} bookmark(s) — sync limit reached.`);
+    }
+    if (window.stopReason || !next || next === cursor || entries.length === 0) {
       complete = true;
       nextCursor = undefined;
       break;
@@ -187,8 +219,9 @@ async function detectXAccount(): Promise<ConnectorAccount | null> {
       },
     });
     if (res.ok) {
-      const data = (await res.json().catch(() => null)) as { screen_name?: string } | null;
-      if (data?.screen_name) handle = data.screen_name;
+      const data = jsonObject(await tryReadJsonResponse(res));
+      const screenName = jsonString(data?.screen_name);
+      if (screenName) handle = screenName;
     }
   } catch {
     /* keep id fallback */

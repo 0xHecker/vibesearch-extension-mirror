@@ -8,6 +8,7 @@
     "url": "https://github.com/0xHecker/vibesearch-extension.git"
   },
   "scripts": {
+    "lint": "bun node_modules/oxlint/bin/oxlint .",
     "build:worker": "vite build --config vite.config.worker.ts",
     "ensure:import-token": "bun scripts/ensure-import-media-token.mjs",
     "build": "bun scripts/ensure-import-media-token.mjs && NODE_ENV=production bunx vite build --config vite.config.chrome.ts",
@@ -50,10 +51,12 @@
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.3.1",
     "uuid": "^11.1.0",
-    "webextension-polyfill": "^0.12.0"
+    "webextension-polyfill": "^0.12.0",
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.0.0-beta.32",
+    "@oxlint/plugins": "1.81.0",
     "@tailwindcss/vite": "^4.1.8",
     "@types/chrome": "^0.0.323",
     "@types/node": "^24.0.10",
@@ -71,6 +74,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "fs-extra": "^11.3.0",
     "nodemon": "^3.1.10",
+    "oxlint": "1.81.0",
     "react-grab": "^0.1.46",
     "tailwindcss": "^4.1.8",
     "ts-node": "^10.9.2",

@@ -21,7 +21,6 @@ import {
   FolderInput,
   FolderPlus,
   Lock,
-  MoreHorizontal,
   Pencil,
   Pin,
   PinOff,
@@ -36,7 +35,6 @@ type SpaceMoveTarget = { id: string; name: string };
 
 type CommonMenuProps = {
   children: React.ReactNode;
-  className?: string;
 };
 
 const MenuIcon = ({ Icon, className }: { Icon: React.ComponentType<{ className?: string }>; className?: string }) => (
@@ -61,7 +59,6 @@ export const SpaceGroupContextMenu = ({
   canMoveDown,
   handlers,
   children,
-  className,
 }: CommonMenuProps & {
   group: SpaceGroupDocType;
   canMoveUp: boolean;
@@ -137,7 +134,6 @@ export const SpaceContextMenu = ({
   groupTargets,
   handlers,
   children,
-  className,
 }: CommonMenuProps & {
   space: SidebarSpace;
   canMoveUp: boolean;
@@ -280,7 +276,6 @@ export const TabGroupContextMenu = ({
   spaceMoveTargets,
   handlers,
   children,
-  className,
 }: CommonMenuProps & {
   folder: FolderDocType;
   hasChildren: boolean;

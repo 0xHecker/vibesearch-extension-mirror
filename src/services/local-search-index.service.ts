@@ -1,4 +1,9 @@
-import { Document, Charset } from "flexsearch";
+import {
+  Charset,
+  Document,
+  type DefaultDocumentSearchResults,
+  type Id,
+} from "flexsearch";
 import { getDb } from "@src/services/DatabaseService";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { normalizeSearchIndexText } from "@src/search-core/search-text";
@@ -53,18 +58,20 @@ type SearchStats = {
 };
 
 type IndexProcessStatusState = "processing" | "success" | "error";
+type SearchIndex = Document<IndexedSearchDoc, boolean>;
+type SearchDocumentResults = DefaultDocumentSearchResults<IndexedSearchDoc>;
 
-const FIELD_WEIGHTS: Record<string, number> = {
-  title: 6,
-  tagsText: 4.5,
-  textContent: 3,
-  ocrText: 2.8,
-  url: 2.5,
-  author: 2.5,
-  phoneticTitle: 2,
-  phoneticAuthor: 1.5,
-  source: 1,
-};
+const FIELD_WEIGHTS = new Map<string, number>([
+  ["title", 6],
+  ["tagsText", 4.5],
+  ["textContent", 3],
+  ["ocrText", 2.8],
+  ["url", 2.5],
+  ["author", 2.5],
+  ["phoneticTitle", 2],
+  ["phoneticAuthor", 1.5],
+  ["source", 1],
+]);
 const ENABLE_FLEXSEARCH_WORKER =
   import.meta.env.VITE_FLEXSEARCH_WORKER === "1";
 // Guard only against a broken/non-advancing index implementation. Production
@@ -82,31 +89,18 @@ const soundexToken = (input: string): string => {
   if (!token) return "";
 
   const first = token[0];
-  const mappings: Record<string, string> = {
-    b: "1",
-    f: "1",
-    p: "1",
-    v: "1",
-    c: "2",
-    g: "2",
-    j: "2",
-    k: "2",
-    q: "2",
-    s: "2",
-    x: "2",
-    z: "2",
-    d: "3",
-    t: "3",
-    l: "4",
-    m: "5",
-    n: "5",
-    r: "6",
-  };
+  const mappings = new Map([
+    ["b", "1"], ["f", "1"], ["p", "1"], ["v", "1"],
+    ["c", "2"], ["g", "2"], ["j", "2"], ["k", "2"],
+    ["q", "2"], ["s", "2"], ["x", "2"], ["z", "2"],
+    ["d", "3"], ["t", "3"], ["l", "4"], ["m", "5"],
+    ["n", "5"], ["r", "6"],
+  ]);
 
   let encoded = first.toUpperCase();
-  let previous = mappings[first] ?? "";
+  let previous = mappings.get(first) ?? "";
   for (let i = 1; i < token.length; i += 1) {
-    const current = mappings[token[i]] ?? "";
+    const current = mappings.get(token[i]) ?? "";
     if (current && current !== previous) {
       encoded += current;
     }
@@ -143,19 +137,13 @@ const toIndexDoc = (item: ItemDocType, tagsText: string): IndexedSearchDoc => {
   };
 };
 
-const toIdString = (entry: unknown): string | null => {
-  if (typeof entry === "string" || typeof entry === "number") return String(entry);
-  if (entry && typeof entry === "object" && "id" in entry) {
-    const idValue = (entry as { id?: unknown }).id;
-    if (typeof idValue === "string" || typeof idValue === "number") return String(idValue);
-  }
-  return null;
-};
+const toIdString = (entry: Id | undefined): string | null =>
+  entry === undefined ? null : String(entry);
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
 export class LocalSearchIndexService {
-  private index: Document<IndexedSearchDoc, any> | null = null;
+  private index: SearchIndex | null = null;
   private buildPromise: Promise<void> | null = null;
   private dirty = true;
   private indexedCount = 0;
@@ -245,8 +233,8 @@ export class LocalSearchIndexService {
     };
   }
 
-  private createIndex(worker: boolean): Document<IndexedSearchDoc, any> {
-    return new Document<IndexedSearchDoc, any>({
+  private createIndex(worker: boolean): SearchIndex {
+    return new Document<IndexedSearchDoc, boolean>({
       tokenize: "forward",
       encoder: Charset.LatinAdvanced,
       resolution: 6,
@@ -271,8 +259,8 @@ export class LocalSearchIndexService {
     });
   }
 
-  private async addBatch(index: Document<IndexedSearchDoc, any>, docs: IndexedSearchDoc[]): Promise<void> {
-    await Promise.all(docs.map((doc) => Promise.resolve((index as any).add(doc))));
+  private async addBatch(index: SearchIndex, documents: IndexedSearchDoc[]): Promise<void> {
+    await Promise.all(documents.map((document) => Promise.resolve(index.add(document))));
   }
 
   private async buildIndexWithMode(worker: boolean): Promise<void> {
@@ -282,14 +270,14 @@ export class LocalSearchIndexService {
     // Neither RxDocuments nor their full text/media JSON are retained for the
     // complete library, and tag joins are restricted to the active page.
     const indexedCount = await forEachIdKeysetPage({
-      collection: db.items as any,
+      collection: db.items,
       selector: { deletedAt: { $eq: 0 } },
       pageSize: SEARCH_INDEX_BUILD_PAGE_SIZE,
-      onPage: async (itemDocs: any[]) => {
-        const itemIds = itemDocs.map((doc) => doc.primary as string).filter(Boolean);
+      onPage: async (itemDocs) => {
+        const itemIds = itemDocs.map((document) => document.primary).filter(Boolean);
         const tagsByItemId = await this.getTagsByItemIds(itemIds, db);
-        const indexDocs = itemDocs.map((doc) => {
-          const item = doc.toMutableJSON() as ItemDocType;
+        const indexDocs = itemDocs.map((document) => {
+          const item = document.toMutableJSON();
           return toIndexDoc(item, (tagsByItemId.get(item.id) || []).join(" "));
         });
         await this.addBatch(index, indexDocs);
@@ -312,10 +300,10 @@ export class LocalSearchIndexService {
       this.pendingItemIdsOverflowed = false;
       const previousIndex = this.index;
       this.index = null;
-      if (previousIndex && typeof (previousIndex as any).clear === "function") {
+      if (previousIndex) {
         // A rebuild can be as large as the live index. Clear the stale copy first
         // so large libraries do not temporarily retain two full text indexes.
-        await Promise.resolve((previousIndex as any).clear());
+        await Promise.resolve(previousIndex.clear());
       }
       if (ENABLE_FLEXSEARCH_WORKER) {
         try {
@@ -395,17 +383,17 @@ export class LocalSearchIndexService {
     const joins = await db.item_tags.find({ selector: { itemId: { $in: itemIds } } }).exec();
     if (joins.length === 0) return map;
 
-    const tagIds = Array.from(new Set(joins.map((join) => join.get("tagId") as string).filter(Boolean)));
+    const tagIds = Array.from(new Set(joins.map((join) => join.get("tagId")).filter(Boolean)));
     const tagDocs =
       tagIds.length > 0 ? await db.tags.find({ selector: { id: { $in: tagIds } } }).exec() : [];
     const tagNameById = new Map<string, string>();
     for (const tag of tagDocs) {
-      tagNameById.set(tag.get("id") as string, (tag.get("name") as string) || "");
+      tagNameById.set(tag.get("id"), tag.get("name") || "");
     }
 
     for (const join of joins) {
-      const itemId = join.get("itemId") as string;
-      const tagId = join.get("tagId") as string;
+      const itemId = join.get("itemId");
+      const tagId = join.get("tagId");
       const tagName = tagNameById.get(tagId);
       if (!tagName) continue;
       const list = map.get(itemId) || [];
@@ -433,7 +421,7 @@ export class LocalSearchIndexService {
             removedIds.add(itemId);
             return null;
           }
-          return doc.toMutableJSON() as ItemDocType;
+          return doc.toMutableJSON();
         })
         .filter((item): item is ItemDocType => !!item);
     } else {
@@ -451,7 +439,7 @@ export class LocalSearchIndexService {
         return 0;
       }
 
-      changedItems = changedDocs.map((doc) => doc.toMutableJSON() as ItemDocType);
+      changedItems = changedDocs.map((doc) => doc.toMutableJSON());
     }
 
     const activeIds = changedItems
@@ -461,16 +449,16 @@ export class LocalSearchIndexService {
     const tagsByItemId = await this.getTagsByItemIds(activeIds);
 
     for (const removedId of removedIds) {
-      await Promise.resolve((this.index as any).remove(removedId));
+      await Promise.resolve(this.index.remove(removedId));
     }
 
     for (const item of changedItems) {
-      await Promise.resolve((this.index as any).remove(item.id));
+      await Promise.resolve(this.index.remove(item.id));
       if ((item.deletedAt || 0) !== 0) {
         continue;
       }
       const indexDoc = toIndexDoc(item, (tagsByItemId.get(item.id) || []).join(" "));
-      await Promise.resolve((this.index as any).add(indexDoc));
+      await Promise.resolve(this.index.add(indexDoc));
     }
 
     this.lastItemSyncAt = Date.now();
@@ -564,7 +552,7 @@ export class LocalSearchIndexService {
   }
 
   private accumulateScores(
-    rawResults: unknown,
+    rawResults: SearchDocumentResults,
     scoreMap: Map<string, number>,
     variantBoost: number,
     includeOcrText: boolean,
@@ -573,19 +561,13 @@ export class LocalSearchIndexService {
     termMatchMasksById?: Map<string, number[]>,
     termMatchIndex = -1
   ) {
-    if (!Array.isArray(rawResults)) return;
-
-    for (const row of rawResults as Array<{ field?: string; result?: unknown[] } | unknown>) {
-      if (!row || typeof row !== "object" || !("result" in row)) {
-        continue;
-      }
-      const typed = row as { field?: string; result?: unknown[] };
+    for (const row of rawResults) {
       // OCR text is a keyword-only signal: only exact keyword variants may match
       // it. Fuzzy variants (prefix + phonetic expansion) skip it, otherwise
       // noisy image-extracted text pollutes fuzzy results.
-      if (!includeOcrText && typed.field === "ocrText") continue;
-      const results = Array.isArray(typed.result) ? typed.result : [];
-      const weight = FIELD_WEIGHTS[typed.field || ""] || 1;
+      if (!includeOcrText && row.field === "ocrText") continue;
+      const results = row.result;
+      const weight = FIELD_WEIGHTS.get(row.field || "") || 1;
       for (let index = 0; index < results.length; index += 1) {
         const id = toIdString(results[index]);
         if (!id) continue;
@@ -603,29 +585,21 @@ export class LocalSearchIndexService {
     }
   }
 
-  private isResultPageSaturated(rawResults: unknown, pageSize: number): boolean {
-    if (!Array.isArray(rawResults)) return false;
-    return rawResults.some((row) => {
-      if (!row || typeof row !== "object" || !("result" in row)) return false;
-      const result = (row as { result?: unknown[] }).result;
-      return Array.isArray(result) && result.length >= pageSize;
-    });
+  private isResultPageSaturated(results: SearchDocumentResults, pageSize: number): boolean {
+    return results.some((row) => row.result.length >= pageSize);
   }
 
-  private getResultPageSignature(rawResults: unknown): string {
-    if (!Array.isArray(rawResults)) return "invalid";
-    return rawResults
+  private getResultPageSignature(results: SearchDocumentResults): string {
+    return results
       .map((row) => {
-        if (!row || typeof row !== "object" || !("result" in row)) return "invalid-row";
-        const typed = row as { field?: string; result?: unknown[] };
-        const results = Array.isArray(typed.result) ? typed.result : [];
-        const middleIndex = Math.floor(results.length / 2);
+        const rowResults = row.result;
+        const middleIndex = Math.floor(rowResults.length / 2);
         return [
-          typed.field || "",
-          results.length,
-          toIdString(results[0]) || "",
-          toIdString(results[middleIndex]) || "",
-          toIdString(results[results.length - 1]) || "",
+          row.field || "",
+          rowResults.length,
+          toIdString(rowResults[0]) || "",
+          toIdString(rowResults[middleIndex]) || "",
+          toIdString(rowResults[rowResults.length - 1]) || "",
         ].join(":");
       })
       .join("|");
@@ -688,7 +662,7 @@ export class LocalSearchIndexService {
         while (pagesRead < MAX_SCOPED_SEARCH_PAGES) {
           throwIfOperationAborted(signal);
           const results = await Promise.resolve(
-            (this.index as any).search(variant.query, {
+            this.index.search(variant.query, {
               limit: resultPageSize,
               offset,
               suggest: variant.suggest,

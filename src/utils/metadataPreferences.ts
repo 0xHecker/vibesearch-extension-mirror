@@ -1,22 +1,30 @@
+import {
+  jsonObject,
+  jsonString,
+  type JsonObject,
+  type JsonValue,
+} from "@src/common/json-value";
+
 export type MetadataPreferenceKey = "title" | "description" | "image";
 
 export type DomainMetadataPreference = Partial<Record<MetadataPreferenceKey, string[]>>;
+export type MetadataPreferences = Record<MetadataPreferenceKey, string[]>;
 
 const stripWhitespace = (value: string): string => value.trim();
 
-export const DEFAULT_METADATA_PREFERENCES: Record<MetadataPreferenceKey, string[]> = {
+export const DEFAULT_METADATA_PREFERENCES: MetadataPreferences = {
   title: ["ogTitle", "twitterTitle", "title"],
   description: ["ogDescription", "twitterDescription", "description"],
   image: ["twitterImage", "ogImage", "image"],
 };
 
-const DOMAIN_METADATA_PREFERENCES: Record<string, DomainMetadataPreference> = {
-  "instagram.com": {
+const DOMAIN_METADATA_PREFERENCES = new Map<string, DomainMetadataPreference>([
+  ["instagram.com", {
     title: ["twitterTitle", "ogTitle", "title"],
     description: ["twitterDescription", "ogDescription", "description"],
     image: ["twitterImage", "ogImage", "image"],
-  },
-};
+  }],
+]);
 
 const normalizeHostname = (host: string): string => host.toLowerCase().replace(/^www\./, "");
 
@@ -29,19 +37,19 @@ const getBaseDomain = (host: string): string => {
 export const getPreferencesForHost = (host: string): DomainMetadataPreference => {
   const normalized = normalizeHostname(host);
   return (
-    DOMAIN_METADATA_PREFERENCES[normalized] ||
-    DOMAIN_METADATA_PREFERENCES[getBaseDomain(normalized)] ||
+    DOMAIN_METADATA_PREFERENCES.get(normalized) ||
+    DOMAIN_METADATA_PREFERENCES.get(getBaseDomain(normalized)) ||
     {}
   );
 };
 
 export const pickStringField = (
-  entry: Record<string, any>,
+  entry: JsonObject,
   fields: string[]
 ): string | undefined => {
   for (const field of fields) {
-    const value = entry[field];
-    if (typeof value === "string") {
+    const value = jsonString(entry[field]);
+    if (value !== undefined) {
       const trimmed = stripWhitespace(value);
       if (trimmed) return trimmed;
     }
@@ -49,22 +57,15 @@ export const pickStringField = (
   return undefined;
 };
 
-const getImageUrl = (val: any): string | undefined => {
-  if (!val) return undefined;
-  if (Array.isArray(val) && val.length > 0 && val[0] && typeof val[0].url === "string") {
-    return val[0].url;
-  }
-  if (typeof val === "object" && !Array.isArray(val) && val.url && typeof val.url === "string") {
-    return val.url;
-  }
-  if (typeof val === "string") {
-    return val;
-  }
-  return undefined;
+const getImageUrl = (value: JsonValue | undefined): string | undefined => {
+  const direct = jsonString(value);
+  if (direct) return direct;
+  const first = Array.isArray(value) ? value[0] : value;
+  return jsonString(jsonObject(first)?.url);
 };
 
 export const pickImageField = (
-  entry: Record<string, any>,
+  entry: JsonObject,
   fields: string[]
 ): string | undefined => {
   for (const field of fields) {
@@ -78,5 +79,5 @@ export const registerDomainMetadataPreference = (
   domain: string,
   preference: DomainMetadataPreference
 ) => {
-  DOMAIN_METADATA_PREFERENCES[normalizeHostname(domain)] = preference;
+  DOMAIN_METADATA_PREFERENCES.set(normalizeHostname(domain), preference);
 };

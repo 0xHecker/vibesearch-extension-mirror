@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { FolderDocType } from "../src/schemas/folder_schema";
 import type { ItemDocType } from "../src/schemas/item_schema";
 import type { SpaceDocType } from "../src/schemas/space_schema";
@@ -85,17 +85,28 @@ const collection = <T,>(rows: T[]) => ({
 
 let db: TestDb;
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => db,
-}));
-
 const {
-  buildLocalExportSnapshot,
-  buildShareSnapshotFromMixed,
-  importSharedSnapshot,
-  mergeBackupSnapshot,
+  buildLocalExportSnapshot: buildLocalExportSnapshotFromSource,
+  buildShareSnapshotFromMixed: buildShareSnapshotFromMixedSource,
+  importSharedSnapshot: importSharedSnapshotFromSource,
+  mergeBackupSnapshot: mergeBackupSnapshotFromSource,
 } = await import("../src/services/share-snapshot");
 const { withSpaceMutationLock } = await import("../src/services/entity-mutation-lock");
+
+const shareSnapshotDependencies = { getDb: async () => db as never };
+const buildShareSnapshotFromMixed = (
+  input: Parameters<typeof buildShareSnapshotFromMixedSource>[0],
+) => buildShareSnapshotFromMixedSource(input, shareSnapshotDependencies);
+const buildLocalExportSnapshot = (
+  payload: Parameters<typeof buildLocalExportSnapshotFromSource>[0] = {},
+  options: Parameters<typeof buildLocalExportSnapshotFromSource>[1] = {},
+) => buildLocalExportSnapshotFromSource(payload, options, shareSnapshotDependencies);
+const importSharedSnapshot = (
+  payload: Parameters<typeof importSharedSnapshotFromSource>[0],
+) => importSharedSnapshotFromSource(payload, shareSnapshotDependencies);
+const mergeBackupSnapshot = (
+  snapshot: Parameters<typeof mergeBackupSnapshotFromSource>[0],
+) => mergeBackupSnapshotFromSource(snapshot, shareSnapshotDependencies);
 
 const now = 1_764_000_000_000;
 

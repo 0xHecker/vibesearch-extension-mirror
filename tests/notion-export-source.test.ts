@@ -1,4 +1,4 @@
-import { expect, mock, test } from "bun:test";
+import { expect, test } from "bun:test";
 
 type Row = { id: string; [key: string]: unknown };
 
@@ -88,11 +88,12 @@ const db = {
   tags: collection([{ id: "tag-a", name: "Design" }]),
 };
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => db,
-}));
-
-const { loadNotionExportBatch } = await import("../src/services/notion-export-source");
+const { loadNotionExportBatch: loadNotionExportBatchFromSource } = await import(
+  "../src/services/notion-export-source"
+);
+const loadNotionExportBatch = (
+  payload: Parameters<typeof loadNotionExportBatchFromSource>[0] = {},
+) => loadNotionExportBatchFromSource(payload, { getDb: async () => db as never });
 
 test("Notion export batches include live content and portable organization metadata", async () => {
   const batch = await loadNotionExportBatch({ limit: 1 });

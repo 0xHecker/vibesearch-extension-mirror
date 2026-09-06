@@ -11,7 +11,6 @@ type AccessContext = {
 };
 
 export class TagsController {
-  [key: string]: any;
 
   private normalizeName(name: string): string {
     return name.trim().slice(0, 100);

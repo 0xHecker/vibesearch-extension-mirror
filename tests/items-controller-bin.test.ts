@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { FolderDocType } from "../src/schemas/folder_schema";
 import type { ItemDocType } from "../src/schemas/item_schema";
 import type { SpaceDocType } from "../src/schemas/space_schema";
@@ -144,11 +144,7 @@ const db = {
   items: collection(items),
 };
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => db,
-}));
-
-const { ItemsController, itemsController } = await import("../src/services/controllers/items.controller");
+const { ItemsController } = await import("../src/services/controllers/items.controller");
 const { SpacesController } = await import("../src/services/controllers/spaces.controller");
 const {
   deleteUnreferencedOpfsFiles,
@@ -156,6 +152,15 @@ const {
 } = await import(
   "../src/services/opfs-media-lifecycle"
 );
+
+const getTestDb = async () => db as never;
+const createItemsController = (
+  options: NonNullable<ConstructorParameters<typeof ItemsController>[0]> = {},
+) => new ItemsController({ ...options, getDb: getTestDb });
+const createSpacesController = (
+  options: NonNullable<ConstructorParameters<typeof SpacesController>[0]> = {},
+) => new SpacesController({ ...options, getDb: getTestDb });
+const itemsController = createItemsController();
 
 const makeSpace = (id: string): SpaceDocType =>
   ({
@@ -227,7 +232,7 @@ const testOpfsIdentity = {
 };
 
 const promotionController = () =>
-  new ItemsController({
+  createItemsController({
     readOpfsFileIdentity: async () => testOpfsIdentity,
   });
 
@@ -290,8 +295,8 @@ describe("item bin restore", () => {
     };
 
     try {
-      const restoreController = new ItemsController();
-      const deleteController = new ItemsController();
+      const restoreController = createItemsController();
+      const deleteController = createItemsController();
       const restorePromise = restoreController.restoreFromBin({ id: "tab-race" });
       await restorePatchStarted.promise;
       const deletePromise = deleteController.deleteForever({
@@ -334,8 +339,8 @@ describe("item bin restore", () => {
     };
 
     try {
-      const deleteController = new ItemsController();
-      const restoreController = new ItemsController();
+      const deleteController = createItemsController();
+      const restoreController = createItemsController();
       const deletePromise = deleteController.deleteForever({
         id: "tab-race",
         expectedDeletedAt: now,
@@ -364,7 +369,7 @@ describe("item bin restore", () => {
     };
 
     try {
-      const controller = new ItemsController({
+      const controller = createItemsController({
         deleteUnreferencedOpfsItemDirectories: async () => {
           cleanupCalls += 1;
           return [];
@@ -386,7 +391,7 @@ describe("item bin restore", () => {
     items.splice(0, items.length, makeItem("remove-succeeds", "folder-a"));
     let itemExistedDuringCleanup = true;
 
-    const controller = new ItemsController({
+    const controller = createItemsController({
       deleteUnreferencedOpfsItemDirectories: async () => {
         itemExistedDuringCleanup = items.some((item) => item.id === "remove-succeeds");
         return ["remove-succeeds"];
@@ -406,7 +411,7 @@ describe("item bin restore", () => {
     const originalDateNow = Date.now;
     Date.now = () => now;
     try {
-      const controller = new ItemsController();
+      const controller = createItemsController();
       await expect(controller.restoreFromBin({ id: "tab-aba" })).resolves.toMatchObject({
         success: true,
       });
@@ -441,9 +446,9 @@ describe("item bin restore", () => {
     };
 
     try {
-      const softDeletePromise = new ItemsController().delete({ id: "tab-rebin-race" });
+      const softDeletePromise = createItemsController().delete({ id: "tab-rebin-race" });
       await rebinPatchStarted.promise;
-      const hardDeletePromise = new ItemsController().deleteForever({
+      const hardDeletePromise = createItemsController().deleteForever({
         id: "tab-rebin-race",
         expectedDeletedAt: now,
       });
@@ -504,7 +509,7 @@ describe("item live destination writes", () => {
     let afterId = "";
     let pageCount = 0;
     while (true) {
-      const page = await new ItemsController().listItemsWithOpfsMedia({
+      const page = await createItemsController().listItemsWithOpfsMedia({
         afterId,
         limit: 37,
       });
@@ -613,7 +618,7 @@ describe("item live destination writes", () => {
         ],
       });
       await promotionPatchStarted.promise;
-      const addPromise = new ItemsController().addMedia({
+      const addPromise = createItemsController().addMedia({
         id: item.id,
         url: "https://example.com/b.png",
         type: "image",
@@ -674,7 +679,7 @@ describe("item live destination writes", () => {
         },
       ],
     });
-    const result = await new ItemsController().updateMedia({
+    const result = await createItemsController().updateMedia({
       id: item.id,
       expectedMedia: originalMedia,
       media: [
@@ -716,7 +721,7 @@ describe("item live destination writes", () => {
     };
 
     try {
-      const result = await new ItemsController().removeMedia({
+      const result = await createItemsController().removeMedia({
         id: item.id,
         index: 0,
       });
@@ -772,7 +777,7 @@ describe("item live destination writes", () => {
     ];
     items.splice(0, items.length, item);
 
-    const result = await new ItemsController({
+    const result = await createItemsController({
       readOpfsFileIdentity: async () => ({
         ...testOpfsIdentity,
         sampleSha256: "restored-file",
@@ -854,7 +859,7 @@ describe("item live destination writes", () => {
     source.displayImageUrl = "media/copy-source/local.png";
     items.splice(0, items.length, source);
 
-    const result = await new ItemsController({
+    const result = await createItemsController({
       cloneOpfsMediaEntriesForItem: async (media, destinationItemId) => ({
         media: (media || []).map((entry) => ({
           ...entry,
@@ -881,7 +886,7 @@ describe("item live destination writes", () => {
     items.splice(0, items.length);
 
     await expect(
-      new ItemsController().addToFolder({
+      createItemsController().addToFolder({
         folderId: "folder-binned",
         url: "https://example.com/new",
       })
@@ -898,7 +903,7 @@ describe("item live destination writes", () => {
     items.splice(0, items.length);
 
     await expect(
-      new ItemsController().addToFolder({
+      createItemsController().addToFolder({
         folderId: "child-live",
         url: "https://example.com/under-binned-parent",
       })
@@ -920,10 +925,10 @@ describe("item live destination writes", () => {
     };
 
     try {
-      const binPromise = new SpacesController({ getDb: async () => db, now: () => now + 10 })
+      const binPromise = createSpacesController({ getDb: async () => db, now: () => now + 10 })
         .moveToBin({ id: "space-a" });
       await binPatchStarted.promise;
-      const savePromise = new ItemsController().addToFolder({
+      const savePromise = createItemsController().addToFolder({
         folderId: "folder-a",
         url: "https://example.com/race-save",
       });
@@ -968,10 +973,10 @@ describe("item live destination writes", () => {
     };
 
     try {
-      const binPromise = new SpacesController({ getDb: async () => db, now: () => now + 10 })
+      const binPromise = createSpacesController({ getDb: async () => db, now: () => now + 10 })
         .moveToBin({ id: "space-target" });
       await binPatchStarted.promise;
-      const movePromise = new ItemsController().moveToFolder({
+      const movePromise = createItemsController().moveToFolder({
         itemIds: ["moving-item"],
         targetFolderId: "folder-target",
       });
@@ -1007,7 +1012,7 @@ describe("item live destination writes", () => {
     );
 
     await expect(
-      new ItemsController().reorder({
+      createItemsController().reorder({
         folders: [{ folderId: "folder-a", orderedIds: ["item-b", "item-a"] }],
       })
     ).resolves.toEqual({ updated: 1 });
@@ -1025,7 +1030,7 @@ describe("item live destination writes", () => {
     items.splice(0, items.length, makeItem("private-move", "folder-a", 0));
 
     await expect(
-      new ItemsController().moveToSpace({
+      createItemsController().moveToSpace({
         itemIds: ["private-move"],
         targetSpaceId: PRIVATE_SPACE_ID,
       })
@@ -1057,9 +1062,9 @@ describe("item live destination writes", () => {
     };
 
     try {
-      const deletePromise = new ItemsController().delete({ id: "delete-during-move" });
+      const deletePromise = createItemsController().delete({ id: "delete-during-move" });
       await deletePatchStarted.promise;
-      const movePromise = new ItemsController().moveToSpace({
+      const movePromise = createItemsController().moveToSpace({
         itemIds: ["delete-during-move"],
         targetSpaceId: "space-b",
       });

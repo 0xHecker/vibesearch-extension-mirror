@@ -33,7 +33,6 @@ const sendProcessStatus = (payload: {
 };
 
 class SyncService {
-  [key: string]: any;
   private isSyncing = false;
   private readonly tempFileName = "vectors.tmp";
   private readonly backupFileName = "vectors.bak";

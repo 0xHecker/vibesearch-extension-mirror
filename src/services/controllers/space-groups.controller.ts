@@ -10,8 +10,24 @@ const buildId = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 
 export type SpaceGroupListItem = SpaceGroupDocType;
 
+export type SpaceGroupsControllerOptions = {
+  getDb?: typeof getDb;
+  moveSpaceToBin?: typeof spacesController.moveToBin;
+};
+
 export class SpaceGroupsController {
-  [key: string]: any;
+
+  constructor(private readonly options: SpaceGroupsControllerOptions = {}) {}
+
+  private getDatabase(): ReturnType<typeof getDb> {
+    return (this.options.getDb ?? getDb)();
+  }
+
+  private moveSpaceToBin(payload: { id: string }): ReturnType<typeof spacesController.moveToBin> {
+    return this.options.moveSpaceToBin
+      ? this.options.moveSpaceToBin(payload)
+      : spacesController.moveToBin(payload);
+  }
 
   private collectSpaceGroupTreeIds(groups: SpaceGroupDocType[], rootId: string): Set<string> {
     const ids = new Set<string>([rootId]);
@@ -30,15 +46,15 @@ export class SpaceGroupsController {
   }
 
   async listSpaceGroups(): Promise<SpaceGroupListItem[]> {
-    const db = await getDb();
+    const db = await this.getDatabase();
     const docs = await db.space_groups.find().exec();
     return docs
-      .map((doc) => doc.toMutableJSON() as SpaceGroupDocType)
+      .map((doc) => doc.toMutableJSON())
       .sort((left, right) => left.sortOrder - right.sortOrder || left.createdAt - right.createdAt);
   }
 
   async createSpaceGroup(payload: { name: string }): Promise<SpaceGroupDocType> {
-    const db = await getDb();
+    const db = await this.getDatabase();
     const name = normalizeSpaceName(payload.name || "");
     if (!name) throw new Error("SPACE_GROUP_NAME_REQUIRED");
 
@@ -62,7 +78,7 @@ export class SpaceGroupsController {
   }
 
   async renameSpaceGroup(payload: { id: string; name: string }): Promise<{ success: boolean }> {
-    const db = await getDb();
+    const db = await this.getDatabase();
     const doc = await db.space_groups.findOne(payload.id).exec();
     if (!doc) return { success: false };
     const name = normalizeSpaceName(payload.name || "");
@@ -78,7 +94,7 @@ export class SpaceGroupsController {
   }
 
   async setCollapsed(payload: { id: string; value: boolean }): Promise<{ success: boolean }> {
-    const db = await getDb();
+    const db = await this.getDatabase();
     const doc = await db.space_groups.findOne(payload.id).exec();
     if (!doc) return { success: false };
     await doc.patch({ isCollapsed: payload.value, updatedAt: Date.now() });
@@ -86,7 +102,7 @@ export class SpaceGroupsController {
   }
 
   async resolveDropSpace(payload: { spaceGroupId: string }): Promise<SpaceDocType> {
-    const db = await getDb();
+    const db = await this.getDatabase();
     const group = await db.space_groups.findOne(payload.spaceGroupId).exec();
     if (!group) throw new Error("SPACE_GROUP_NOT_FOUND");
 
@@ -100,13 +116,13 @@ export class SpaceGroupsController {
       })
       .exec();
     const firstSpace = spaces
-      .map((doc) => doc.toMutableJSON() as SpaceDocType)
+      .map((doc) => doc.toMutableJSON())
       .filter((space) => space.deletedAt === 0 && space.isArchived === false)
       .sort((left, right) => left.sortOrder - right.sortOrder || left.createdAt - right.createdAt)[0];
     if (firstSpace) return firstSpace;
 
     const now = Date.now();
-    const groupName = group.get("name") as string;
+    const groupName = group.toMutableJSON().name;
     const space: SpaceDocType = {
       id: buildId("space"),
       name: `${groupName} inbox`.slice(0, 80),
@@ -136,7 +152,7 @@ export class SpaceGroupsController {
     id: string;
     mode?: "moveToUngrouped" | "deleteContents";
   }): Promise<{ success: boolean; affectedSpaces: number }> {
-    const db = await getDb();
+    const db = await this.getDatabase();
     const id = (payload.id || "").trim();
     const mode = payload.mode || "deleteContents";
     if (!id) return { success: false, affectedSpaces: 0 };
@@ -144,7 +160,7 @@ export class SpaceGroupsController {
     if (!groupDoc) return { success: false, affectedSpaces: 0 };
 
     const groupDocs = await db.space_groups.find().exec();
-    const groups = groupDocs.map((doc) => doc.toMutableJSON() as SpaceGroupDocType);
+    const groups = groupDocs.map((doc) => doc.toMutableJSON());
     const targetGroupIds = this.collectSpaceGroupTreeIds(groups, id);
     const children = await db.spaces
       .find({ selector: { spaceGroupId: { $in: Array.from(targetGroupIds) } } })
@@ -156,7 +172,7 @@ export class SpaceGroupsController {
       for (const child of children) {
         const spaceId = child.primary;
         try {
-          await spacesController.moveToBin({ id: spaceId });
+          await this.moveSpaceToBin({ id: spaceId });
           await child.patch({ spaceGroupId: UNGROUPED_SPACE_GROUP_ID, updatedAt: now });
         } catch (childError) {
           console.error("[SpaceGroups] failed to move group child to bin", childError);
@@ -184,7 +200,7 @@ export class SpaceGroupsController {
   }
 
   async reorderSpaceGroups(payload: { orderedIds: string[] }): Promise<{ success: boolean }> {
-    const db = await getDb();
+    const db = await this.getDatabase();
     const docs = await db.space_groups.find().exec();
     const allIds = docs.map((doc) => doc.primary);
     const provided = (payload.orderedIds || []).filter((id) => id && allIds.includes(id));
@@ -194,7 +210,7 @@ export class SpaceGroupsController {
       const id = finalOrder[i];
       const doc = await db.space_groups.findOne(id).exec();
       if (!doc) continue;
-      const currentOrder = doc.get("sortOrder") as number | undefined;
+      const currentOrder = doc.toMutableJSON().sortOrder;
       if (currentOrder !== i) {
         await doc.patch({ sortOrder: i, updatedAt: now });
       }

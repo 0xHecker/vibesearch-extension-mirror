@@ -1,32 +1,44 @@
-import { countRxQuerySubscribers, uncacheRxQuery } from "rxdb";
+import { jsonString, type JsonValue } from "@src/common/json-value";
+import {
+  countRxQuerySubscribers,
+  uncacheRxQuery,
+  type QueryCache,
+  type RxQuery,
+} from "rxdb";
 
-type RxDocumentWithId = {
+export type RxDocumentWithId = {
   primary?: string;
-  get?: (field: string) => unknown;
+  get?: (field: string) => JsonValue | undefined;
 };
 
-type KeysetQuery<Document> = {
-  exec: () => Promise<Document[]>;
+export type KeysetQuery<Result> = {
+  exec: () => Promise<Result>;
 };
 
-type KeysetCollection<Document extends RxDocumentWithId> = {
-  _queryCache?: unknown;
+export type KeysetCollection<Document extends RxDocumentWithId, Selector extends object> = {
+  _queryCache?: QueryCache;
   find: (query: {
-    selector: Record<string, unknown>;
+    selector: Selector;
     sort: Array<{ id: "asc" }>;
     limit: number;
-  }) => KeysetQuery<Document>;
+  }) => KeysetQuery<Document[]>;
 };
 
-const releaseOneShotQuery = (collection: KeysetCollection<any>, query: KeysetQuery<any>): void => {
+const releaseOneShotQuery = <Document extends RxDocumentWithId, Selector extends object, Result>(
+  collection: KeysetCollection<Document, Selector>,
+  query: KeysetQuery<Result>,
+): void => {
   const queryCache = collection._queryCache;
   if (!queryCache) return;
   try {
     // RxDB's query cache otherwise retains each distinct cursor page and its
     // complete RxDocuments. Keyset scans are one-shot, but never evict a query
     // that another caller happened to subscribe to.
-    if (countRxQuerySubscribers(query as any) === 0) {
-      uncacheRxQuery(queryCache as any, query as any);
+    // SAFETY: A collection exposing RxDB's private query cache creates RxQuery
+    // instances from `find`; test doubles omit `_queryCache` and never enter here.
+    const rxQuery = query as RxQuery;
+    if (countRxQuerySubscribers(rxQuery) === 0) {
+      uncacheRxQuery(queryCache, rxQuery);
     }
   } catch {
     // Cache eviction is a memory optimization; query correctness must not
@@ -36,14 +48,18 @@ const releaseOneShotQuery = (collection: KeysetCollection<any>, query: KeysetQue
 
 /** Execute a bounded ad-hoc RxDB query without pinning every unique selector in
  * the query cache for the lifetime of the offscreen document. */
-export const execAndReleaseOneShotQuery = async <Result>(
-  collection: KeysetCollection<any>,
-  query: { exec: () => Promise<Result> },
+export const execAndReleaseOneShotQuery = async <
+  Document extends RxDocumentWithId,
+  Selector extends object,
+  Result,
+>(
+  collection: KeysetCollection<Document, Selector>,
+  query: KeysetQuery<Result>,
 ): Promise<Result> => {
   try {
     return await query.exec();
   } finally {
-    releaseOneShotQuery(collection, query as KeysetQuery<any>);
+    releaseOneShotQuery(collection, query);
   }
 };
 
@@ -57,18 +73,21 @@ export const throwIfOperationAborted = (signal?: AbortSignal): void => {
 };
 
 const documentId = (document: RxDocumentWithId): string => {
-  if (typeof document.primary === "string" && document.primary) return document.primary;
-  const id = document.get?.("id");
-  return typeof id === "string" ? id : "";
+  if (document.primary) return document.primary;
+  return jsonString(document.get?.("id")) ?? "";
 };
 
-const selectorAfterId = (
-  selector: Record<string, unknown>,
+const selectorAfterId = <Selector extends object>(
+  selector: Selector,
   afterId: string
-): Record<string, unknown> => {
+): Selector => {
   if (!afterId) return { ...selector };
-  if (selector.id === undefined) return { ...selector, id: { $gt: afterId } };
-  return { $and: [selector, { id: { $gt: afterId } }] };
+  const cursorSelector = "id" in selector
+    ? { $and: [selector, { id: { $gt: afterId } }] }
+    : { ...selector, id: { $gt: afterId } };
+  // SAFETY: Both shapes are valid Mango selectors; the primary-key clause only
+  // narrows the caller's selector and preserves its document schema.
+  return cursorSelector as Selector;
 };
 
 /**
@@ -77,9 +96,9 @@ const selectorAfterId = (
  * empty request, which keeps both retained documents and message payloads
  * bounded without reading a lookahead document.
  */
-export const readIdKeysetPage = async <Document extends RxDocumentWithId>(options: {
-  collection: KeysetCollection<Document>;
-  selector: Record<string, unknown>;
+export const readIdKeysetPage = async <Document extends RxDocumentWithId, Selector extends object>(options: {
+  collection: KeysetCollection<Document, Selector>;
+  selector: Selector;
   pageSize: number;
   afterId?: string;
   signal?: AbortSignal;
@@ -121,9 +140,9 @@ export const readIdKeysetPage = async <Document extends RxDocumentWithId>(option
  * Pages are ordered by primary key and advance with `id > lastId`, so records
  * are neither duplicated nor skipped in a stable snapshot.
  */
-export const forEachIdKeysetPage = async <Document extends RxDocumentWithId>(options: {
-  collection: KeysetCollection<Document>;
-  selector: Record<string, unknown>;
+export const forEachIdKeysetPage = async <Document extends RxDocumentWithId, Selector extends object>(options: {
+  collection: KeysetCollection<Document, Selector>;
+  selector: Selector;
   pageSize: number;
   onPage: (documents: Document[]) => void | Promise<void>;
   signal?: AbortSignal;

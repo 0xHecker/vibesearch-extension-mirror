@@ -1,7 +1,5 @@
 import { getDb } from "@src/services/DatabaseService";
 import type { FolderDocType } from "@src/schemas/folder_schema";
-import type { ItemDocType } from "@src/schemas/item_schema";
-import type { ItemTagDocType } from "@src/schemas/item_tag_schema";
 import type { SpaceDocType } from "@src/schemas/space_schema";
 import type { TagDocType } from "@src/schemas/tag_schema";
 import {
@@ -33,8 +31,12 @@ export type NotionExportBatch = {
   hasMore: boolean;
 };
 
-const clippedText = (value: unknown, maxLength: number): string => {
-  if (typeof value !== "string") return "";
+export type NotionExportDependencies = {
+  getDb?: typeof getDb;
+};
+
+const clippedText = (value: string | null | undefined, maxLength: number): string => {
+  if (!value) return "";
   // Avoid duplicating an arbitrarily large captured page just to produce a
   // short Notion excerpt.
   const boundedInput = value.length > maxLength * 2 ? value.slice(0, maxLength * 2) : value;
@@ -43,11 +45,10 @@ const clippedText = (value: unknown, maxLength: number): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
-const documentsById = <T>(rows: Map<string, unknown>): Map<string, T> => {
+const documentsById = <T>(rows: Map<string, { toMutableJSON(): T }>): Map<string, T> => {
   const result = new Map<string, T>();
   for (const [id, document] of rows) {
-    const mutable = (document as { toMutableJSON?: () => T })?.toMutableJSON?.();
-    if (mutable) result.set(id, mutable);
+    result.set(id, document.toMutableJSON());
   }
   return result;
 };
@@ -55,16 +56,16 @@ const documentsById = <T>(rows: Map<string, unknown>): Map<string, T> => {
 export async function loadNotionExportBatch(payload: {
   afterId?: string;
   limit?: number;
-} = {}): Promise<NotionExportBatch> {
-  const db = await getDb();
+} = {}, dependencies: NotionExportDependencies = {}): Promise<NotionExportBatch> {
+  const db = await (dependencies.getDb ?? getDb)();
   const limit = Math.max(1, Math.min(NOTION_EXPORT_BATCH_SIZE, Math.floor(payload.limit || NOTION_EXPORT_BATCH_SIZE)));
   const page = await readIdKeysetPage({
     collection: db.items,
     selector: { deletedAt: { $eq: 0 } },
     pageSize: limit,
-    afterId: typeof payload.afterId === "string" ? payload.afterId : "",
+    afterId: payload.afterId ?? "",
   });
-  const itemRows = page.documents.map((document) => document.toMutableJSON() as ItemDocType);
+  const itemRows = page.documents.map((document) => document.toMutableJSON());
   if (itemRows.length === 0) {
     return { items: [], nextCursor: null, hasMore: false };
   }
@@ -80,15 +81,15 @@ export async function loadNotionExportBatch(payload: {
     execAndReleaseOneShotQuery(db.spaces, spaceQuery),
     execAndReleaseOneShotQuery(db.item_tags, itemTagQuery),
   ]);
-  const folders = documentsById<FolderDocType>(folderDocuments as Map<string, unknown>);
-  const spaces = documentsById<SpaceDocType>(spaceDocuments as Map<string, unknown>);
-  const itemTags = itemTagDocuments.map((document) => document.toMutableJSON() as ItemTagDocType);
+  const folders = documentsById<FolderDocType>(folderDocuments);
+  const spaces = documentsById<SpaceDocType>(spaceDocuments);
+  const itemTags = itemTagDocuments.map((document) => document.toMutableJSON());
   const tagIds = Array.from(new Set(itemTags.map((join) => join.tagId).filter(Boolean)));
   const tagQuery = db.tags.findByIds(tagIds);
   const tags = documentsById<TagDocType>(await execAndReleaseOneShotQuery(
     db.tags,
     tagQuery,
-  ) as Map<string, unknown>);
+  ));
   const tagNamesByItem = new Map<string, string[]>();
   for (const join of itemTags) {
     const name = clippedText(tags.get(join.tagId)?.name, 100);
@@ -103,12 +104,11 @@ export async function loadNotionExportBatch(payload: {
       item.summary || item.ai?.summary || item.textContent || item.ocrText,
       1_800,
     );
-    return {
+    const exportItem: NotionExportItem = {
       id: item.id,
       title: clippedText(item.title || item.url || "Untitled", 600),
       url: clippedText(item.url, 2_000),
       source: clippedText(item.source, 80),
-      ...(item.type ? { type: clippedText(item.type, 100) } : {}),
       spaceName: clippedText(spaces.get(item.spaceId)?.name || "Unfiled", 200),
       folderName: clippedText(folders.get(item.folderId)?.name || "Unfiled", 200),
       tags: (tagNamesByItem.get(item.id) || []).sort((left, right) => left.localeCompare(right)),
@@ -117,6 +117,8 @@ export async function loadNotionExportBatch(payload: {
       createdAt: Number.isSafeInteger(item.createdAt) ? item.createdAt : 0,
       updatedAt: Number.isSafeInteger(item.updatedAt) ? item.updatedAt : 0,
     };
+    if (item.type) exportItem.type = clippedText(item.type, 100);
+    return exportItem;
   });
   return {
     items,

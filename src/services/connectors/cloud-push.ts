@@ -1,5 +1,5 @@
 /**
- * cloud-sync.service.ts
+ * Connector cloud push
  *
  * Extension → Cloud **unidirectional** sync. The extension is the source of
  * truth; this module *forwards* captured/imported content to the web-app backend
@@ -9,11 +9,17 @@
  * each item carries a stable `externalId` (e.g. `x:<tweetId>`); we remember which
  * ids we've pushed so a re-sync doesn't duplicate.
  */
-import { getCloudAuthToken } from "./cloud-auth";
+import { getCloudAuthToken } from "@src/services/cloud-auth";
+import {
+  jsonObject,
+  jsonString,
+  tryReadJsonResponse,
+} from "@src/common/json-value";
 import {
   CLOUD_SYNC_API_BASE_KEY,
   DEFAULT_VIBESEARCH_API_BASE,
-} from "./cloud-config";
+} from "@src/services/cloud-config";
+import { z } from "zod";
 
 export class ConnectorCloudAuthError extends Error {
   constructor(message: string) {
@@ -25,9 +31,7 @@ export class ConnectorCloudAuthError extends Error {
 const resolveConnectorApiBase = async (): Promise<string> => {
   try {
     const row = await chrome.storage.local.get(CLOUD_SYNC_API_BASE_KEY);
-    const configured = typeof row?.[CLOUD_SYNC_API_BASE_KEY] === "string"
-      ? row[CLOUD_SYNC_API_BASE_KEY].trim().replace(/\/+$/, "")
-      : "";
+    const configured = jsonString(row?.[CLOUD_SYNC_API_BASE_KEY])?.trim().replace(/\/+$/, "") ?? "";
     return configured || DEFAULT_VIBESEARCH_API_BASE;
   } catch {
     return DEFAULT_VIBESEARCH_API_BASE;
@@ -58,45 +62,127 @@ export interface CapturedCreator {
   verified?: boolean;
 }
 
+export interface CapturedStats {
+  likes?: number;
+  upvotes?: number;
+  replies?: number;
+  comments?: number;
+  reposts?: number;
+  views?: number;
+  saves?: number;
+  shares?: number;
+}
+
+export interface CapturedCommunity {
+  id?: string;
+  name?: string;
+  iconUrl?: string;
+  url?: string;
+}
+
+export interface CapturedQuotedPost {
+  url?: string;
+  text?: string;
+  author?: CapturedCreator;
+}
+
+export interface CapturedInlineImage {
+  url: string;
+  width?: number;
+  height?: number;
+  altText?: string;
+}
+
+export interface CapturedInlineVideo {
+  url: string;
+  thumbnailUrl?: string;
+  durationSec?: number;
+}
+
+export interface CapturedSourceInline {
+  id: string;
+  title: string;
+  description: string;
+  author?: CapturedCreator;
+  postedAt?: number;
+  stats?: CapturedStats;
+  community?: CapturedCommunity;
+  language?: string;
+  hashtags?: string[];
+  mentions?: string[];
+  quotedPost?: CapturedQuotedPost;
+  flair?: string;
+  crosspostOrigin?: string;
+  domain?: string;
+  postKind?: string;
+  conversationId?: string;
+  location?: { name: string };
+  audio?: { title: string };
+  mediaKind?: string;
+  images?: CapturedInlineImage[];
+  videos?: CapturedInlineVideo[];
+}
+
+export interface CapturedItemFields {
+  externalId: string;
+  connector: string;
+  postedAt?: number;
+  comments?: number;
+  replies?: number;
+  reposts?: number;
+  views?: number;
+  saves?: number;
+  shares?: number;
+  community?: string;
+  subredditId?: string;
+  hashtags?: string[];
+  mentions?: string[];
+  flair?: string;
+  crosspostOrigin?: string;
+  linkedDomain?: string;
+  postKind?: string;
+  conversationId?: string;
+  location?: string;
+  originalAudio?: string;
+  mediaKind?: string;
+}
+
+export interface CapturedSocialMetadata {
+  platform: string;
+  postId?: string;
+  author?: CapturedCreator;
+  community?: CapturedCommunity;
+  postedAt?: number;
+  language?: string;
+  stats?: CapturedStats;
+  parentUrl?: string;
+  quotedPost?: CapturedQuotedPost;
+}
+
+export interface CapturedProvenance {
+  method?: "extension" | "import";
+  importer?: string;
+  externalId?: string;
+  capturedAt?: number;
+  importedAt?: number;
+}
+
+export interface CapturedSourceRecord {
+  id: string;
+  provider: string;
+  kind: "api";
+  adapterVersion: string;
+  canonicalUrl?: string;
+  externalId?: string;
+  fetchedAt?: number;
+  inline: CapturedSourceInline;
+}
+
 export interface CapturedItemMetadata {
   schemaVersion: 1;
-  social?: {
-    platform: string;
-    postId?: string;
-    author?: CapturedCreator;
-    community?: { id?: string; name?: string; iconUrl?: string; url?: string };
-    postedAt?: number;
-    language?: string;
-    stats?: {
-      likes?: number;
-      upvotes?: number;
-      replies?: number;
-      comments?: number;
-      reposts?: number;
-      views?: number;
-      saves?: number;
-      shares?: number;
-    };
-    parentUrl?: string;
-    quotedPost?: { url?: string; text?: string; author?: CapturedCreator };
-  };
-  provenance?: {
-    method?: "extension" | "import";
-    importer?: string;
-    externalId?: string;
-    capturedAt?: number;
-    importedAt?: number;
-  };
-  sourceRecords?: Array<{
-    id: string;
-    provider: string;
-    kind: "api";
-    adapterVersion: string;
-    canonicalUrl?: string;
-    externalId?: string;
-    fetchedAt?: number;
-    inline: Record<string, unknown>;
-  }>;
+  social?: CapturedSocialMetadata;
+  provenance?: CapturedProvenance;
+  sourceRecords?: CapturedSourceRecord[];
 }
 
 /** Neutral shape a connector/capture produces; mapped to the API item on push. */
@@ -117,7 +203,7 @@ export interface CapturedItem {
   /** @deprecated kept only for callers compiled against the earlier shape. */
   createdAt?: number;
   folderId?: string;
-  fields?: Record<string, unknown>;
+  fields?: CapturedItemFields;
   metadata?: CapturedItemMetadata;
 }
 
@@ -129,12 +215,13 @@ export interface CloudPushResult {
 
 const PUSHED_KEY = "vibesearch:pushedExternalIds";
 const PUSHED_CAP = 20000; // keep the dedupe set bounded
+const pushedIdsSchema = z.array(z.string());
 
 async function loadPushedIds(): Promise<Set<string>> {
   try {
     const row = await chrome.storage.local.get(PUSHED_KEY);
-    const arr = row?.[PUSHED_KEY];
-    return new Set(Array.isArray(arr) ? (arr as string[]) : []);
+    const parsed = pushedIdsSchema.safeParse(row?.[PUSHED_KEY]);
+    return new Set(parsed.success ? parsed.data : []);
   } catch {
     return new Set();
   }
@@ -150,8 +237,44 @@ async function savePushedIds(ids: Set<string>): Promise<void> {
   }
 }
 
+export interface CloudItemMediaBody {
+  type: CapturedMedia["type"];
+  originalUrl: string;
+  storageType: NonNullable<CapturedMedia["storageType"]>;
+  thumbnailUrl?: string;
+  id?: string;
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  durationSec?: number;
+  altText?: string;
+  provider?: string;
+  externalId?: string;
+}
+
+export interface CloudItemCreateBody {
+  url: string;
+  title: string;
+  textContent: string;
+  source: string;
+  type: string;
+  authorUsername?: string;
+  likes?: number;
+  upvotes?: number;
+  media: CloudItemMediaBody[];
+  folderId: string;
+  fields: CapturedItemFields;
+  metadata?: CapturedItemMetadata;
+}
+
 /** Map a neutral CapturedItem to the `vibesearch-api` item-create body. */
-export function toItemBody(item: CapturedItem): Record<string, unknown> {
+export function toItemBody(item: CapturedItem): CloudItemCreateBody {
+  const fields: CapturedItemFields = item.fields
+    ? { ...item.fields }
+    : { externalId: item.externalId, connector: "capture" };
+  fields.externalId = item.externalId;
+  if (item.postedAt !== undefined) fields.postedAt = item.postedAt;
+
   return {
     url: item.url,
     title: item.title,
@@ -176,11 +299,7 @@ export function toItemBody(item: CapturedItem): Record<string, unknown> {
       externalId: m.externalId,
     })),
     folderId: item.folderId ?? "",
-    fields: {
-      ...(item.fields ?? {}),
-      externalId: item.externalId,
-      ...(item.postedAt !== undefined ? { postedAt: item.postedAt } : {}),
-    },
+    fields,
     metadata: item.metadata,
   };
 }
@@ -230,8 +349,9 @@ export async function pushCapturedItems(
         console.warn(`[Vibesearch · Cloud] ✗ ${res.status} for`, item.url);
         failed += 1;
       } else {
-        const created = (await res.json().catch(() => null)) as { id?: string } | null;
-        console.log(`[Vibesearch · Cloud] ← created ${created?.id ?? "?"}`, { title: item.title, url: item.url });
+        const created = jsonObject(await tryReadJsonResponse(res));
+        const createdId = jsonString(created?.id) ?? "?";
+        console.log(`[Vibesearch · Cloud] ← created ${createdId}`, { title: item.title, url: item.url });
         pushed += 1;
         if (item.externalId) pushedIds.add(item.externalId);
       }

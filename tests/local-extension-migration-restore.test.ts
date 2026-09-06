@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 type Row = Record<string, unknown> & { id: string };
 type CollectionName =
@@ -26,19 +26,9 @@ const collectionNames: CollectionName[] = [
 
 let db: ReturnType<typeof makeDb>;
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => db,
-}));
-
-mock.module("@src/services/media-storage", () => ({
-  readOpfsFile: async () => null,
-  saveMediaToOpfs: async () => {},
-  withOpfsMutationLock: async <T>(work: () => Promise<T>) => work(),
-}));
-
 const {
-  buildLocalExtensionMigrationBundle,
-  restoreLocalExtensionMigrationBundle,
+  buildLocalExtensionMigrationBundle: buildLocalExtensionMigrationBundleFromSource,
+  restoreLocalExtensionMigrationBundle: restoreLocalExtensionMigrationBundleFromSource,
   validateLocalExtensionMigrationBundle,
 } = await import(
   "../src/services/local-extension-migration"
@@ -46,6 +36,23 @@ const {
 const { withBinMutationLock, withSpaceMutationLock } = await import(
   "../src/services/entity-mutation-lock"
 );
+
+const migrationDependencies = {
+  getDb: async () => db as never,
+  readOpfsFile: async () => null,
+  saveMediaToOpfs: async () => {},
+  withOpfsMutationLock: async <T>(work: () => Promise<T>) => work(),
+};
+const buildLocalExtensionMigrationBundle = (
+  options: Parameters<typeof buildLocalExtensionMigrationBundleFromSource>[0] = {},
+) => buildLocalExtensionMigrationBundleFromSource({ ...migrationDependencies, ...options });
+const restoreLocalExtensionMigrationBundle = (
+  value: Parameters<typeof restoreLocalExtensionMigrationBundleFromSource>[0],
+  options: Parameters<typeof restoreLocalExtensionMigrationBundleFromSource>[1] = {},
+) => restoreLocalExtensionMigrationBundleFromSource(value, {
+  ...migrationDependencies,
+  ...options,
+});
 
 const makeDoc = (row: Row) => ({
   primary: row.id,

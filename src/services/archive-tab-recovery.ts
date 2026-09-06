@@ -31,7 +31,7 @@ const waitForComplete = (
 ): Promise<chrome.tabs.Tab> => {
   if (created.status === "complete") return Promise.resolve(created);
   const tabId = created.id;
-  if (typeof tabId !== "number") return Promise.reject(new Error("ARCHIVE_RECOVERY_TAB_MISSING"));
+  if (tabId === undefined) return Promise.reject(new Error("ARCHIVE_RECOVERY_TAB_MISSING"));
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -65,15 +65,17 @@ const waitForComplete = (
  * script, so preferring one strands the recovery on a tab that can never
  * respond. Tabs that merely have no id are equally unusable.
  */
-export function pickLiveArchiveCaptureTab(
-  tabs: Array<Pick<chrome.tabs.Tab, "id" | "url" | "discarded">>,
+export function pickLiveArchiveCaptureTab<
+  Tab extends Pick<chrome.tabs.Tab, "id" | "url" | "discarded">,
+>(
+  tabs: Tab[],
   sourceUrl: string,
   normalizeUrl: (value: string | null | undefined) => string | null,
-): Pick<chrome.tabs.Tab, "id" | "url" | "discarded"> | null {
+): Tab | null {
   const target = normalizeUrl(sourceUrl);
   if (!target) return null;
   return tabs.find((tab) =>
-    typeof tab.id === "number" &&
+    tab.id !== undefined &&
     tab.discarded !== true &&
     normalizeUrl(tab.url) === target) ?? null;
 }
@@ -92,7 +94,7 @@ export async function withTemporaryArchiveTab<T>(
   const timeoutMs = Math.max(1_000, Math.floor(options.timeoutMs ?? 30_000));
   const created = await tabs.create({ url, active: false });
   const tabId = created.id;
-  if (typeof tabId !== "number") throw new Error("ARCHIVE_RECOVERY_TAB_MISSING");
+  if (tabId === undefined) throw new Error("ARCHIVE_RECOVERY_TAB_MISSING");
   try {
     const loaded = await waitForComplete(created, tabs, timeoutMs);
     return await capture(loaded);

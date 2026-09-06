@@ -1,3 +1,5 @@
+import { jsonString, type JsonObject, type JsonValue } from "@src/common/json-value";
+
 /**
  * Deciding what a pull from the cloud is allowed to do to this device.
  *
@@ -31,7 +33,7 @@ export type CloudPullCollection =
 export type CloudPullChange = {
   collection: CloudPullCollection;
   id: string;
-  doc: Record<string, unknown> | null;
+  doc: JsonObject | null;
   updatedAt: number;
   deletedAt: number;
 };
@@ -80,11 +82,15 @@ const SUPPORTED: ReadonlySet<string> = new Set<CloudPullCollection>([
  * Host case and a trailing slash are noise; the query string is not (many sites
  * put the real target there). The fragment never identifies a different page.
  */
-export const itemDedupeKey = (url: unknown, spaceId: unknown): string | null => {
-  if (typeof url !== "string" || !url.trim()) return null;
+export const itemDedupeKey = (
+  url: JsonValue | undefined,
+  spaceId: JsonValue | undefined,
+): string | null => {
+  const parsedUrl = jsonString(url)?.trim();
+  if (!parsedUrl) return null;
   let normalized: string;
   try {
-    const parsed = new URL(url.trim());
+    const parsed = new URL(parsedUrl);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
     parsed.hash = "";
     parsed.hostname = parsed.hostname.toLowerCase();
@@ -93,7 +99,7 @@ export const itemDedupeKey = (url: unknown, spaceId: unknown): string | null => 
   } catch {
     return null;
   }
-  const space = typeof spaceId === "string" ? spaceId.trim() : "";
+  const space = jsonString(spaceId)?.trim() ?? "";
   return `${space}\n${normalized}`;
 };
 
@@ -117,7 +123,7 @@ export const planCloudPullMerge = (
       skip(change, "unsupported-collection");
       continue;
     }
-    if (typeof change.id !== "string" || !change.id.trim()) {
+    if (!change.id.trim()) {
       skip(change, "invalid");
       continue;
     }
@@ -163,7 +169,7 @@ export const planCloudPullMerge = (
 
 /** Build the dedupe key set for the local items this device holds. */
 export const cloudPullItemKeys = (
-  items: readonly { url?: unknown; spaceId?: unknown }[],
+  items: readonly { url?: JsonValue; spaceId?: JsonValue }[],
 ): Set<string> => {
   const keys = new Set<string>();
   for (const item of items) {

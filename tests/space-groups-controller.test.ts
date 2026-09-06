@@ -1,8 +1,10 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { BIN_RETENTION_MS, SPACE_NOT_BINNED } from "../src/common/spaces";
 import type { SpaceDocType } from "../src/schemas/space_schema";
 import { UNGROUPED_SPACE_GROUP_ID } from "../src/schemas/space_schema";
 import type { SpaceGroupDocType } from "../src/schemas/space_group_schema";
+import { SpacesController } from "../src/services/controllers/spaces.controller";
+import { SpaceGroupsController } from "../src/services/controllers/space-groups.controller";
 
 type Row = { id: string; [key: string]: unknown };
 
@@ -69,11 +71,12 @@ let db = {
   spaces: collection(spaces),
 };
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => db,
-}));
-
-const { spaceGroupsController } = await import("../src/services/controllers/space-groups.controller");
+const getTestDb = async () => db as never;
+const spacesController = new SpacesController({ getDb: getTestDb });
+const spaceGroupsController = new SpaceGroupsController({
+  getDb: getTestDb,
+  moveSpaceToBin: (payload) => spacesController.moveToBin(payload),
+});
 
 const now = 1_764_000_000_000;
 

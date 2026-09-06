@@ -1,6 +1,7 @@
-import { expect, mock, test } from "bun:test";
+import { expect, test } from "bun:test";
 import type { FolderDocType } from "../src/schemas/folder_schema";
 import type { SpaceDocType } from "../src/schemas/space_schema";
+import { readImportTargets } from "../src/services/imports/targets";
 
 type Row = { id: string; [key: string]: unknown };
 
@@ -90,14 +91,8 @@ const db = {
   folders: collection(folders),
 };
 
-mock.module("@src/services/DatabaseService", () => ({
-  getDb: async () => db,
-}));
-
-const { databaseManager } = await import("../src/services/db-manager");
-
 test("import targets expose only live spaces and live folders", async () => {
-  const targets = await databaseManager.getImportTargets({
+  const targets = await readImportTargets(db as never, {
     maxSpaces: 0,
     maxFoldersPerSpace: 0,
     maxItemsPerFolder: 0,

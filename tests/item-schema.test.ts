@@ -1,5 +1,4 @@
 import { addRxPlugin, createRxDatabase, type RxJsonSchema } from "rxdb";
-import { RxDBDevModePlugin } from "rxdb/plugins/dev-mode";
 import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
 import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
 import { wrappedValidateZSchemaStorage } from "rxdb/plugins/validate-z-schema";
@@ -10,7 +9,6 @@ import {
   type ItemDocType,
 } from "@src/schemas/item_schema";
 
-addRxPlugin(RxDBDevModePlugin);
 addRxPlugin(RxDBMigrationSchemaPlugin);
 
 const item = (overrides: Partial<ItemDocType> = {}): ItemDocType => ({
@@ -194,12 +192,12 @@ describe("item schema", () => {
   it("migrates an existing v0 item database in place", async () => {
     const name = `item-schema-migration-${crypto.randomUUID()}`;
     const storage = wrappedValidateZSchemaStorage({ storage: getRxStorageMemory() });
-    const oldDatabase = await createRxDatabase({ name, storage, ignoreDuplicate: true });
+    const oldDatabase = await createRxDatabase({ name, storage });
     const oldCollections = await oldDatabase.addCollections({ items: { schema: v0ItemSchema() } });
     await oldCollections.items.insert(item());
     await oldDatabase.close();
 
-    const newDatabase = await createRxDatabase({ name, storage, ignoreDuplicate: true });
+    const newDatabase = await createRxDatabase({ name, storage });
     try {
       const newCollections = await newDatabase.addCollections({
         items: { schema: itemSchema, migrationStrategies: itemMigrationStrategies },

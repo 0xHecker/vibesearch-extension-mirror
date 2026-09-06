@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { toItemBody } from "../src/services/cloud-sync.service";
+import { toItemBody } from "../src/services/connectors/cloud-push";
 
 describe("connector cloud item contract", () => {
   it("maps normalized social media and metadata onto the shared wire shape", () => {

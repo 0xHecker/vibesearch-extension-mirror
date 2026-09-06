@@ -9,7 +9,7 @@
  *  • per-account **incremental** sync → pushes to the cloud (unidirectional).
  *  • **scheduler** via chrome.alarms.
  */
-import { pushCapturedItems } from "../cloud-sync.service";
+import { pushCapturedItems } from "./cloud-push";
 import { getCloudAuthToken } from "../cloud-auth";
 import { xConnector } from "./x-bookmarks";
 import { redditConnector } from "./reddit-saved";
