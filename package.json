@@ -50,7 +50,7 @@
     "single-file-core": "1.5.84",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.3.1",
-    "uuid": "^11.1.0",
+    "uuid": "^14.0.2",
     "webextension-polyfill": "^0.12.0",
     "zod": "4.5.4"
   },
