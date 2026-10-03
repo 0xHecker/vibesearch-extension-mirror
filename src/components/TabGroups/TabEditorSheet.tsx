@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type {
-  LightboxEntry,
-  LightboxMetadata,
-} from "@components/TabGroups/MediaLightboxModal";
+import type { LightboxEntry, LightboxMetadata } from "@components/TabGroups/MediaLightboxModal";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import {
   saveMediaToOpfs,
@@ -36,23 +33,14 @@ interface TabEditorSheetProps {
   onSaved?: (updated: Partial<ItemDocType>) => void;
 }
 
-export const TabEditorSheet = ({
-  item,
-  open,
-  onOpenChange,
-  onSaved,
-}: TabEditorSheetProps) => {
+export const TabEditorSheet = ({ item, open, onOpenChange, onSaved }: TabEditorSheetProps) => {
   const [title, setTitle] = useState(item.title);
   const [url, setUrl] = useState(item.url);
   const [textContent, setTextContent] = useState(item.textContent ?? "");
   const [source, setSource] = useState<ItemDocType["source"]>(item.source);
   const [isFavorite, setIsFavorite] = useState(item.isFavorite);
-  const [authorUsername, setAuthorUsername] = useState(
-    item.authorUsername ?? "",
-  );
-  const [likes, setLikes] = useState<string>(
-    item.likes === undefined ? "" : String(item.likes),
-  );
+  const [authorUsername, setAuthorUsername] = useState(item.authorUsername ?? "");
+  const [likes, setLikes] = useState<string>(item.likes === undefined ? "" : String(item.likes));
   const [upvotes, setUpvotes] = useState<string>(
     item.upvotes === undefined ? "" : String(item.upvotes),
   );
@@ -60,23 +48,17 @@ export const TabEditorSheet = ({
   const [tags, setTags] = useState<TagEntry[]>([]);
   const [newTag, setNewTag] = useState("");
   const [isAddingTag, setIsAddingTag] = useState(false);
-  const [mediaItems, setMediaItems] = useState<ItemDocType["media"]>(
-    item.media || [],
-  );
+  const [mediaItems, setMediaItems] = useState<ItemDocType["media"]>(item.media || []);
   const [isAddMediaOpen, setIsAddMediaOpen] = useState(false);
   const [mediaUrl, setMediaUrl] = useState("");
   const [isAddingMedia, setIsAddingMedia] = useState(false);
   const [replaceIndex, setReplaceIndex] = useState<number | null>(null);
   const [isRefetchConfirmOpen, setIsRefetchConfirmOpen] = useState(false);
-  const [mediaErrorIndexes, setMediaErrorIndexes] = useState<Set<number>>(
-    new Set(),
-  );
+  const [mediaErrorIndexes, setMediaErrorIndexes] = useState<Set<number>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [resolvedMedia, setResolvedMedia] = useState<LightboxEntry[]>([]);
-  const [resolvedMeta, setResolvedMeta] = useState<
-    { isPrimary: boolean; index: number }[]
-  >([]);
+  const [resolvedMeta, setResolvedMeta] = useState<{ isPrimary: boolean; index: number }[]>([]);
   const [activeMediaIndex, setActiveMediaIndex] = useState(0);
   const [isMediaMenuOpen, setIsMediaMenuOpen] = useState(false);
   // True while the media lightbox (a native <dialog> opened on top of the
@@ -146,8 +128,7 @@ export const TabEditorSheet = ({
 
   useEffect(() => {
     if (!open) return;
-    const nextDirty =
-      JSON.stringify(currentValues) !== JSON.stringify(originalSnapshot);
+    const nextDirty = JSON.stringify(currentValues) !== JSON.stringify(originalSnapshot);
     setHasDirtyChanges(nextDirty);
   }, [currentValues, originalSnapshot, open]);
 
@@ -188,8 +169,7 @@ export const TabEditorSheet = ({
             if (!u) continue;
             const lower = u.toLowerCase();
             if (lower.includes("/shorts/")) return true;
-            if (lower.includes("/reel/") || lower.includes("/reels/"))
-              return true;
+            if (lower.includes("/reel/") || lower.includes("/reels/")) return true;
             if (lower.includes("tiktok.com")) return true;
           }
           return false;
@@ -385,10 +365,9 @@ export const TabEditorSheet = ({
           category,
         )
       ) {
-        showErrorToast(
-          `${category}s limit reached (max ${MEDIA_LIMITS[category]}).`,
-          { tempo: "quick" },
-        );
+        showErrorToast(`${category}s limit reached (max ${MEDIA_LIMITS[category]}).`, {
+          tempo: "quick",
+        });
         return;
       }
     }
@@ -399,8 +378,7 @@ export const TabEditorSheet = ({
         await withToast({
           loading: "Replacing media...",
           success: "Media replaced.",
-          error: (err) =>
-            resolveToastErrorMessage(err, "Failed to replace media."),
+          error: (err) => resolveToastErrorMessage(err, "Failed to replace media."),
           action: async () => {
             const res = await chrome.runtime.sendMessage({
               service: "items",
@@ -469,10 +447,9 @@ export const TabEditorSheet = ({
             category,
           )
         ) {
-          showErrorToast(
-            `${category}s limit reached (max ${MEDIA_LIMITS[category]}).`,
-            { tempo: "quick" },
-          );
+          showErrorToast(`${category}s limit reached (max ${MEDIA_LIMITS[category]}).`, {
+            tempo: "quick",
+          });
           return;
         }
       }
@@ -493,14 +470,11 @@ export const TabEditorSheet = ({
           altText: file.name,
         };
         const expectedMedia = mediaItems || [];
-        const next = expectedMedia.map((m, i) =>
-          i === indexToReplace ? newEntry : m,
-        );
+        const next = expectedMedia.map((m, i) => (i === indexToReplace ? newEntry : m));
         await withToast({
           loading: "Replacing media...",
           success: "Media replaced.",
-          error: (err) =>
-            resolveToastErrorMessage(err, "Failed to replace media."),
+          error: (err) => resolveToastErrorMessage(err, "Failed to replace media."),
           action: async () => {
             const res = await chrome.runtime.sendMessage({
               service: "items",
@@ -529,16 +503,9 @@ export const TabEditorSheet = ({
         const expectedMedia = mediaItems || [];
         const next = [...expectedMedia, ...newEntries];
         await withToast({
-          loading:
-            files.length > 1
-              ? `Uploading ${files.length} files...`
-              : "Uploading media...",
-          success:
-            files.length > 1
-              ? `${files.length} files uploaded.`
-              : "Media uploaded.",
-          error: (err) =>
-            resolveToastErrorMessage(err, "Failed to upload media."),
+          loading: files.length > 1 ? `Uploading ${files.length} files...` : "Uploading media...",
+          success: files.length > 1 ? `${files.length} files uploaded.` : "Media uploaded.",
+          error: (err) => resolveToastErrorMessage(err, "Failed to upload media."),
           action: async () => {
             const res = await chrome.runtime.sendMessage({
               service: "items",
@@ -564,8 +531,7 @@ export const TabEditorSheet = ({
       await withToast({
         loading: "Removing media...",
         success: "Media removed.",
-        error: (err) =>
-          resolveToastErrorMessage(err, "Failed to remove media."),
+        error: (err) => resolveToastErrorMessage(err, "Failed to remove media."),
         successTempo: "quick",
         action: async () => {
           const res = await chrome.runtime.sendMessage({
@@ -602,8 +568,7 @@ export const TabEditorSheet = ({
       await withToast({
         loading: "Setting default media...",
         success: "Default media updated.",
-        error: (err) =>
-          resolveToastErrorMessage(err, "Failed to set default media."),
+        error: (err) => resolveToastErrorMessage(err, "Failed to set default media."),
         successTempo: "quick",
         action: async () => {
           const res = await chrome.runtime.sendMessage({
@@ -625,8 +590,7 @@ export const TabEditorSheet = ({
       await withToast({
         loading: "Refetching metadata...",
         success: "Metadata refresh queued. All media will be replaced.",
-        error: (err) =>
-          resolveToastErrorMessage(err, "Failed to refetch metadata."),
+        error: (err) => resolveToastErrorMessage(err, "Failed to refetch metadata."),
         action: async () => {
           await chrome.runtime.sendMessage({
             target: "background",
@@ -661,19 +625,15 @@ export const TabEditorSheet = ({
 
     if (title.trim() !== originalSnapshot.title) payload.title = title.trim();
     if (trimmedUrl !== originalSnapshot.url) payload.url = trimmedUrl;
-    if (textContent !== originalSnapshot.textContent)
-      payload.textContent = textContent;
+    if (textContent !== originalSnapshot.textContent) payload.textContent = textContent;
     if (source !== originalSnapshot.source) payload.source = source;
-    if (isFavorite !== originalSnapshot.isFavorite)
-      payload.isFavorite = isFavorite;
+    if (isFavorite !== originalSnapshot.isFavorite) payload.isFavorite = isFavorite;
     if (authorUsername.trim() !== originalSnapshot.authorUsername)
       payload.authorUsername = authorUsername.trim();
     const likesNum = likes.trim() === "" ? undefined : Number(likes);
-    if (likesNum !== undefined && !Number.isNaN(likesNum))
-      payload.likes = likesNum;
+    if (likesNum !== undefined && !Number.isNaN(likesNum)) payload.likes = likesNum;
     const upvotesNum = upvotes.trim() === "" ? undefined : Number(upvotes);
-    if (upvotesNum !== undefined && !Number.isNaN(upvotesNum))
-      payload.upvotes = upvotesNum;
+    if (upvotesNum !== undefined && !Number.isNaN(upvotesNum)) payload.upvotes = upvotesNum;
 
     if (Object.keys(payload).length <= 1) {
       showSuccessToast("Nothing to save.", { tempo: "quick" });
@@ -727,9 +687,7 @@ export const TabEditorSheet = ({
 
   const handleOpenChange = (next: boolean) => {
     if (!next && hasDirtyChanges && !isSaving) {
-      const confirm = window.confirm(
-        "You have unsaved changes. Discard them and close?",
-      );
+      const confirm = window.confirm("You have unsaved changes. Discard them and close?");
       if (!confirm) return;
     }
     onOpenChange(next);

@@ -87,18 +87,22 @@ export const MediaCarousel = ({
       const isYouTube =
         !!getYouTubeVideoIdFromUrl(pageUrl || "") ||
         (media || []).some((entry) =>
-          [entry.embedUrl, entry.originalUrl, entry.pageUrl, entry.s3ThumbnailUrl, entry.thumbnailUrl]
+          [
+            entry.embedUrl,
+            entry.originalUrl,
+            entry.pageUrl,
+            entry.s3ThumbnailUrl,
+            entry.thumbnailUrl,
+          ]
             .filter(Boolean)
-            .some((url) => !!url && !!getYouTubeVideoIdFromUrl(url))
+            .some((url) => !!url && !!getYouTubeVideoIdFromUrl(url)),
         );
       const allEntries: (MediaEntry | { type: "image"; originalUrl: string; s3Url?: string })[] = [
         ...(media || []),
       ];
       if (
         displayImageUrl &&
-        !allEntries.some(
-          (e) => e.s3Url === displayImageUrl || e.originalUrl === displayImageUrl
-        )
+        !allEntries.some((e) => e.s3Url === displayImageUrl || e.originalUrl === displayImageUrl)
       ) {
         const displayEntry = { type: "image" as const, originalUrl: displayImageUrl };
         if (isYouTube) allEntries.push(displayEntry);
@@ -107,8 +111,11 @@ export const MediaCarousel = ({
 
       const resolved = await Promise.all(
         allEntries
-          .filter((e) => (e as MediaEntry).embedUrl || e.s3Url || e.originalUrl || (e as MediaEntry).opfsPath)
-          .map((e) => resolveEntry(e as MediaEntry))
+          .filter(
+            (e) =>
+              (e as MediaEntry).embedUrl || e.s3Url || e.originalUrl || (e as MediaEntry).opfsPath,
+          )
+          .map((e) => resolveEntry(e as MediaEntry)),
       );
 
       const valid = resolved.filter((r): r is ResolvedEntry => r !== null);
@@ -143,7 +150,7 @@ export const MediaCarousel = ({
       const clamped = ((index % entries.length) + entries.length) % entries.length;
       setActiveIndex(clamped);
     },
-    [entries.length]
+    [entries.length],
   );
 
   const next = useCallback(() => goTo(activeIndex + 1), [activeIndex, goTo]);
@@ -195,7 +202,12 @@ export const MediaCarousel = ({
 
   if (entries.length === 0) {
     return (
-      <div className={cn("flex items-center justify-center h-full bg-background-page text-foreground-tertiary", className)}>
+      <div
+        className={cn(
+          "flex items-center justify-center h-full bg-background-page text-foreground-tertiary",
+          className,
+        )}
+      >
         <p className="text-sm">No media available</p>
       </div>
     );
@@ -209,7 +221,7 @@ export const MediaCarousel = ({
       tabIndex={0}
       className={cn(
         "relative h-full w-full overflow-hidden bg-background-page outline-none group/carousel",
-        className
+        className,
       )}
       onPointerDown={handleDragStart}
       onPointerMove={handleDragMove}
@@ -249,14 +261,10 @@ export const MediaCarousel = ({
                   className="max-h-full max-w-full bg-background-page-secondary"
                   style={{
                     aspectRatio:
-                      entry.width && entry.height
-                        ? `${entry.width} / ${entry.height}`
-                        : "16 / 9",
+                      entry.width && entry.height ? `${entry.width} / ${entry.height}` : "16 / 9",
                     width: "100%",
                   }}
-                  onError={() =>
-                    setErroredIndexes((prev) => new Set(prev).add(i))
-                  }
+                  onError={() => setErroredIndexes((prev) => new Set(prev).add(i))}
                 />
               ) : (
                 <video
@@ -264,9 +272,7 @@ export const MediaCarousel = ({
                   preload="metadata"
                   playsInline
                   className="max-h-full max-w-full object-contain"
-                  onError={() =>
-                    setErroredIndexes((prev) => new Set(prev).add(i))
-                  }
+                  onError={() => setErroredIndexes((prev) => new Set(prev).add(i))}
                 >
                   <source src={entry.src} />
                 </video>
@@ -280,9 +286,7 @@ export const MediaCarousel = ({
                   outline: "1px solid rgba(0,0,0,0.08)",
                   outlineOffset: "-1px",
                 }}
-                onError={() =>
-                  setErroredIndexes((prev) => new Set(prev).add(i))
-                }
+                onError={() => setErroredIndexes((prev) => new Set(prev).add(i))}
               />
             )}
           </div>
@@ -308,7 +312,7 @@ export const MediaCarousel = ({
               "shadow-md hover:shadow-lg transition-all duration-300",
               "opacity-0 group-hover/carousel:opacity-100",
               "active:scale-[0.92] cursor-pointer outline-none",
-              "focus-visible:ring-2 focus-visible:ring-accent/40"
+              "focus-visible:ring-2 focus-visible:ring-accent/40",
             )}
           >
             <ChevronLeft size={22} />
@@ -329,7 +333,7 @@ export const MediaCarousel = ({
               "shadow-md hover:shadow-lg transition-all duration-300",
               "opacity-0 group-hover/carousel:opacity-100",
               "active:scale-[0.92] cursor-pointer outline-none",
-              "focus-visible:ring-2 focus-visible:ring-accent/40"
+              "focus-visible:ring-2 focus-visible:ring-accent/40",
             )}
           >
             <ChevronRight size={22} />
@@ -355,7 +359,7 @@ export const MediaCarousel = ({
                   "active:scale-[0.85]",
                   i === activeIndex
                     ? "w-5 h-1.5 bg-accent"
-                    : "w-1.5 h-1.5 bg-foreground-tertiary/50 hover:bg-foreground-secondary"
+                    : "w-1.5 h-1.5 bg-foreground-tertiary/50 hover:bg-foreground-secondary",
                 )}
               />
             ))}

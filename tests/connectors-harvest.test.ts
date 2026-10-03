@@ -232,6 +232,53 @@ describe("harvest — shape-agnostic extraction", () => {
     });
   });
 
+  it("credits a licensed-music reel to its poster, not the song's artist", () => {
+    const artist = {
+      pk: "266319242",
+      username: "theweeknd",
+      full_name: "Abel",
+      profile_pic_url: "https://scontent.cdninstagram.com/artist.jpg",
+      is_verified: true,
+    };
+    const payload = {
+      items: [
+        {
+          media: {
+            pk: "3973717440187449358",
+            code: "DclevVMJcAO",
+            taken_at: 1787924171,
+            // Instagram puts the soundtrack, tags and comments before the owner.
+            clips_metadata: {
+              audio_type: "licensed_music",
+              music_info: {
+                music_asset_info: { title: "Blinding Lights (Extended Radio Edit)", display_artist: "The Weeknd" },
+                music_consumption_info: { ig_artist: artist },
+              },
+            },
+            usertags: { in: [{ user: { pk: "11", username: "tagged.friend", full_name: "Tagged Friend", profile_pic_url: "https://scontent.cdninstagram.com/t.jpg" } }] },
+            preview_comments: [{ text: "This comment is much longer than the caption and is not what the post says.", user: artist }],
+            caption: { text: "Hot chicken, done right" },
+            user: {
+              pk: "4242",
+              username: "bangalore.eats",
+              full_name: "Bangalore Eats",
+              profile_pic_url: "https://scontent.cdninstagram.com/owner.jpg",
+            },
+          },
+        },
+      ],
+    };
+    const item = normalizeEntry(findInstagramEntryList(payload)[0], {
+      source: "instagram",
+      idPrefix: "ig",
+      connector: "instagram-saved",
+      defaultType: "social",
+      buildUrl: ({ code }) => `https://www.instagram.com/p/${code}/`,
+    })!;
+    expect(item.authorUsername).toBe("bangalore.eats");
+    expect(item.textContent).toBe("Hot chicken, done right");
+  });
+
   it("keeps an Instagram carousel as one saved social post", () => {
     const payload = {
       items: [{

@@ -26,12 +26,12 @@ const findPostAnchor = (target: HTMLElement): HTMLAnchorElement | null => {
   if (direct) return direct;
 
   const container = target.closest(
-    "article, [role='article'], [data-testid='post-container'], shreddit-post, ytd-rich-item-renderer, ytd-video-renderer, .feed-shared-update-v2"
+    "article, [role='article'], [data-testid='post-container'], shreddit-post, ytd-rich-item-renderer, ytd-video-renderer, .feed-shared-update-v2",
   );
   if (!container) return null;
 
   return container.querySelector(
-    "a[href*='/watch'], a[href*='/shorts/'], a[href*='/status/'], a[href*='/comments/'], a[href*='/feed/update/'], a[href*='/p/'], a[href*='/@']"
+    "a[href*='/watch'], a[href*='/shorts/'], a[href*='/status/'], a[href*='/comments/'], a[href*='/feed/update/'], a[href*='/p/'], a[href*='/@']",
   ) as HTMLAnchorElement | null;
 };
 
@@ -64,22 +64,24 @@ document.addEventListener(
       payload: saveTarget,
     });
   },
-  true
+  true,
 );
 
 let archiveCaptureModule: Promise<typeof import("./page-archive-capture")> | null = null;
 
-chrome.runtime.onMessage.addListener((message: PageArchiveCaptureRequest, _sender, sendResponse) => {
-  if (message?.type !== PAGE_ARCHIVE_CAPTURE_MESSAGE) return;
-  archiveCaptureModule ||= import("./page-archive-capture");
-  void archiveCaptureModule
-    .then(({ capturePageArchive }) => capturePageArchive(message.payload))
-    .then((payload) => sendResponse({ success: true, payload } satisfies ArchiveProtocolResponse))
-    .catch((error) =>
-      sendResponse({
-        success: false,
-        error: error instanceof Error ? error.message : "ARCHIVE_CAPTURE_FAILED",
-      } satisfies ArchiveProtocolResponse),
-    );
-  return true;
-});
+chrome.runtime.onMessage.addListener(
+  (message: PageArchiveCaptureRequest, _sender, sendResponse) => {
+    if (message?.type !== PAGE_ARCHIVE_CAPTURE_MESSAGE) return;
+    archiveCaptureModule ||= import("./page-archive-capture");
+    void archiveCaptureModule
+      .then(({ capturePageArchive }) => capturePageArchive(message.payload))
+      .then((payload) => sendResponse({ success: true, payload } satisfies ArchiveProtocolResponse))
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "ARCHIVE_CAPTURE_FAILED",
+        } satisfies ArchiveProtocolResponse),
+      );
+    return true;
+  },
+);

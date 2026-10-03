@@ -44,8 +44,7 @@ export const noUnknownReturnsRule = defineRule({
         if (
           resolved.type !== "TSTypeReference" ||
           resolved.typeName.type !== "Identifier" ||
-          (resolved.typeName.name !== "Promise" &&
-            resolved.typeName.name !== "PromiseLike")
+          (resolved.typeName.name !== "Promise" && resolved.typeName.name !== "PromiseLike")
         ) {
           return false;
         }
@@ -62,10 +61,7 @@ export const noUnknownReturnsRule = defineRule({
 
     return {
       Program(node) {
-        environment = createTypeAliasEnvironment(
-          node,
-          context.sourceCode.visitorKeys,
-        );
+        environment = createTypeAliasEnvironment(node, context.sourceCode.visitorKeys);
       },
       ArrowFunctionExpression: checkReturnType,
       FunctionDeclaration: checkReturnType,

@@ -1,5 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { formatTabsForClipboard, getClipboardFormat } from "@src/pages/search/components/settings/clipboard-format";
+import {
+  formatTabsForClipboard,
+  getClipboardFormat,
+} from "@src/pages/search/components/settings/clipboard-format";
 import { CopyIcon } from "@icons/copy";
 import { Checkmark } from "@icons/checkmark";
 import { OpenArrowIcon } from "@icons/open-arrow";
@@ -109,7 +112,7 @@ const TabGroupContent = ({
   }, [items, revealItemId]);
   const moveSpaceOptions = useMemo(
     () => spaces.filter((space) => space.id !== folder.spaceId),
-    [folder.spaceId, spaces]
+    [folder.spaceId, spaces],
   );
 
   const { isSelectionMode, selectedIds, toggleSelectAll } = useSelection();
@@ -121,7 +124,11 @@ const TabGroupContent = ({
     while (changed) {
       changed = false;
       for (const candidate of allFolders) {
-        if (candidate.parentId && folderIds.has(candidate.parentId) && !folderIds.has(candidate.id)) {
+        if (
+          candidate.parentId &&
+          folderIds.has(candidate.parentId) &&
+          !folderIds.has(candidate.id)
+        ) {
           folderIds.add(candidate.id);
           changed = true;
         }
@@ -157,7 +164,7 @@ const TabGroupContent = ({
       transform: CSS.Transform.toString(transform),
       transition,
     }),
-    [transform, transition]
+    [transform, transition],
   );
 
   useEffect(() => {
@@ -170,7 +177,7 @@ const TabGroupContent = ({
   const handleCopyFolderUrls = async () => {
     const text = formatTabsForClipboard(
       items.map((item) => ({ title: item.title, url: item.url })),
-      getClipboardFormat()
+      getClipboardFormat(),
     );
     if (!text.trim()) {
       showErrorToast("No URLs available to copy.", { tempo: "quick" });
@@ -223,7 +230,7 @@ const TabGroupContent = ({
       });
       if (response?.success === false || response?.payload?.success === false) {
         throw new Error(
-          response?.error || response?.payload?.error || "Failed to update pin state"
+          response?.error || response?.payload?.error || "Failed to update pin state",
         );
       }
     } catch (error) {
@@ -248,7 +255,7 @@ const TabGroupContent = ({
       });
       if (response?.success === false || response?.payload?.success === false) {
         throw new Error(
-          response?.error || response?.payload?.error || "Failed to update lock state"
+          response?.error || response?.payload?.error || "Failed to update lock state",
         );
       }
     } catch (error) {
@@ -313,7 +320,7 @@ const TabGroupContent = ({
       });
       if (response?.success === false || response?.payload?.success === false) {
         throw new Error(
-          response?.error || response?.payload?.error || "Failed to update collapsed state"
+          response?.error || response?.payload?.error || "Failed to update collapsed state",
         );
       }
     } catch (error) {
@@ -339,7 +346,7 @@ const TabGroupContent = ({
       if (response?.success === false || response?.payload?.success === false) {
         console.error(
           "Failed to delete folder after open",
-          response?.error || response?.payload?.error
+          response?.error || response?.payload?.error,
         );
       }
     } catch (e) {
@@ -364,7 +371,7 @@ const TabGroupContent = ({
           throw new Error(
             response?.error ||
               response?.payload?.error ||
-              "Failed to delete tab group. Please try again."
+              "Failed to delete tab group. Please try again.",
           );
         }
       },
@@ -458,7 +465,9 @@ const TabGroupContent = ({
           });
           if (response?.success === false || response?.payload?.success === false) {
             throw new Error(
-              response?.error || response?.payload?.error || "Failed to move folder to selected space."
+              response?.error ||
+                response?.payload?.error ||
+                "Failed to move folder to selected space.",
             );
           }
         },
@@ -488,7 +497,9 @@ const TabGroupContent = ({
           });
           if (response?.success === false || response?.payload?.success === false) {
             throw new Error(
-              response?.error || response?.payload?.error || "Failed to copy folder to selected space."
+              response?.error ||
+                response?.payload?.error ||
+                "Failed to copy folder to selected space.",
             );
           }
         },
@@ -522,7 +533,8 @@ const TabGroupContent = ({
         Previous
       </Button>
       <span className="text-xs text-foreground-secondary tabular-nums">
-        {safePage * TAB_PAGE_SIZE + 1}&ndash;{Math.min(items.length, (safePage + 1) * TAB_PAGE_SIZE)} of {items.length}
+        {safePage * TAB_PAGE_SIZE + 1}&ndash;
+        {Math.min(items.length, (safePage + 1) * TAB_PAGE_SIZE)} of {items.length}
       </span>
       <Button
         type="button"
@@ -544,7 +556,7 @@ const TabGroupContent = ({
         className={cn(
           "group/tabgroup flex relative flex-col rounded-xl transition-[box-shadow,opacity] duration-200",
           isDragging ? "opacity-50" : "",
-          isOver ? "outline-dashed outline-2 outline-accent/40 outline-offset-4" : ""
+          isOver ? "outline-dashed outline-2 outline-accent/40 outline-offset-4" : "",
         )}
       >
         {/* Pin/Lock controls */}
@@ -552,7 +564,7 @@ const TabGroupContent = ({
           className={cn(
             "absolute right-4 transition-all duration-300 flex flex-row gap-1",
             isCollapsed ? "top-2" : "top-5.5",
-            isPinned || isLocked ? "opacity-100" : "opacity-0 group-hover/tabgroup:opacity-100"
+            isPinned || isLocked ? "opacity-100" : "opacity-0 group-hover/tabgroup:opacity-100",
           )}
         >
           <div
@@ -562,7 +574,7 @@ const TabGroupContent = ({
               isLocked
                 ? "text-foreground-icon"
                 : "text-foreground-tertiary/60 hover:text-foreground-tertiary",
-              isUpdatingLocked && "opacity-60 pointer-events-none"
+              isUpdatingLocked && "opacity-60 pointer-events-none",
             )}
           >
             <LockShadowIcon size={28} className="transition-all duration-300" />
@@ -574,7 +586,7 @@ const TabGroupContent = ({
               isPinned
                 ? "text-foreground-icon"
                 : "text-foreground-tertiary/60 hover:text-foreground-tertiary",
-              isUpdatingPinned && "opacity-60 pointer-events-none"
+              isUpdatingPinned && "opacity-60 pointer-events-none",
             )}
           >
             <PinShadowIcon size={28} className="transition-all duration-300" />
@@ -585,7 +597,7 @@ const TabGroupContent = ({
         <div
           className={cn(
             "flex flex-row items-center px-4 py-2 transition-colors duration-300 border border-transparent rounded-semi",
-            isCollapsed ? "bg-background-page-secondary border-border-neutral-faded shadow-sm" : ""
+            isCollapsed ? "bg-background-page-secondary border-border-neutral-faded shadow-sm" : "",
           )}
         >
           <div
@@ -595,7 +607,7 @@ const TabGroupContent = ({
             className={cn(
               "mr-2 flex h-8 w-5 items-center justify-center text-foreground-tertiary",
               "hover:text-foreground-secondary cursor-grab active:cursor-grabbing rounded-sm",
-              "transition-colors duration-150"
+              "transition-colors duration-150",
             )}
             aria-label="Drag tab group"
           >
@@ -611,7 +623,7 @@ const TabGroupContent = ({
               size={16}
               className={cn(
                 "transition-all duration-300 text-foreground-tertiary hover:text-foreground-icon",
-                !isCollapsed && "rotate-90"
+                !isCollapsed && "rotate-90",
               )}
             />
           </Button>
@@ -621,7 +633,9 @@ const TabGroupContent = ({
             <button
               type="button"
               onClick={() => toggleSelectAll(items)}
-              aria-label={groupAllSelected ? "Deselect all tabs in group" : "Select all tabs in group"}
+              aria-label={
+                groupAllSelected ? "Deselect all tabs in group" : "Select all tabs in group"
+              }
               title={groupAllSelected ? "Deselect all in group" : "Select all in group"}
               className={cn(
                 "ml-2 grid size-5 shrink-0 place-items-center rounded-md border transition-all duration-150 cursor-pointer",
@@ -630,7 +644,7 @@ const TabGroupContent = ({
                   : groupSomeSelected
                     ? "border-accent bg-accent/40 text-background-neutral"
                     : "border-border-neutral-faded text-foreground-tertiary hover:border-foreground-tertiary",
-                isSelectionMode ? "opacity-100" : "opacity-0 group-hover/tabgroup:opacity-100"
+                isSelectionMode ? "opacity-100" : "opacity-0 group-hover/tabgroup:opacity-100",
               )}
             >
               {groupAllSelected ? (
@@ -796,7 +810,7 @@ const TabGroupContent = ({
                 "cursor-pointer transition-colors duration-300",
                 isLocked
                   ? "text-foreground-tertiary/70 cursor-not-allowed"
-                  : "text-foreground-tertiary hover:text-foreground-danger"
+                  : "text-foreground-tertiary hover:text-foreground-danger",
               )}
               aria-label={isLocked ? "Unlock to delete" : "Delete tab group"}
               disabled={isLocked}
@@ -816,7 +830,7 @@ const TabGroupContent = ({
         <div
           className={cn(
             "grid transition-[grid-template-rows,opacity] ease-in-out duration-300",
-            isCollapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100"
+            isCollapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100",
           )}
         >
           <div className="overflow-hidden min-h-0">
@@ -839,55 +853,57 @@ const TabGroupContent = ({
 
                 {/* Items */}
                 <div className="flex flex-col gap-2">
-                    {viewMode === "list" ? (
-                      pagedItems.map((item) => {
-                        const Row = dragMode ? SortableFlatItem : FlatItem;
+                  {viewMode === "list" ? (
+                    pagedItems.map((item) => {
+                      const Row = dragMode ? SortableFlatItem : FlatItem;
+                      return (
+                        <Row
+                          key={item.id}
+                          item={item}
+                          spaces={spaces}
+                          debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
+                          showDebugScore={showDebugScores}
+                          onCopy={handleItemCopy}
+                        />
+                      );
+                    })
+                  ) : (
+                    <Masonry
+                      items={pagedItems}
+                      config={{
+                        columns: [2, 3, 4],
+                        gap: [16, 16, 16],
+                        media: [640, 768, 1024],
+                      }}
+                      render={(item) => {
+                        const Card = dragMode ? SortableGridItem : GridItem;
                         return (
-                          <Row
+                          <Card
                             key={item.id}
                             item={item}
                             spaces={spaces}
-                            debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
+                            debugScore={
+                              showDebugScores ? debugScoresByItemId?.[item.id] : undefined
+                            }
                             showDebugScore={showDebugScores}
                             onCopy={handleItemCopy}
                           />
                         );
-                      })
-                    ) : (
-                      <Masonry
-                        items={pagedItems}
-                        config={{
-                          columns: [2, 3, 4],
-                          gap: [16, 16, 16],
-                          media: [640, 768, 1024],
-                        }}
-                        render={(item) => {
-                          const Card = dragMode ? SortableGridItem : GridItem;
-                          return (
-                            <Card
-                              key={item.id}
-                              item={item}
-                              spaces={spaces}
-                              debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
-                              showDebugScore={showDebugScores}
-                              onCopy={handleItemCopy}
-                            />
-                          );
-                        }}
-                      />
-                    )}
+                      }}
+                    />
+                  )}
+                </div>
+                {items.length === 0 && (
+                  <div className="mt-2 rounded-lg border border-dashed border-border-neutral/70 bg-background-neutral p-4 text-center text-sm text-foreground-secondary">
+                    Drag tabs here to start this group.
                   </div>
-                  {items.length === 0 && (
-                    <div className="mt-2 rounded-lg border border-dashed border-border-neutral/70 bg-background-neutral p-4 text-center text-sm text-foreground-secondary">
-                      Drag tabs here to start this group.
-                    </div>
-                  )}
+                )}
 
-                  {isPaginated && (
-                    <div className="mt-3 border-t border-border-neutral-faded/60 pt-3">
-                      {renderPaginationBar()}
-                    </div>
-                  )}
+                {isPaginated && (
+                  <div className="mt-3 border-t border-border-neutral-faded/60 pt-3">
+                    {renderPaginationBar()}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -917,32 +933,34 @@ const TabGroupContent = ({
   );
 };
 
-export const TabGroup = memo(({
-  folder,
-  items,
-  allFolders,
-  treeItemCount,
-  spaces,
-  viewMode,
-  debugScoresByItemId,
-  showDebugScores = false,
-  onShareSelectedItems,
-  onShareFolder,
-  dragMode = false,
-}: TabGroupProps) => {
-  return (
-    <TabGroupContent
-      folder={folder}
-      items={items}
-      allFolders={allFolders}
-      treeItemCount={treeItemCount}
-      spaces={spaces}
-      viewMode={viewMode}
-      debugScoresByItemId={debugScoresByItemId}
-      showDebugScores={showDebugScores}
-      onShareSelectedItems={onShareSelectedItems}
-      onShareFolder={onShareFolder}
-      dragMode={dragMode}
-    />
-  );
-});
+export const TabGroup = memo(
+  ({
+    folder,
+    items,
+    allFolders,
+    treeItemCount,
+    spaces,
+    viewMode,
+    debugScoresByItemId,
+    showDebugScores = false,
+    onShareSelectedItems,
+    onShareFolder,
+    dragMode = false,
+  }: TabGroupProps) => {
+    return (
+      <TabGroupContent
+        folder={folder}
+        items={items}
+        allFolders={allFolders}
+        treeItemCount={treeItemCount}
+        spaces={spaces}
+        viewMode={viewMode}
+        debugScoresByItemId={debugScoresByItemId}
+        showDebugScores={showDebugScores}
+        onShareSelectedItems={onShareSelectedItems}
+        onShareFolder={onShareFolder}
+        dragMode={dragMode}
+      />
+    );
+  },
+);

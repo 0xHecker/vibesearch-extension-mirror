@@ -65,7 +65,7 @@ export const OcrExtractedText = memo(
           variant === "overlay"
             ? "border-border-neutral-faded/60 bg-background-neutral/80 shadow-lg backdrop-blur-md"
             : "border-border-neutral-faded bg-background-page-secondary/60",
-          className
+          className,
         )}
       >
         <div className={cn("flex items-center gap-2", collapsed ? "" : "mb-1.5")}>
@@ -128,7 +128,7 @@ export const OcrExtractedText = memo(
               <p
                 className={cn(
                   "select-text whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground-secondary",
-                  expanded ? "overflow-auto" : isLong ? cn("overflow-hidden", FADE_MASK) : ""
+                  expanded ? "overflow-auto" : isLong ? cn("overflow-hidden", FADE_MASK) : "",
                 )}
                 style={{
                   maxHeight: expanded
@@ -151,11 +151,13 @@ export const OcrExtractedText = memo(
               )}
             </>
           ) : (
-            <div className="text-xs text-foreground-tertiary">No readable text found in this image.</div>
+            <div className="text-xs text-foreground-tertiary">
+              No readable text found in this image.
+            </div>
           ))}
       </div>
     );
-  }
+  },
 );
 
 OcrExtractedText.displayName = "OcrExtractedText";

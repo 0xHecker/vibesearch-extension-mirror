@@ -19,6 +19,7 @@ import type {
 } from "@src/services/connectors/cloud-push";
 import { collectMedia } from "./media";
 import {
+  ATTACHED_ENTITY,
   decodeEntities,
   directString,
   entries,
@@ -43,10 +44,14 @@ function profileUrlFor(source: string, handle: string): string | undefined {
   return undefined;
 }
 
-/** Pick the richest author object, so X mention entities cannot beat the creator. */
+/**
+ * Pick the richest author object, so X mention entities cannot beat the
+ * creator. Attached people (a reel's music artist, tagged users, likers,
+ * commenters) are never candidates; on a tie the shallower object wins.
+ */
 function pickCreator(node: Json, source: string): CapturedCreator | undefined {
-  let best: { score: number; creator: CapturedCreator } | undefined;
-  for (const { node: candidate } of walk(node)) {
+  let best: { score: number; depth: number; creator: CapturedCreator } | undefined;
+  for (const { node: candidate, depth } of walk(node, 0, ATTACHED_ENTITY)) {
     const profile = isObj(candidate.legacy) ? candidate.legacy : candidate;
     const handle = directString(profile, ["screen_name", "username", "user_name", "handle"])
       ?.replace(/^@+/u, "");
@@ -72,7 +77,9 @@ function pickCreator(node: Json, source: string): CapturedCreator | undefined {
     if (avatarUrl && isHttp(avatarUrl)) creator.avatarUrl = avatarUrl;
     if (profileUrl) creator.url = profileUrl;
     if (verified !== undefined) creator.verified = verified;
-    if (!best || score > best.score) best = { score, creator };
+    if (!best || score > best.score || (score === best.score && depth < best.depth)) {
+      best = { score, depth, creator };
+    }
   }
   if (best) return best.creator;
   const handle = pickString(node, KEY.author, { skipHttp: true });

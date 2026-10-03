@@ -15,15 +15,14 @@ type ResolvedMedia = {
   totalCount: number;
 };
 
-const isVerticalVideoSource = (item: ItemDocType, media?: { originalUrl?: string; pageUrl?: string; width?: number; height?: number }): boolean => {
+const isVerticalVideoSource = (
+  item: ItemDocType,
+  media?: { originalUrl?: string; pageUrl?: string; width?: number; height?: number },
+): boolean => {
   if (media?.width && media?.height && media.height > media.width) return true;
   const source = item.source;
   if (source === "tiktok") return true;
-  const checkUrls = [
-    item.url,
-    media?.originalUrl,
-    media?.pageUrl,
-  ].filter(Boolean) as string[];
+  const checkUrls = [item.url, media?.originalUrl, media?.pageUrl].filter(Boolean) as string[];
   for (const u of checkUrls) {
     const lower = u.toLowerCase();
     if (lower.includes("/shorts/")) return true;
@@ -39,21 +38,22 @@ const resolveMedia = async (item: ItemDocType): Promise<ResolvedMedia | null> =>
       typeof entry?.embedUrl === "string" ||
       typeof entry?.s3Url === "string" ||
       typeof entry?.originalUrl === "string" ||
-      typeof entry?.opfsPath === "string"
+      typeof entry?.opfsPath === "string",
   );
   const totalCount = mediaEntries.length > 0 ? mediaEntries.length : item.displayImageUrl ? 1 : 0;
 
   // Grid cards should prefer real image media, including WebP, over an embed or
   // metadata fallback. The image keeps its natural height via `h-auto` below.
   const imageEntries = mediaEntries.filter((entry) => entry.type === "image");
-  const candidate = imageEntries.find(
-    (entry) => entry.storageType === "opfs" || entry.storageType === "s3"
-  ) || imageEntries[0] || mediaEntries.find(
-    (entry) => entry.storageType === "opfs" || entry.storageType === "s3"
-  ) || mediaEntries[0];
+  const candidate =
+    imageEntries.find((entry) => entry.storageType === "opfs" || entry.storageType === "s3") ||
+    imageEntries[0] ||
+    mediaEntries.find((entry) => entry.storageType === "opfs" || entry.storageType === "s3") ||
+    mediaEntries[0];
   if (candidate) {
     const isVertical = isVerticalVideoSource(item, candidate);
-    const embedUrl = candidate.type === "video" ? normalizeIframeEmbedUrl(candidate.embedUrl) : null;
+    const embedUrl =
+      candidate.type === "video" ? normalizeIframeEmbedUrl(candidate.embedUrl) : null;
     if (embedUrl) {
       return {
         type: "video",
@@ -133,9 +133,9 @@ export const ItemMediaPreview = ({
   const [isErrored, setIsErrored] = useState(false);
   const hasMedia = Boolean(
     item.displayImageUrl ||
-      item.media?.some(
-        (entry) => entry.embedUrl || entry.s3Url || entry.originalUrl || entry.opfsPath
-      )
+    item.media?.some(
+      (entry) => entry.embedUrl || entry.s3Url || entry.originalUrl || entry.opfsPath,
+    ),
   );
 
   useEffect(() => {
@@ -177,7 +177,7 @@ export const ItemMediaPreview = ({
           setIsVisible(entry.isIntersecting);
         }
       },
-      { root: null, rootMargin: "480px 0px", threshold: 0.01 }
+      { root: null, rootMargin: "480px 0px", threshold: 0.01 },
     );
     if (hostRef.current) observer.observe(hostRef.current);
     return () => observer.disconnect();
@@ -211,7 +211,11 @@ export const ItemMediaPreview = ({
             loading="lazy"
             decoding="async"
             className="w-full h-auto rounded-sm-semi object-contain"
-            style={media.width && media.height ? { aspectRatio: `${media.width} / ${media.height}` } : undefined}
+            style={
+              media.width && media.height
+                ? { aspectRatio: `${media.width} / ${media.height}` }
+                : undefined
+            }
             onError={() => {
               setIsErrored(true);
             }}
@@ -228,7 +232,7 @@ export const ItemMediaPreview = ({
             <div
               className={cn(
                 "relative grid w-full place-items-center overflow-hidden rounded-sm-semi border border-border-neutral-faded bg-background-page-secondary",
-                media.isVertical && "mx-auto max-w-[420px]"
+                media.isVertical && "mx-auto max-w-[420px]",
               )}
               style={{
                 aspectRatio:
@@ -262,7 +266,7 @@ export const ItemMediaPreview = ({
               playsInline
               className={cn(
                 "w-full rounded-sm-semi border border-border-neutral-faded bg-background-page-secondary",
-                media.isVertical && "mx-auto max-w-[420px]"
+                media.isVertical && "mx-auto max-w-[420px]",
               )}
               style={{
                 aspectRatio:
@@ -301,7 +305,9 @@ export const ItemMediaPreview = ({
             <source src={media.src} />
           </audio>
           {extraCount > 0 && (
-            <div className="mt-1 text-[10px] font-medium text-foreground-secondary">+{extraCount} more media</div>
+            <div className="mt-1 text-[10px] font-medium text-foreground-secondary">
+              +{extraCount} more media
+            </div>
           )}
         </div>
       )}

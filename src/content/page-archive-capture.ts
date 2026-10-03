@@ -96,14 +96,19 @@ const consumeResourceBudget = (context: CaptureContext, byteSize: number): void 
   context.resourceBytes += byteSize;
 };
 
-const fetchForCapture = async (input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> => {
+const fetchForCapture = async (
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+): Promise<Response> => {
   const context = activeContext;
   if (!context) throw new Error("ARCHIVE_CAPTURE_NOT_ACTIVE");
   if (Date.now() >= context.deadlineAt) throw new Error("ARCHIVE_CAPTURE_DEADLINE");
-  if (context.resourceCount >= PAGE_ARCHIVE_MAX_RESOURCE_REQUESTS) throw new Error("ARCHIVE_RESOURCE_LIMIT");
+  if (context.resourceCount >= PAGE_ARCHIVE_MAX_RESOURCE_REQUESTS)
+    throw new Error("ARCHIVE_RESOURCE_LIMIT");
   context.resourceCount += 1;
 
-  const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  const rawUrl =
+    typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   const url = new URL(rawUrl, window.location.href);
   const accept = new Headers(init.headers).get("accept") || "*/*";
 
@@ -142,13 +147,18 @@ const fetchForCapture = async (input: RequestInfo | URL, init: RequestInit = {})
       }
       const bytes = await readLocalResponse(
         response,
-        Math.min(PAGE_ARCHIVE_MAX_RESOURCE_BYTES, PAGE_ARCHIVE_MAX_RESOURCE_TOTAL_BYTES - context.resourceBytes),
+        Math.min(
+          PAGE_ARCHIVE_MAX_RESOURCE_BYTES,
+          PAGE_ARCHIVE_MAX_RESOURCE_TOTAL_BYTES - context.resourceBytes,
+        ),
       );
       consumeResourceBudget(context, bytes.byteLength);
       return new Response(bytes, {
         status: response.status,
         statusText: response.statusText,
-        headers: { "content-type": response.headers.get("content-type") || "application/octet-stream" },
+        headers: {
+          "content-type": response.headers.get("content-type") || "application/octet-stream",
+        },
       });
     } finally {
       window.clearTimeout(timeout);
@@ -242,9 +252,18 @@ const RESOURCE_HINT_SELECTOR = [
   "[style]",
   "style",
 ].join(",");
-const RESOURCE_ATTRIBUTES = ["src", "srcset", "poster", "background", "href", "xlink:href"] as const;
+const RESOURCE_ATTRIBUTES = [
+  "src",
+  "srcset",
+  "poster",
+  "background",
+  "href",
+  "xlink:href",
+] as const;
 
-const collectOriginalResourceHints = (sessionId: string): {
+const collectOriginalResourceHints = (
+  sessionId: string,
+): {
   hints: OriginalResourceHint[];
   cleanup: () => void;
 } => {
@@ -259,7 +278,8 @@ const collectOriginalResourceHints = (sessionId: string): {
     }
     const style = element.getAttribute("style");
     if (style) attributes.style = style;
-    const styleText = element.tagName.toLowerCase() === "style" ? element.textContent || "" : undefined;
+    const styleText =
+      element.tagName.toLowerCase() === "style" ? element.textContent || "" : undefined;
     if (Object.keys(attributes).length === 0 && !styleText) continue;
 
     const id = `${sessionId}-${index++}`;
@@ -319,9 +339,9 @@ const restoreOriginalResourceHints = (html: string, hints: OriginalResourceHint[
     link.setAttribute("href", hint.attributes.href);
     parsed.head.appendChild(link);
   }
-  parsed.querySelectorAll(`[${RESOURCE_HINT_ATTRIBUTE}]`).forEach((element) =>
-    element.removeAttribute(RESOURCE_HINT_ATTRIBUTE),
-  );
+  parsed
+    .querySelectorAll(`[${RESOURCE_HINT_ATTRIBUTE}]`)
+    .forEach((element) => element.removeAttribute(RESOURCE_HINT_ATTRIBUTE));
   const doctype = parsed.doctype ? "<!doctype html>" : "";
   return `${doctype}${parsed.documentElement.outerHTML}`;
 };
@@ -368,7 +388,8 @@ const sendArchive = async (
     type: PAGE_ARCHIVE_FINISH_MESSAGE,
     payload: { sessionId, chunkCount: sequence, capturedUrl, title },
   })) as ArchiveProtocolResponse<{ byteSize: number }>;
-  if (!finished?.success || !finished.payload) throw new Error(finished?.error || "ARCHIVE_FINISH_FAILED");
+  if (!finished?.success || !finished.payload)
+    throw new Error(finished?.error || "ARCHIVE_FINISH_FAILED");
   return { byteSize: finished.payload.byteSize, chunkCount: sequence };
 };
 
@@ -407,14 +428,16 @@ export const capturePageArchive = async (
         request.maxHtmlBytes,
       );
     } catch (error) {
-      await chrome.runtime.sendMessage({
-        target: "background",
-        type: PAGE_ARCHIVE_ABORT_MESSAGE,
-        payload: {
-          sessionId: request.sessionId,
-          reason: error instanceof Error ? error.message : "ARCHIVE_CAPTURE_FAILED",
-        },
-      }).catch(() => {});
+      await chrome.runtime
+        .sendMessage({
+          target: "background",
+          type: PAGE_ARCHIVE_ABORT_MESSAGE,
+          payload: {
+            sessionId: request.sessionId,
+            reason: error instanceof Error ? error.message : "ARCHIVE_CAPTURE_FAILED",
+          },
+        })
+        .catch(() => {});
       throw error;
     } finally {
       originalResources.cleanup();

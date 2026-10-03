@@ -37,19 +37,34 @@ export const KEY = {
   shares: /(share_count|^shares$)/i,
 };
 
-/** Depth-first walk over every object node (arrays traversed, objects yielded). */
-export function* walk(node: Json, depth = 0): Generator<{ node: Obj; depth: number }> {
+/**
+ * Subtrees that describe someone or something attached to a post rather than
+ * the post itself: its soundtrack, tagged people, collaborators, likers and
+ * comments. A licensed-music reel carries the artist's full Instagram profile
+ * and the song title under `clips_metadata`, which otherwise outrank the
+ * poster and the caption.
+ */
+export const ATTACHED_ENTITY =
+  /^(clips_metadata|music_metadata|music_info|music_asset_info|music_consumption_info|original_sound_info|usertags|coauthor_producers|invited_coauthor_producers|sponsor_tags|facepile_top_likers|top_likers|likers|preview_comments|comments)$/iu;
+
+/**
+ * Depth-first walk over every object node (arrays traversed, objects yielded).
+ * Values under keys matching `skip` are not descended into.
+ */
+export function* walk(node: Json, depth = 0, skip?: RegExp): Generator<{ node: Obj; depth: number }> {
   if (Array.isArray(node)) {
-    for (const child of node) yield* walk(child, depth);
+    for (const child of node) yield* walk(child, depth, skip);
   } else if (isObj(node)) {
     yield { node, depth };
-    for (const key of Object.keys(node)) yield* walk(node[key], depth + 1);
+    for (const key of Object.keys(node)) {
+      if (!skip?.test(key)) yield* walk(node[key], depth + 1, skip);
+    }
   }
 }
 
-/** All key/value pairs anywhere below a JSON node. */
-export function* entries(node: Json): Generator<[string, Json]> {
-  for (const { node: object } of walk(node)) {
+/** All key/value pairs anywhere below a JSON node, outside `skip` subtrees. */
+export function* entries(node: Json, skip?: RegExp): Generator<[string, Json]> {
+  for (const { node: object } of walk(node, 0, skip)) {
     for (const key of Object.keys(object)) yield [key, object[key]];
   }
 }
@@ -66,7 +81,8 @@ export function decodeEntities(text: string): string {
 /** Longest non-URL string under a known text field. */
 export function pickText(node: Json): string {
   let best = "";
-  for (const [key, value] of entries(node)) {
+  // A song title or a long comment is not what the post says.
+  for (const [key, value] of entries(node, ATTACHED_ENTITY)) {
     const text = jsonString(value);
     if (text?.trim() && !isHttp(text) && KEY.text.test(key) && text.length > best.length) {
       best = text;
