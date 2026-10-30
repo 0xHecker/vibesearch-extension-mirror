@@ -1,9 +1,5 @@
-import { getCloudAuthToken } from "./cloud-auth";
-import { getArchiveDeviceKey } from "./device-key";
-import {
-  CLOUD_SYNC_API_BASE_KEY,
-  DEFAULT_VIBESEARCH_API_BASE,
-} from "./cloud-config";
+import type { CloudConnectionLifetime } from "./cloud-auth";
+import { assertCloudConnectionCurrent, CloudConnectionRetiredError, getArchiveCloudConnection } from "./cloud-connection";
 import { getArchiveCache } from "./archive-cache";
 import { normalizeArchiveItemId } from "./archive-identity";
 import {
@@ -58,7 +54,7 @@ export class ArchivePreviewError extends Error {
   }
 }
 
-export type ArchivePreviewConnection = {
+export type ArchivePreviewConnection = CloudConnectionLifetime & {
   token: string;
   apiBase: string;
   /** Login-less identity: unlocks the anonymous per-device archive namespace. */
@@ -84,9 +80,9 @@ export type ArchivePreviewSessionOptions = {
   recoverMissing?: (itemId: string) => Promise<boolean>;
   cache?: {
     get(itemId: string): Promise<Blob | null>;
-    put(itemId: string, body: Blob, updatedAt?: number): Promise<unknown>;
-    putCloud?(itemId: string, body: Blob, updatedAt?: number): Promise<unknown>;
-    putIfAbsent?(itemId: string, body: Blob, updatedAt?: number): Promise<unknown>;
+    put(itemId: string, body: Blob, updatedAt?: number, assertCurrent?: () => Promise<void>): Promise<unknown>;
+    putCloud?(itemId: string, body: Blob, updatedAt?: number, assertCurrent?: () => Promise<void>): Promise<unknown>;
+    putIfAbsent?(itemId: string, body: Blob, updatedAt?: number, assertCurrent?: () => Promise<void>): Promise<unknown>;
   };
 };
 
@@ -119,12 +115,12 @@ export const createArchivePreviewLocalCache = (
     }
     return cache.get(itemId);
   },
-  put: (itemId, body, updatedAt) => cache.put(itemId, body, updatedAt),
+  put: (itemId, body, updatedAt, assertCurrent) => cache.put(itemId, body, updatedAt, assertCurrent),
   ...(cache.putCloud
-    ? { putCloud: (itemId: string, body: Blob, updatedAt?: number) => cache.putCloud!(itemId, body, updatedAt) }
+    ? { putCloud: (itemId: string, body: Blob, updatedAt?: number, assertCurrent?: () => Promise<void>) => cache.putCloud!(itemId, body, updatedAt, assertCurrent) }
     : {}),
   ...(cache.putIfAbsent
-    ? { putIfAbsent: (itemId: string, body: Blob, updatedAt?: number) => cache.putIfAbsent!(itemId, body, updatedAt) }
+    ? { putIfAbsent: (itemId: string, body: Blob, updatedAt?: number, assertCurrent?: () => Promise<void>) => cache.putIfAbsent!(itemId, body, updatedAt, assertCurrent) }
     : {}),
   });
 };
@@ -140,24 +136,7 @@ const normalizeApiBase = (value: string): string => {
   return value.replace(/\/+$/, "");
 };
 
-const defaultConnection = async (forceRefresh: boolean): Promise<ArchivePreviewConnection> => {
-  const [row, token, deviceKey] = await Promise.all([
-    chrome.storage.local
-      .get(CLOUD_SYNC_API_BASE_KEY)
-      .then((value) => value as Record<string, unknown>)
-      .catch((): Record<string, unknown> => ({})),
-    getCloudAuthToken(forceRefresh).catch(() => ""),
-    getArchiveDeviceKey(),
-  ]);
-  const configured = typeof row[CLOUD_SYNC_API_BASE_KEY] === "string"
-    ? row[CLOUD_SYNC_API_BASE_KEY].trim()
-    : "";
-  return {
-    token,
-    apiBase: normalizeApiBase(configured || DEFAULT_VIBESEARCH_API_BASE),
-    deviceKey,
-  };
-};
+const defaultConnection = getArchiveCloudConnection;
 
 const errorForResponse = (response: Response): ArchivePreviewError => {
   if (response.status === 401 || response.status === 403) {
@@ -392,6 +371,7 @@ export class ArchivePreviewSession {
         this.controller.signal,
       );
       this.assertActive();
+      await this.assertConnectionCurrent(connection);
       if (byteSize === 0) {
         throw new ArchivePreviewError(
           "ARCHIVE_PREVIEW_INVALID_RESPONSE",
@@ -409,11 +389,11 @@ export class ArchivePreviewSession {
       // response, but a successful write is awaited before reporting success.
       const cacheRemote = this.preferFresh
         ? this.cache.putCloud
-          ? this.cache.putCloud(itemId, sourceBlob, loadStartedAt)
-          : this.cache.put(itemId, sourceBlob, loadStartedAt)
+          ? this.cache.putCloud(itemId, sourceBlob, loadStartedAt, () => this.assertConnectionCurrent(connection))
+          : this.cache.put(itemId, sourceBlob, loadStartedAt, () => this.assertConnectionCurrent(connection))
         : this.cache.putIfAbsent
-          ? this.cache.putIfAbsent(itemId, sourceBlob, loadStartedAt)
-          : this.cache.put(itemId, sourceBlob, loadStartedAt);
+          ? this.cache.putIfAbsent(itemId, sourceBlob, loadStartedAt, () => this.assertConnectionCurrent(connection))
+          : this.cache.put(itemId, sourceBlob, loadStartedAt, () => this.assertConnectionCurrent(connection));
       await this.awaitWhileActive(
         cacheRemote.catch((error) => {
           if (typeof chrome !== "undefined") {
@@ -422,6 +402,7 @@ export class ArchivePreviewSession {
         }),
       );
       this.assertActive();
+      await this.assertConnectionCurrent(connection);
       // A newer local capture may have filled the cache while the cloud read
       // was in flight. Render that authoritative copy instead of briefly
       // showing the older response that putIfAbsent correctly refused.
@@ -429,10 +410,12 @@ export class ArchivePreviewSession {
         this.cache.get(itemId).catch(() => null),
       );
       this.assertActive();
+      await this.assertConnectionCurrent(connection);
       return await this.createDocument(
         authoritativeBlob || sourceBlob,
         authoritativeBlob?.size || byteSize,
         this.localCapturedAt(authoritativeBlob) || capturedAt,
+        connection,
       );
     } catch (error) {
       if (
@@ -454,7 +437,7 @@ export class ArchivePreviewSession {
           "The saved copy took too long to load.",
         );
       }
-      if (!this.active || this.controller.signal.aborted || isAbortError(error)) {
+      if (!this.active || this.controller.signal.aborted || isAbortError(error) || error instanceof CloudConnectionRetiredError) {
         throw new ArchivePreviewError("ARCHIVE_PREVIEW_ABORTED", "The archive preview was closed.");
       }
       if (error instanceof ArchivePreviewError) throw error;
@@ -490,11 +473,12 @@ export class ArchivePreviewSession {
     itemId: string,
     connection: ArchivePreviewConnection,
   ): Promise<Response | null> {
+    await this.assertConnectionCurrent(connection);
     const token = connection.token.trim();
     const deviceKey = connection.deviceKey?.trim() ?? "";
     if (!token && !deviceKey) return null;
     const apiBase = normalizeApiBase(connection.apiBase.trim());
-    return this.fetcher(`${apiBase}/v1/items/${encodeURIComponent(itemId)}/archive`, {
+    const response = await this.fetcher(`${apiBase}/v1/items/${encodeURIComponent(itemId)}/archive`, {
       method: "GET",
       headers: {
         accept: "text/html, application/xhtml+xml",
@@ -507,6 +491,9 @@ export class ArchivePreviewSession {
       cache: "no-store",
       signal: this.controller.signal,
     });
+    try { await this.assertConnectionCurrent(connection); }
+    catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
+    return response;
   }
 
   /**
@@ -538,6 +525,8 @@ export class ArchivePreviewSession {
     if (!connection.token) return { response: null, connection };
 
     const refreshed = await this.awaitWhileActive(this.getConnection(true));
+    await this.assertConnectionCurrent(connection);
+    await this.assertConnectionCurrent(refreshed);
     this.assertActive();
     const sameIdentity =
       refreshed.token === connection.token && refreshed.deviceKey === connection.deviceKey;
@@ -552,6 +541,7 @@ export class ArchivePreviewSession {
     source: Blob,
     sourceByteSize: number,
     capturedAt?: number,
+    connection?: ArchivePreviewConnection,
   ): Promise<ArchivePreviewDocument> {
     if (sourceByteSize <= 0) {
       throw new ArchivePreviewError(
@@ -567,10 +557,12 @@ export class ArchivePreviewSession {
     }
     const blob = await this.awaitWhileActive(this.sanitizeSource(source));
     this.assertActive();
+    if (connection) await this.assertConnectionCurrent(connection);
     const objectUrl = this.createObjectUrl(blob);
-    if (!this.active || this.controller.signal.aborted) {
+    if (!this.active || this.controller.signal.aborted || connection?.isCurrent?.() === false) {
       this.revokeObjectUrl(objectUrl);
       this.assertActive();
+      throw new CloudConnectionRetiredError();
     }
     this.objectUrl = objectUrl;
     return { url: objectUrl, sourceByteSize, ...(capturedAt ? { capturedAt } : {}) };
@@ -587,6 +579,11 @@ export class ArchivePreviewSession {
     if (!this.active || this.controller.signal.aborted) {
       throw new ArchivePreviewError("ARCHIVE_PREVIEW_ABORTED", "The archive preview was closed.");
     }
+  }
+
+  private async assertConnectionCurrent(connection: ArchivePreviewConnection): Promise<void> {
+    await assertCloudConnectionCurrent(connection);
+    this.assertActive();
   }
 
   /**

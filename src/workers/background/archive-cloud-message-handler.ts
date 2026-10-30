@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { shouldScheduleCloudSyncContinuation } from "@src/services/cloud-sync-continuation";
 import type { CloudSyncAllResult } from "@src/services/cloud-sync";
-import { markCloudSessionRejected } from "@src/services/cloud-auth";
 import {
   PAGE_ARCHIVE_ABORT_MESSAGE,
   PAGE_ARCHIVE_CHUNK_CODE_UNITS,
@@ -407,8 +406,6 @@ export const handleArchiveCloudMessage = (
           (result.push.reason === "http-error" &&
             /^(401|403)\b/.test(result.push.error || ""));
         if (refusedByServer) {
-          // The server rejected this session: stop reporting "Connected".
-          await markCloudSessionRejected().catch(() => {});
           throw new Error(
             "Your Vibesearch session expired. Reconnect your cloud account and try again.",
           );
@@ -429,8 +426,6 @@ export const handleArchiveCloudMessage = (
         await scheduleArchiveOutboxRetry();
       }
       if (archive.reason === "auth-required" || archive.tokenRejected) {
-        // The API actually refused a token: the session is dead.
-        await markCloudSessionRejected().catch(() => {});
         throw new Error(
           "Your Vibesearch session expired. Reconnect your cloud account and try again.",
         );

@@ -1,3 +1,4 @@
+import { legacyCloudEnabled } from "@src/services/extension-policy";
 import { getArchiveCache } from "@src/services/archive-cache";
 import { ArchiveCaptureSessionManager } from "@src/services/archive-capture-session";
 import { collectArchiveItemIds } from "@src/services/archive-identity";
@@ -19,15 +20,7 @@ import {
   pickLiveArchiveCaptureTab,
   withTemporaryArchiveTab,
 } from "@src/services/archive-tab-recovery";
-import {
-  getCloudAuthToken,
-  markCloudSessionRejected,
-} from "@src/services/cloud-auth";
-import {
-  CLOUD_SYNC_API_BASE_KEY,
-  DEFAULT_VIBESEARCH_API_BASE,
-} from "@src/services/cloud-config";
-import { getArchiveDeviceKey } from "@src/services/device-key";
+export { claimAnonymousArchives } from "@src/services/archive-cloud-claim";
 import { normalizeHttpUrl } from "@src/workers/background/import-utils";
 import { sendProcessStatus } from "@src/workers/background/process-status";
 import { sendForwardedToOffscreen } from "@src/workers/background/runtime";
@@ -42,9 +35,6 @@ export type ArchiveCaptureResult = {
 };
 export type ArchiveRecoveryResult = { captured: boolean; reason?: string };
 
-const claimResponseSchema = z.object({
-  imported: z.number().int().nonnegative().optional(),
-});
 const protocolResponseSchema: z.ZodType<ArchiveProtocolResponse> = z.object({
   success: z.boolean(),
   payload: z.unknown().optional(),
@@ -165,6 +155,7 @@ export async function markArchiveItemCancelled(itemId: string): Promise<void> {
 }
 
 export async function scheduleArchiveOutboxRetry(): Promise<void> {
+  if (!await legacyCloudEnabled()) return;
   const jobs = (await archiveOutbox.list()).filter((job) => !job.terminal);
   if (jobs.length === 0) {
     await chrome.alarms.clear(ARCHIVE_OUTBOX_RETRY_ALARM_NAME);
@@ -179,13 +170,11 @@ export async function scheduleArchiveOutboxRetry(): Promise<void> {
 export async function triggerArchiveOutboxDrain(): Promise<
   ArchiveOutboxDrainResult | undefined
 > {
+  if (!await legacyCloudEnabled()) return undefined;
   if (writesSuspended || globalThis.navigator?.onLine === false)
     return undefined;
   try {
     const result = await archiveOutbox.drain(ARCHIVE_OUTBOX_DRAIN_LIMIT);
-    if (result.reason === "auth-required" || result.tokenRejected) {
-      await markCloudSessionRejected().catch(() => undefined);
-    }
     const escalated = await escalateTerminalArchivesToSessionCapture();
     const jobs = await archiveOutbox.list();
     for (const job of jobs
@@ -241,45 +230,6 @@ export async function queueServerArchive(
       "error",
       `Capture not finished: ${job.lastError || "will retry"}`,
     );
-  }
-}
-
-/** Copy login-less device archives into the signed-in account, best effort. */
-export async function claimAnonymousArchives(): Promise<void> {
-  try {
-    const token = await getCloudAuthToken();
-    const deviceKey = await getArchiveDeviceKey();
-    if (!token || !deviceKey) return;
-    const stored = await chrome.storage.local.get(CLOUD_SYNC_API_BASE_KEY);
-    const parsedBase = z.string().safeParse(stored[CLOUD_SYNC_API_BASE_KEY]);
-    const apiBase = parsedBase.success
-      ? parsedBase.data.trim().replace(/\/+$/, "") ||
-        DEFAULT_VIBESEARCH_API_BASE
-      : DEFAULT_VIBESEARCH_API_BASE;
-    const response = await fetch(`${apiBase}/v1/archives/claim`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "x-vs-device-key": deviceKey,
-      },
-      credentials: "omit",
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      console.warn("[archive] anon claim failed", response.status);
-      return;
-    }
-    const parsed = claimResponseSchema.safeParse(await response.json());
-    if (parsed.success && parsed.data.imported) {
-      console.info(
-        `[archive] claimed ${parsed.data.imported} device archive(s) into account`,
-      );
-      void chrome.runtime
-        .sendMessage({ type: "DB_CHANGE", scope: "items" })
-        .catch(() => undefined);
-    }
-  } catch (cause) {
-    console.warn("[archive] anon claim skipped", cause);
   }
 }
 

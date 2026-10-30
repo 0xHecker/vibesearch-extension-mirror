@@ -75,7 +75,7 @@ test("development auth can auto-connect the same identity without an iframe", as
     }),
   });
 
-  expect(await service.getCredentials()).toEqual({
+  expect(await service.getCredentials()).toMatchObject({
     token: "dev:user_demo",
     userId: "user_demo",
   });
@@ -307,6 +307,157 @@ test("credentials never combine one account token with another account profile",
   });
 
   expect(await service.getCredentials()).toEqual({ token: "", userId: "" });
+});
+
+test("credential leases survive same-owner token refresh and retire on disconnect or reconnect", async () => {
+  const now = 1_000_000;
+  const local = storage();
+  let issued = 0;
+  const service = new CloudAuthService({
+    storage: local.adapter,
+    now: () => now,
+    requestHostedToken: async () => token(now + 3_600_000, `token-${++issued}`),
+  });
+  await service.connect();
+  const original = await service.getCredentials();
+  expect(original.isCurrent?.()).toBe(true);
+  const refreshed = await service.getCredentials(true);
+  expect(refreshed.token).not.toBe(original.token);
+  expect(refreshed.userId).toBe(original.userId);
+  expect(original.isCurrent?.()).toBe(true);
+  expect(refreshed.isCurrent?.()).toBe(true);
+
+  await service.disconnect();
+  expect(original.isCurrent?.()).toBe(false);
+  expect(refreshed.isCurrent?.()).toBe(false);
+  await service.connect();
+  expect(original.isCurrent?.()).toBe(false);
+  expect((await service.getCredentials()).isCurrent?.()).toBe(true);
+});
+
+test("a silent refresh to another owner retires old credential leases", async () => {
+  const now = 1_000_000;
+  const local = storage();
+  let owner = "user-1";
+  const service = new CloudAuthService({
+    storage: local.adapter,
+    now: () => now,
+    requestHostedToken: async () => ({ ...token(now + 3_600_000, `token-${owner}`), user: { ...profile, uid: owner } }),
+  });
+  await service.connect();
+  const original = await service.getCredentials();
+  owner = "user-2";
+  expect(await service.getCredentials(true)).toEqual({ token: "", userId: "" });
+  expect(original.isCurrent?.()).toBe(false);
+  const next = await service.getCredentials();
+  expect(next).toMatchObject({ token: "token-user-2", userId: "user-2" });
+  expect(next.isCurrent?.()).toBe(true);
+});
+
+test("credentials cannot lease the previous owner while a new connect is pending", async () => {
+  const now = 1_000_000;
+  const local = storage();
+  let completeConnect!: (result: CloudAuthToken) => void;
+  const nextToken = new Promise<CloudAuthToken>((resolve) => { completeConnect = resolve; });
+  let requests = 0;
+  const service = new CloudAuthService({
+    storage: local.adapter,
+    now: () => now,
+    requestHostedToken: async () => ++requests === 1 ? token(now + 3_600_000) : nextToken,
+  });
+  await service.connect();
+  const original = await service.getCredentials();
+  const connecting = service.connect();
+  expect(original.isCurrent?.()).toBe(false);
+  expect(await service.getCredentials()).toEqual({ token: "", userId: "" });
+  completeConnect({ ...token(now + 3_600_000, "other-token"), user: { ...profile, uid: "user-2" } });
+  await connecting;
+  expect(await service.getCredentials()).toMatchObject({ token: "other-token", userId: "user-2" });
+  expect(original.isCurrent?.()).toBe(false);
+});
+
+test("credentials cannot lease stored credentials while disconnect storage is pending", async () => {
+  const now = 1_000_000;
+  const local = storage();
+  let finishRemove!: () => void;
+  const removal = new Promise<void>((resolve) => { finishRemove = resolve; });
+  const service = new CloudAuthService({
+    storage: {
+      ...local.adapter,
+      async remove(keys) {
+        await removal;
+        await local.adapter.remove(keys);
+      },
+    },
+    now: () => now,
+    requestHostedToken: async () => token(now + 3_600_000),
+  });
+  await service.connect();
+  const original = await service.getCredentials();
+  const disconnecting = service.disconnect();
+  expect(original.isCurrent?.()).toBe(false);
+  expect(await service.getCredentials()).toEqual({ token: "", userId: "" });
+  finishRemove();
+  await disconnecting;
+  expect(await service.getCredentials()).toEqual({ token: "", userId: "" });
+});
+
+for (const operation of ["connect", "refresh"] as const) {
+  test(`a delayed ${operation} storage write cannot restore credentials after disconnect`, async () => {
+    const now = 1_000_000;
+    const local = storage();
+    let blockWrite = false;
+    let writeStarted!: () => void;
+    const started = new Promise<void>((resolve) => { writeStarted = resolve; });
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const service = new CloudAuthService({
+      storage: {
+        ...local.adapter,
+        async set(entries) {
+          if (blockWrite && CLOUD_SYNC_TOKEN_KEY in entries) {
+            writeStarted();
+            await writeGate;
+          }
+          await local.adapter.set(entries);
+        },
+      },
+      now: () => now,
+      requestHostedToken: async () => token(now + 3_600_000),
+    });
+    await service.connect();
+    blockWrite = true;
+    const pending = operation === "connect" ? service.connect() : service.getToken(true);
+    await started;
+    const disconnecting = service.disconnect();
+    // Let an unguarded disconnect finish while the earlier write is held.
+    await Bun.sleep(0);
+    releaseWrite();
+    const [result] = await Promise.all([pending, disconnecting]);
+    if (operation === "refresh") expect(result).toBe("");
+    expect(await service.status()).toMatchObject({ connected: false, optedIn: false });
+    expect(await service.getCredentials()).toEqual({ token: "", userId: "" });
+    expect(local.values.has(CLOUD_SYNC_TOKEN_KEY)).toBe(false);
+  });
+}
+
+test("a failed account chooser releases the credential fence for the prior session", async () => {
+  const now = 1_000_000;
+  const local = storage();
+  let requests = 0;
+  const service = new CloudAuthService({
+    storage: local.adapter,
+    now: () => now,
+    requestHostedToken: async () => {
+      if (++requests > 1) throw new Error("Account chooser cancelled");
+      return token(now + 3_600_000);
+    },
+  });
+  await service.connect();
+  await expect(service.connect()).rejects.toThrow("Account chooser cancelled");
+  const credentials = await service.getCredentials();
+  expect(credentials).toMatchObject({ token: "firebase-token", userId: "user-1" });
+  expect(credentials.isCurrent?.()).toBe(true);
 });
 
 test("Firebase expiry parsing accepts base64url JWT payloads and rejects opaque tokens", () => {

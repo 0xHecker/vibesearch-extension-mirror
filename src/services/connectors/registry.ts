@@ -1,3 +1,4 @@
+import { requireLegacyCloud, legacyBrowserEnabled } from "@src/services/extension-policy";
 /**
  * connectors/registry.ts — drives all social connectors uniformly.
  *
@@ -10,7 +11,8 @@
  *  • **scheduler** via chrome.alarms.
  */
 import { pushCapturedItems } from "./cloud-push";
-import { getCloudAuthToken } from "../cloud-auth";
+import { getCloudAuthConnection, type CloudConnectionLifetime } from "../cloud-auth";
+import { assertCloudConnectionCurrent } from "../cloud-connection";
 import { xConnector } from "./x-bookmarks";
 import { redditConnector } from "./reddit-saved";
 import { instagramConnector } from "./instagram-saved";
@@ -46,7 +48,8 @@ async function loadStates(): Promise<StateMap> {
   }
 }
 
-async function saveStates(map: StateMap): Promise<void> {
+async function saveStates(map: StateMap, connection?: CloudConnectionLifetime): Promise<void> {
+  if (connection) await assertCloudConnectionCurrent(connection);
   try {
     await chrome.storage.local.set({ [STORE_KEY]: map });
   } catch {
@@ -82,6 +85,8 @@ export async function connect(platform: ConnectorPlatform): Promise<ConnectorSta
     displayName: account.displayName,
     connected: true,
     autoSync: prev?.autoSync ?? true,
+    cloudUserId: prev?.cloudUserId,
+    cloudCheckpoints: prev?.cloudCheckpoints,
     sinceId: prev?.sinceId,
     continuationCursor: prev?.continuationCursor,
     pendingNewestId: prev?.pendingNewestId,
@@ -185,6 +190,7 @@ async function runConnectorSync(
   accountId: string,
   onProgress?: (detail: string) => void,
 ): Promise<ConnectorSyncOutcome> {
+  await requireLegacyCloud();
   const map = await loadStates();
   const key = connectorKey(platform, accountId);
   const state = map[key];
@@ -193,8 +199,9 @@ async function runConnectorSync(
   const base: ConnectorSyncOutcome = { platform, accountId, handle: state.handle, fetched: 0, pushed: 0, skipped: 0, failed: 0 };
 
   onProgress?.("Checking your Vibesearch sign-in…");
-  const token = await getCloudAuthToken();
-  if (!token) {
+  const connection = await getCloudAuthConnection();
+  const token = connection.token;
+  if (!token || !connection.userId) {
     state.lastError = "Sign in to Vibesearch to sync to the cloud.";
     await saveStates(map);
     return { ...base, error: state.lastError };
@@ -204,6 +211,28 @@ async function runConnectorSync(
   const shouldCancel = () => cancelRequested.has(platform);
 
   try {
+    await assertCloudConnectionCurrent(connection);
+    if (state.cloudUserId !== connection.userId) {
+      if (state.cloudUserId) {
+        state.cloudCheckpoints = {
+          ...state.cloudCheckpoints,
+          [state.cloudUserId]: {
+            sinceId: state.sinceId,
+            continuationCursor: state.continuationCursor,
+            pendingNewestId: state.pendingNewestId,
+            lastSyncAt: state.lastSyncAt,
+            itemCount: state.itemCount,
+          },
+        };
+      }
+      const checkpoint = state.cloudCheckpoints?.[connection.userId];
+      state.cloudUserId = connection.userId;
+      state.sinceId = checkpoint?.sinceId;
+      state.continuationCursor = checkpoint?.continuationCursor;
+      state.pendingNewestId = checkpoint?.pendingNewestId;
+      state.lastSyncAt = checkpoint?.lastSyncAt;
+      state.itemCount = checkpoint?.itemCount ?? 0;
+    }
     onProgress?.(`Reading your ${label} saved items…`);
     const { items, newestId, nextCursor, complete } = await CONNECTOR_MODULES[platform].fetchSaved({
       sinceId: state.sinceId,
@@ -211,6 +240,7 @@ async function runConnectorSync(
       onProgress,
       shouldCancel,
     });
+    await assertCloudConnectionCurrent(connection);
     if (items.length === 0) {
       const cancelled = shouldCancel();
       cancelRequested.delete(platform);
@@ -230,7 +260,7 @@ async function runConnectorSync(
       } else {
         state.lastError = "Sync paused before the remote backlog was complete; it will retry.";
       }
-      await saveStates(map);
+      await saveStates(map, connection);
       let progressDetail = "More saved items remain; continuing shortly.";
       if (cancelled) progressDetail = "Sync cancelled.";
       else if (complete) progressDetail = "You're all caught up — no new saved items.";
@@ -239,9 +269,11 @@ async function runConnectorSync(
     }
     onProgress?.(`Found ${items.length} new item${items.length === 1 ? "" : "s"} — sending to Vibesearch…`);
     const push = await pushCapturedItems(items, {
+      connection,
       onProgress: (done, total) => onProgress?.(`Sending to Vibesearch… ${done}/${total}`),
       shouldCancel,
     });
+    await assertCloudConnectionCurrent(connection);
     const cancelled = shouldCancel();
     cancelRequested.delete(platform);
     const batchCommitted = shouldAdvanceConnectorCursor({
@@ -273,12 +305,14 @@ async function runConnectorSync(
     } else {
       state.lastError = "More saved items remain; sync will resume shortly.";
     }
-    await saveStates(map);
+    await saveStates(map, connection);
     return { ...base, fetched: items.length, ...push, cancelled, hasMore: !complete };
   } catch (err) {
     cancelRequested.delete(platform);
+    try { await assertCloudConnectionCurrent(connection); }
+    catch { return { ...base, cancelled: true, error: "Cloud account changed or sync was disabled. Saved items will be retried." }; }
     state.lastError = err instanceof Error ? err.message : String(err);
-    await saveStates(map);
+    await saveStates(map, connection);
     return { ...base, error: state.lastError };
   }
 }
@@ -309,6 +343,7 @@ export async function syncAllConnected(onProgress?: (detail: string) => void): P
 
 /** Register the periodic sync alarm (also runs a heartbeat each tick). */
 export async function setupConnectorScheduler(intervalMinutes = 240): Promise<void> {
+  if (!await legacyBrowserEnabled()) return;
   try {
     await chrome.alarms.create(CONNECTOR_SYNC_ALARM, {
       periodInMinutes: Math.max(30, intervalMinutes),
@@ -321,6 +356,7 @@ export async function setupConnectorScheduler(intervalMinutes = 240): Promise<vo
 
 /** Called from the alarm handler: heartbeat, then sync the still-connected ones. */
 export async function onConnectorAlarm(): Promise<void> {
+  if (!await legacyBrowserEnabled()) return;
   await runHeartbeats();
   await syncAllConnected();
 }

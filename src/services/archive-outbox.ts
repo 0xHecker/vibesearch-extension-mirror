@@ -1,9 +1,6 @@
-import {
-  CLOUD_SYNC_API_BASE_KEY,
-  DEFAULT_VIBESEARCH_API_BASE,
-} from "./cloud-config";
-import { getCloudAuthToken } from "./cloud-auth";
-import { getArchiveDeviceKey } from "./device-key";
+import { requireLegacyCloud } from "@src/services/extension-policy";
+import type { CloudConnectionLifetime } from "./cloud-auth";
+import { assertCloudConnectionCurrent, CloudConnectionRetiredError, getArchiveCloudConnection } from "./cloud-connection";
 import { withOpfsMutationLock } from "./media-storage";
 import { collectArchiveItemIds, normalizeArchiveItemId } from "./archive-identity";
 import { isServerCapturableArchiveUrl } from "./archive-resource-url";
@@ -54,7 +51,7 @@ export type ArchiveOutboxJob = {
   remoteAttempts?: number;
 };
 
-export type ArchiveOutboxConnection = {
+export type ArchiveOutboxConnection = CloudConnectionLifetime & {
   token: string;
   apiBase: string;
   /** Login-less identity: uploads land in the anonymous per-device namespace. */
@@ -126,7 +123,7 @@ export type ArchiveOutboxDrainResult = {
    */
   tokenRejected: boolean;
   remaining: number;
-  reason?: "empty" | "missing-token" | "auth-required" | "not-due" | "terminal";
+  reason?: "empty" | "missing-token" | "auth-required" | "not-due" | "terminal" | "cancelled";
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -233,19 +230,7 @@ export const parseRetryAfterMs = (value: string | null, now = Date.now()): numbe
   return Number.isFinite(date) ? Math.max(0, date - now) : 0;
 };
 
-const defaultConnection = async (forceRefresh = false): Promise<ArchiveOutboxConnection> => {
-  const [row, token, deviceKey] = await Promise.all([
-    chrome.storage.local.get(CLOUD_SYNC_API_BASE_KEY),
-    getCloudAuthToken(forceRefresh).catch(() => ""),
-    getArchiveDeviceKey(),
-  ]);
-  const configured = typeof row[CLOUD_SYNC_API_BASE_KEY] === "string" ? row[CLOUD_SYNC_API_BASE_KEY].trim() : "";
-  return {
-    token,
-    apiBase: (configured || DEFAULT_VIBESEARCH_API_BASE).replace(/\/+$/, ""),
-    deviceKey,
-  };
-};
+const defaultConnection = getArchiveCloudConnection;
 
 export const createChromeArchiveOutboxStorage = (): ArchiveOutboxStorage => ({
   async read() {
@@ -423,7 +408,11 @@ const requestWithTimeout = async (
   init: RequestInit,
   timeoutMs: number,
   cancellationSignal?: AbortSignal,
+  connection?: ArchiveOutboxConnection,
 ): Promise<{ response: Response; errorText?: string }> => {
+  if (connection) await assertCloudConnectionCurrent(connection);
+  else await requireLegacyCloud();
+  if (cancellationSignal?.aborted) throw new Error("ARCHIVE_REQUEST_CANCELLED");
   const controller = new AbortController();
   let timedOut = false;
   const cancelRequest = () => controller.abort();
@@ -435,13 +424,17 @@ const requestWithTimeout = async (
   }, timeoutMs);
   try {
     const response = await fetcher(input, { ...init, signal: controller.signal });
+    try { if (connection) await assertCloudConnectionCurrent(connection); }
+    catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
     if (response.ok) {
       await response.body?.cancel().catch(() => {});
       return { response };
     }
+    const errorText = await responseError(response, controller.signal);
+    if (connection) await assertCloudConnectionCurrent(connection);
     return {
       response,
-      errorText: await responseError(response, controller.signal),
+      errorText,
     };
   } catch (error) {
     if (controller.signal.aborted) {
@@ -712,6 +705,7 @@ export class ArchiveOutbox {
   }
 
   private async drainInternal(limit: number): Promise<ArchiveOutboxDrainResult> {
+    await requireLegacyCloud();
     const result: ArchiveOutboxDrainResult = {
       attempted: 0,
       uploaded: 0,
@@ -735,9 +729,20 @@ export class ArchiveOutbox {
     const attemptedIds = new Set<string>();
     let authRefreshAttempted = false;
     let authRejected = false;
+    let rejectedConnection: ArchiveOutboxConnection | undefined;
+    const connectionCurrent = async () => {
+      try { await assertCloudConnectionCurrent(connection); return true; }
+      catch (error) {
+        if (error instanceof CloudConnectionRetiredError || (error instanceof Error && error.message === "LOCAL_ONLY_CLOUD_DISABLED")) return false;
+        throw error;
+      }
+    };
+    const cancelled = async () => ({ ...result, tokenRejected: false, remaining: (await this.list()).length, reason: "cancelled" as const });
+    if (!await connectionCurrent()) return cancelled();
     while (result.attempted < limit) {
       const now = this.now();
       jobs = await this.list();
+      if (!await connectionCurrent()) return cancelled();
       const expired = jobs.filter((job) => now - job.createdAt > this.maxAgeMs);
       if (expired.length > 0) {
         await this.removeJobs(expired);
@@ -799,8 +804,9 @@ export class ArchiveOutbox {
         result.discarded += 1;
         continue;
       }
+      if (!await connectionCurrent()) return cancelled();
       if (!readiness.ready) {
-        await this.deferJob(job, readiness.reason || "ITEM_NOT_SYNCED", readiness.retryAfterMs);
+        await this.deferJob(job, readiness.reason || "ITEM_NOT_SYNCED", readiness.retryAfterMs, connectionCurrent);
         result.deferred += 1;
         continue;
       }
@@ -812,8 +818,9 @@ export class ArchiveOutbox {
           result.discarded += 1;
           continue;
         }
+        if (!await connectionCurrent()) return cancelled();
         if (!body || body.size < 20 || body.size > ARCHIVE_OUTBOX_MAX_FILE_BYTES) {
-          await this.convertToServerCapture(job, "LOCAL_ARCHIVE_FILE_MISSING");
+          await this.convertToServerCapture(job, "LOCAL_ARCHIVE_FILE_MISSING", connectionCurrent);
           result.convertedToServerCapture += 1;
           continue;
         }
@@ -856,6 +863,7 @@ export class ArchiveOutbox {
           },
           this.requestTimeoutMs,
           jobCancellationSignal,
+          activeConnection,
         );
         // One send, plus one retry if a refusal can be answered by a different
         // identity on this device (a dead bearer session leaves the device key).
@@ -864,16 +872,18 @@ export class ArchiveOutbox {
           const refused = attempt.response.status === 401 || attempt.response.status === 403;
           // Report a refused session even when the retry below rescues this
           // upload, so a dead account cannot hide behind a working device key.
-          if (refused && activeConnection.token) result.tokenRejected = true;
+          if (refused && activeConnection.token) { result.tokenRejected = true; rejectedConnection = activeConnection; }
           return { attempt, refused };
         };
 
         let { attempt: request, refused } = await send(connection);
         // The service answered, so this attempt counts against the remote cap.
-        await this.noteRemoteAttempt(job);
+        await this.noteRemoteAttempt(job, connectionCurrent);
+        if (!await connectionCurrent()) return cancelled();
         if (refused && !authRefreshAttempted && (connection.token || connection.deviceKey)) {
           authRefreshAttempted = true;
           const refreshed = await this.getConnection(true);
+          if (!await connectionCurrent()) return cancelled();
           const sameIdentity =
             refreshed.token === connection.token && refreshed.deviceKey === connection.deviceKey;
           const usable = Boolean(refreshed.token || refreshed.deviceKey);
@@ -885,14 +895,17 @@ export class ArchiveOutbox {
         response = request.response;
         responseFailure = request.errorText || "";
       } catch (error) {
-        await this.deferJob(job, error instanceof Error ? error.message : "ARCHIVE_NETWORK_ERROR");
+        if (!await connectionCurrent()) return cancelled();
+        await this.deferJob(job, error instanceof Error ? error.message : "ARCHIVE_NETWORK_ERROR", 0, connectionCurrent);
         result.deferred += 1;
         continue;
       }
+      if (!await connectionCurrent()) return cancelled();
 
       if (response.ok) {
         const stillCurrent = jobGeneration === this.generation &&
           (await this.list()).some((candidate) => candidate.id === job.id);
+        if (!await connectionCurrent()) return cancelled();
         if (!stillCurrent) {
           // A permanent delete, whole-library clear, or newer capture won while
           // this request was in flight. Never resurrect its local cache entry.
@@ -904,7 +917,7 @@ export class ArchiveOutbox {
             const finalized = await withOpfsMutationLock(async () => {
               const current = jobGeneration === this.generation &&
                 (await this.list()).some((candidate) => candidate.id === job.id);
-              if (!current) return false;
+              if (!current || !await connectionCurrent()) return false;
               await this.retainUploadedArchiveWithinMutationLock?.(
                 job.itemId,
                 body,
@@ -912,12 +925,13 @@ export class ArchiveOutbox {
               );
               const currentAfterRetention = jobGeneration === this.generation &&
                 (await this.list()).some((candidate) => candidate.id === job.id);
-              if (!currentAfterRetention) return false;
-              await this.removeJobs([job]);
+              if (!currentAfterRetention || !await connectionCurrent()) return false;
+              if (!await this.removeJobs([job], connectionCurrent)) return false;
               await this.deleteJobFiles([job]);
               return true;
             });
             if (!finalized) {
+              if (!await connectionCurrent()) return cancelled();
               result.discarded += 1;
               continue;
             }
@@ -927,6 +941,7 @@ export class ArchiveOutbox {
             await this.deferJob(
               job,
               error instanceof Error ? error.message : "ARCHIVE_CACHE_WRITE_FAILED",
+              0, connectionCurrent,
             );
             result.deferred += 1;
             continue;
@@ -941,6 +956,7 @@ export class ArchiveOutbox {
           ).catch(() => false);
         }
         if (body && this.retainUploadedArchive && !retained) {
+          if (!await connectionCurrent()) return cancelled();
           try {
             // R2 acknowledgement is not enough for airplane-mode preview. Keep
             // the exact uploaded bytes in the bounded archive cache before the
@@ -950,19 +966,23 @@ export class ArchiveOutbox {
             await this.deferJob(
               job,
               error instanceof Error ? error.message : "ARCHIVE_CACHE_WRITE_FAILED",
+              0, connectionCurrent,
             );
             result.deferred += 1;
             continue;
           }
         }
-        await this.removeJobs([job]);
+        if (!await connectionCurrent()) return cancelled();
+        if (!await this.removeJobs([job], connectionCurrent)) return cancelled();
         await this.deleteJobFiles([job]);
         result.uploaded += 1;
         continue;
       }
 
       const error = responseFailure || `${response.status} ${response.statusText}`.trim().slice(0, 240);
-      if (response.status === 401 || response.status === 403) authRejected = true;
+      if (response.status === 401 || response.status === 403) {
+        authRejected = true;
+      }
       if (job.mode === "upload" && (response.status === 400 || response.status === 413 || response.status === 415 || response.status === 422)) {
         // A page only this browser can reach cannot anchor a cloud archive
         // owner, so the mirror will refuse it forever. Settle as a local-only
@@ -976,7 +996,7 @@ export class ArchiveOutbox {
             ? await this.isUploadedArchiveRetained(job.itemId, job.updatedAt, body.size).catch(() => false)
             : false;
           if (stillReadable) {
-            await this.removeJobs([job]);
+            if (!await this.removeJobs([job], connectionCurrent)) return cancelled();
             await this.deleteJobFiles([job]);
             result.retainedLocally += 1;
             continue;
@@ -989,11 +1009,11 @@ export class ArchiveOutbox {
               // Deferring below keeps the bytes; the next drain retries.
             }
           }
-          await this.deferJob(job, "ARCHIVE_LOCAL_COPY_UNVERIFIED");
+          await this.deferJob(job, "ARCHIVE_LOCAL_COPY_UNVERIFIED", 0, connectionCurrent);
           result.deferred += 1;
           continue;
         }
-        await this.convertToServerCapture(job, error);
+        await this.convertToServerCapture(job, error, connectionCurrent);
         result.convertedToServerCapture += 1;
         continue;
       }
@@ -1015,7 +1035,7 @@ export class ArchiveOutbox {
         const authRefused = response.status === 401 || response.status === 403;
         const identityCanChange = Boolean(connection.token && connection.deviceKey);
         const authDelay = authRefused ? (identityCanChange ? 30_000 : 15 * 60 * 1000) : 0;
-        await this.deferJob(job, error, Math.max(authDelay, parseRetryAfterMs(response.headers.get("retry-after"), now)));
+        await this.deferJob(job, error, Math.max(authDelay, parseRetryAfterMs(response.headers.get("retry-after"), now)), connectionCurrent);
         result.deferred += 1;
         continue;
       }
@@ -1029,12 +1049,14 @@ export class ArchiveOutbox {
         continue;
       }
 
-      await this.removeJobs([job]);
+      if (!await this.removeJobs([job], connectionCurrent)) return cancelled();
       await this.deleteJobFiles([job]);
       result.discarded += 1;
     }
 
     result.remaining = (await this.list()).length;
+    if (!await connectionCurrent()) return cancelled();
+    await rejectedConnection?.reject?.();
     if (authRejected) result.reason = "auth-required";
     else if (result.terminal > 0 || (result.remaining > 0 && (await this.list()).every((job) => job.terminal))) {
       result.reason = "terminal";
@@ -1042,7 +1064,7 @@ export class ArchiveOutbox {
     return result;
   }
 
-  private async convertToServerCapture(job: ArchiveOutboxJob, reason: string): Promise<void> {
+  private async convertToServerCapture(job: ArchiveOutboxJob, reason: string, canMutate?: () => Promise<boolean>): Promise<void> {
     const replacement: ArchiveOutboxJob = {
       ...job,
       id: this.randomId(),
@@ -1058,22 +1080,23 @@ export class ArchiveOutbox {
       // of browser-session captures.
       ...(job.sessionCaptureAttempts ? { sessionCaptureAttempts: job.sessionCaptureAttempts } : {}),
     };
-    await this.mutate((jobs) => jobs.map((candidate) => (candidate.id === job.id ? replacement : candidate)));
+    if (!await this.mutate((jobs) => jobs.map((candidate) => (candidate.id === job.id ? replacement : candidate)), canMutate)) return;
     await this.deleteJobFiles([job]);
   }
 
   /** Count one attempt where the archiving service actually responded. */
-  private async noteRemoteAttempt(job: ArchiveOutboxJob): Promise<void> {
+  private async noteRemoteAttempt(job: ArchiveOutboxJob, canMutate?: () => Promise<boolean>): Promise<void> {
     await this.mutate((jobs) =>
       jobs.map((candidate) =>
         candidate.id === job.id
           ? { ...candidate, remoteAttempts: (candidate.remoteAttempts ?? 0) + 1 }
           : candidate,
       ),
+      canMutate,
     );
   }
 
-  private async deferJob(job: ArchiveOutboxJob, error: string, retryAfterMs = 0): Promise<void> {
+  private async deferJob(job: ArchiveOutboxJob, error: string, retryAfterMs = 0, canMutate?: () => Promise<boolean>): Promise<void> {
     const now = this.now();
     await this.mutate((jobs) =>
       jobs.map((candidate) =>
@@ -1087,6 +1110,7 @@ export class ArchiveOutbox {
             }
           : candidate,
       ),
+      canMutate,
     );
   }
 
@@ -1139,9 +1163,9 @@ export class ArchiveOutbox {
     return claimed;
   }
 
-  private async removeJobs(toRemove: ArchiveOutboxJob[]): Promise<void> {
+  private async removeJobs(toRemove: ArchiveOutboxJob[], canMutate?: () => Promise<boolean>): Promise<boolean> {
     const ids = new Set(toRemove.map((job) => job.id));
-    await this.mutate((jobs) => jobs.filter((job) => !ids.has(job.id)));
+    return this.mutate((jobs) => jobs.filter((job) => !ids.has(job.id)), canMutate);
   }
 
   private async isCurrentJob(
@@ -1159,7 +1183,7 @@ export class ArchiveOutbox {
     await Promise.all([...names].map((name) => this.files.delete(name)));
   }
 
-  private async mutate(operation: (jobs: ArchiveOutboxJob[]) => ArchiveOutboxJob[]): Promise<void> {
+  private async mutate(operation: (jobs: ArchiveOutboxJob[]) => ArchiveOutboxJob[], canMutate?: () => Promise<boolean>): Promise<boolean> {
     let release!: () => void;
     const previous = this.mutationTail;
     this.mutationTail = new Promise<void>((resolve) => {
@@ -1168,8 +1192,10 @@ export class ArchiveOutbox {
     await previous;
     try {
       const current = normalizeArchiveOutbox(await this.storage.read());
+      if (canMutate && !await canMutate()) return false;
       const next = normalizeArchiveOutbox(operation(current));
       await this.storage.write(next);
+      return true;
     } finally {
       release();
     }

@@ -66,6 +66,8 @@ export interface ConnectorState {
   /** The switch: on = auto-sync + heartbeat; flipped off automatically on session loss. */
   connected: boolean;
   autoSync: boolean;
+  cloudUserId?: string;
+  cloudCheckpoints?: Record<string, ConnectorCloudCheckpoint>;
   sinceId?: string;
   /** Opaque remote page cursor for a backlog that spans bounded sync runs. */
   continuationCursor?: string;
@@ -76,6 +78,10 @@ export interface ConnectorState {
   lastError?: string;
   itemCount: number;
 }
+
+export type ConnectorCloudCheckpoint = Pick<ConnectorState,
+  "sinceId" | "continuationCursor" | "pendingNewestId" | "lastSyncAt" | "itemCount"
+>;
 
 export const connectorKey = (platform: ConnectorPlatform, accountId: string): string =>
   `${platform}:${accountId}`;

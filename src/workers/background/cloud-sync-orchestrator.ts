@@ -1,22 +1,14 @@
-import { z } from "zod";
+import { legacyCloudEnabled } from "@src/services/extension-policy";
 import {
   CLOUD_SYNC_CONTINUATION_DELAY_MS,
   shouldScheduleCloudSyncContinuation,
 } from "@src/services/cloud-sync-continuation";
 import type { CloudSyncPullResult } from "@src/services/cloud-sync";
-import { markCloudSessionRejected } from "@src/services/cloud-auth";
 import { isOnline } from "@src/workers/background/network-state";
 import { sendForwardedToOffscreen } from "@src/workers/background/runtime";
 
 export const CLOUD_SYNC_CONTINUATION_ALARM_NAME = "cloud-sync-continuation";
 export const CLOUD_SYNC_SELECTION_LIMIT = 200;
-
-const CloudDrainResponseSchema = z
-  .object({
-    reason: z.string().optional(),
-    error: z.string().optional(),
-  })
-  .passthrough();
 
 let syncInFlight: Promise<void> | null = null;
 let syncRequestVersion = 0;
@@ -26,6 +18,7 @@ export const cancelCloudSyncRequests = (): void => {
 };
 
 export const scheduleCloudSyncContinuation = async (): Promise<void> => {
+  if (!await legacyCloudEnabled()) return;
   try {
     await chrome.alarms.create(CLOUD_SYNC_CONTINUATION_ALARM_NAME, {
       when: Date.now() + CLOUD_SYNC_CONTINUATION_DELAY_MS,
@@ -39,6 +32,7 @@ export const scheduleCloudSyncContinuation = async (): Promise<void> => {
 export const pullCloudChanges = async (): Promise<
   CloudSyncPullResult | undefined
 > => {
+  if (!await legacyCloudEnabled()) return;
   try {
     const result = await sendForwardedToOffscreen<CloudSyncPullResult>({
       service: "cloudSync",
@@ -49,9 +43,6 @@ export const pullCloudChanges = async (): Promise<
       chrome.runtime
         .sendMessage({ type: "DB_CHANGE", scope: "items" })
         .catch(() => {});
-    }
-    if (result.reason === "invalid-auth") {
-      await markCloudSessionRejected().catch(() => {});
     }
     return result;
   } catch (error) {
@@ -67,21 +58,13 @@ export const triggerCloudSync = (): Promise<void> => {
 
   const runVersion = syncRequestVersion;
   const run = (async () => {
+    if (!await legacyCloudEnabled()) return;
     try {
       const rawResult = await sendForwardedToOffscreen<unknown>({
         service: "cloudSync",
         type: "drain",
         payload: { maxBatches: 10 },
       });
-      const parsedResult = CloudDrainResponseSchema.safeParse(rawResult);
-      const result = parsedResult.success ? parsedResult.data : undefined;
-      const pushRefused =
-        result?.reason === "invalid-auth" ||
-        (result?.reason === "http-error" &&
-          /^(401|403)\b/.test(result.error || ""));
-      if (pushRefused) {
-        await markCloudSessionRejected().catch(() => {});
-      }
 
       const pulled = await pullCloudChanges();
       if (

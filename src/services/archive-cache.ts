@@ -228,13 +228,13 @@ export class ArchiveCache {
     return file;
   }
 
-  async put(itemIdRaw: string, body: Blob, updatedAt = this.now()): Promise<ArchiveCacheEntry> {
-    return withOpfsMutationLock(() => this.putWithinMutationLock(itemIdRaw, body, updatedAt));
+  async put(itemIdRaw: string, body: Blob, updatedAt = this.now(), assertCurrent?: () => Promise<void>): Promise<ArchiveCacheEntry> {
+    return withOpfsMutationLock(() => this.putWithinMutationLock(itemIdRaw, body, updatedAt, { assertCurrent }));
   }
 
-  async putCloud(itemIdRaw: string, body: Blob, updatedAt = this.now()): Promise<ArchiveCacheEntry> {
+  async putCloud(itemIdRaw: string, body: Blob, updatedAt = this.now(), assertCurrent?: () => Promise<void>): Promise<ArchiveCacheEntry> {
     return withOpfsMutationLock(() =>
-      this.putWithinMutationLock(itemIdRaw, body, updatedAt, { source: "cloud" })
+      this.putWithinMutationLock(itemIdRaw, body, updatedAt, { source: "cloud", assertCurrent })
     );
   }
 
@@ -246,14 +246,16 @@ export class ArchiveCache {
     itemIdRaw: string,
     body: Blob,
     updatedAt = this.now(),
+    assertCurrent?: () => Promise<void>,
   ): Promise<ArchiveCacheEntry> {
     const itemId = normalizeArchiveItemId(itemIdRaw);
     if (!itemId) throw new Error("ARCHIVE_CACHE_ITEM_INVALID");
     return withOpfsMutationLock(async () => {
       const existing = normalizeArchiveCache(await this.storage.read())
         .find((entry) => entry.itemId === itemId);
+      await assertCurrent?.();
       if (existing) return existing;
-      return this.putWithinMutationLock(itemId, body, updatedAt, { source: "cloud" });
+      return this.putWithinMutationLock(itemId, body, updatedAt, { source: "cloud", assertCurrent });
     });
   }
 
@@ -266,7 +268,7 @@ export class ArchiveCache {
     itemIdRaw: string,
     body: Blob,
     updatedAt = this.now(),
-    options: { source?: "local" | "cloud"; replaceCloudNewer?: boolean } = {},
+    options: { source?: "local" | "cloud"; replaceCloudNewer?: boolean; assertCurrent?: () => Promise<void> } = {},
   ): Promise<ArchiveCacheEntry> {
     const itemId = normalizeArchiveItemId(itemIdRaw);
     if (!itemId) throw new Error("ARCHIVE_CACHE_ITEM_INVALID");
@@ -279,6 +281,7 @@ export class ArchiveCache {
       const normalizedUpdatedAt =
         Number.isSafeInteger(updatedAt) && updatedAt >= 0 ? updatedAt : this.now();
       const resetState = await this.readResetState();
+      await options.assertCurrent?.();
       if (
         resetState.inProgress ||
         (options.source === "cloud" && resetState.resetAt > 0 && normalizedUpdatedAt <= resetState.resetAt)
@@ -293,6 +296,7 @@ export class ArchiveCache {
       );
       if (newer) {
         const retainedFile = await this.files.read(newer.fileName);
+        await options.assertCurrent?.();
         if (
           retainedFile &&
           retainedFile.size === newer.byteSize &&
@@ -338,6 +342,7 @@ export class ArchiveCache {
       );
 
       try {
+        await options.assertCurrent?.();
         await this.storage.write(retained);
       } catch (error) {
         await this.files.delete(fileName).catch(() => {});

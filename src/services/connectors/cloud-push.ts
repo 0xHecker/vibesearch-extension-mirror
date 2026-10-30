@@ -9,7 +9,8 @@
  * each item carries a stable `externalId` (e.g. `x:<tweetId>`); we remember which
  * ids we've pushed so a re-sync doesn't duplicate.
  */
-import { getCloudAuthToken } from "@src/services/cloud-auth";
+import { getCloudAuthConnection, type CloudAuthConnection } from "@src/services/cloud-auth";
+import { assertCloudConnectionCurrent, CloudConnectionRetiredError } from "@src/services/cloud-connection";
 import {
   jsonObject,
   jsonString,
@@ -18,6 +19,7 @@ import {
 import {
   CLOUD_SYNC_API_BASE_KEY,
   DEFAULT_VIBESEARCH_API_BASE,
+  resolveVibeSearchApiBase,
 } from "@src/services/cloud-config";
 import { z } from "zod";
 
@@ -32,7 +34,7 @@ const resolveConnectorApiBase = async (): Promise<string> => {
   try {
     const row = await chrome.storage.local.get(CLOUD_SYNC_API_BASE_KEY);
     const configured = jsonString(row?.[CLOUD_SYNC_API_BASE_KEY])?.trim().replace(/\/+$/, "") ?? "";
-    return configured || DEFAULT_VIBESEARCH_API_BASE;
+    return resolveVibeSearchApiBase(configured);
   } catch {
     return DEFAULT_VIBESEARCH_API_BASE;
   }
@@ -217,22 +219,28 @@ const PUSHED_KEY = "vibesearch:pushedExternalIds";
 const PUSHED_CAP = 20000; // keep the dedupe set bounded
 const pushedIdsSchema = z.array(z.string());
 
-async function loadPushedIds(): Promise<Set<string>> {
+const pushedKeyForOwner = (userId: string): string => `${PUSHED_KEY}:${encodeURIComponent(userId)}`;
+
+async function loadPushedIds(userId: string): Promise<Set<string>> {
   try {
-    const row = await chrome.storage.local.get(PUSHED_KEY);
-    const parsed = pushedIdsSchema.safeParse(row?.[PUSHED_KEY]);
+    const key = pushedKeyForOwner(userId);
+    const row = await chrome.storage.local.get(key);
+    const parsed = pushedIdsSchema.safeParse(row?.[key]);
     return new Set(parsed.success ? parsed.data : []);
   } catch {
     return new Set();
   }
 }
 
-async function savePushedIds(ids: Set<string>): Promise<void> {
+async function savePushedIds(ids: Set<string>, connection: CloudAuthConnection): Promise<void> {
   try {
     const arr = Array.from(ids);
     const trimmed = arr.length > PUSHED_CAP ? arr.slice(arr.length - PUSHED_CAP) : arr;
-    await chrome.storage.local.set({ [PUSHED_KEY]: trimmed });
-  } catch {
+    await assertCloudConnectionCurrent(connection);
+    await chrome.storage.local.set({ [pushedKeyForOwner(connection.userId)]: trimmed });
+    await assertCloudConnectionCurrent(connection);
+  } catch (error) {
+    if (error instanceof CloudConnectionRetiredError || (error instanceof Error && error.message === "LOCAL_ONLY_CLOUD_DISABLED")) throw error;
     /* best-effort */
   }
 }
@@ -311,12 +319,14 @@ export function toItemBody(item: CapturedItem): CloudItemCreateBody {
  */
 export async function pushCapturedItems(
   items: CapturedItem[],
-  opts?: { onProgress?: (done: number, total: number) => void; shouldCancel?: () => boolean },
+  opts?: { onProgress?: (done: number, total: number) => void; shouldCancel?: () => boolean; connection?: CloudAuthConnection },
 ): Promise<CloudPushResult> {
-  const token = await getCloudAuthToken();
-  if (!token) throw new ConnectorCloudAuthError("Sign in to Vibesearch to sync to the cloud.");
+  const connection = opts?.connection ?? await getCloudAuthConnection();
+  const { token, userId } = connection;
+  if (!token || !userId) throw new ConnectorCloudAuthError("Sign in to Vibesearch to sync to the cloud.");
   const base = await resolveConnectorApiBase();
-  const pushedIds = await loadPushedIds();
+  const pushedIds = await loadPushedIds(userId);
+  await assertCloudConnectionCurrent(connection);
   console.log(`[Vibesearch · Cloud] pushing ${items.length} item(s) to ${base}…`);
 
   let pushed = 0;
@@ -325,6 +335,7 @@ export async function pushCapturedItems(
   let done = 0;
 
   for (const item of items) {
+    await assertCloudConnectionCurrent(connection);
     if (opts?.shouldCancel?.()) {
       console.log("[Vibesearch · Cloud] push cancelled by user.");
       break;
@@ -336,13 +347,19 @@ export async function pushCapturedItems(
       continue;
     }
     try {
+      await assertCloudConnectionCurrent(connection);
+      if (opts?.shouldCancel?.()) break;
       const res = await fetch(`${base}/v1/items`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
         body: JSON.stringify(toItemBody(item)),
       });
+      try { await assertCloudConnectionCurrent(connection); }
+      catch (error) { await res.body?.cancel().catch(() => {}); throw error; }
       if (res.status === 401 || res.status === 403) {
-        await savePushedIds(pushedIds);
+        await res.body?.cancel().catch(() => {});
+        await savePushedIds(pushedIds, connection);
+        await connection.reject?.();
         throw new ConnectorCloudAuthError("Your Vibesearch session expired — sign in again to sync.");
       }
       if (!res.ok) {
@@ -350,19 +367,20 @@ export async function pushCapturedItems(
         failed += 1;
       } else {
         const created = jsonObject(await tryReadJsonResponse(res));
+        await assertCloudConnectionCurrent(connection);
         const createdId = jsonString(created?.id) ?? "?";
         console.log(`[Vibesearch · Cloud] ← created ${createdId}`, { title: item.title, url: item.url });
         pushed += 1;
         if (item.externalId) pushedIds.add(item.externalId);
       }
     } catch (err) {
-      if (err instanceof ConnectorCloudAuthError) throw err;
+      if (err instanceof ConnectorCloudAuthError || err instanceof CloudConnectionRetiredError || (err instanceof Error && err.message === "LOCAL_ONLY_CLOUD_DISABLED")) throw err;
       failed += 1;
     }
     opts?.onProgress?.(done, items.length);
   }
 
-  await savePushedIds(pushedIds);
+  await savePushedIds(pushedIds, connection);
   console.log(`[Vibesearch · Cloud] pushed ${pushed} new, ${skipped} already saved, ${failed} failed.`);
   return { pushed, skipped, failed };
 }

@@ -1,9 +1,46 @@
-import { expect, test } from "bun:test";
+import { beforeEach, afterEach, expect, test } from "bun:test";
+import { EXTENSION_POLICY_KEY } from "@src/services/extension-policy";
 import {
   ARCHIVE_PREVIEW_DOCUMENT_CSP,
   ArchivePreviewSession,
   createArchivePreviewLocalCache,
 } from "@src/services/archive-preview";
+
+let previousChrome: PropertyDescriptor | undefined;
+beforeEach(() => {
+  previousChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
+  Object.defineProperty(globalThis, "chrome", { configurable: true, value: {
+    storage: { local: { get: async (key: string) => ({ [key]: key === EXTENSION_POLICY_KEY ? { version: 1, mode: "legacy-browser", legacyCloudEnabled: true } : undefined }) } },
+  } });
+});
+afterEach(() => {
+  if (previousChrome) Object.defineProperty(globalThis, "chrome", previousChrome);
+  else Reflect.deleteProperty(globalThis, "chrome");
+});
+
+test("a retired preview connection cannot cache or render a late cloud body", async () => {
+  let current = true;
+  let writes = 0;
+  let documents = 0;
+  const session = new ArchivePreviewSession({
+    cache: { get: async () => null, put: async () => { writes += 1; } },
+    getConnection: async () => ({ token: "old-account", apiBase: "https://api.example", isCurrent: () => current }),
+    fetcher: async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("<html><body>old account</body></html>"));
+        current = false;
+        controller.close();
+      },
+    }), { headers: { "content-type": "text/html" } }),
+    createObjectUrl: () => { documents += 1; return "blob:old-account"; },
+    revokeObjectUrl: () => {},
+  });
+
+  await expect(session.load("old-item")).rejects.toMatchObject({ code: "ARCHIVE_PREVIEW_ABORTED" });
+  expect(writes).toBe(0);
+  expect(documents).toBe(0);
+  session.dispose();
+});
 
 test("the View sheet embeds only the sanitized archive URL with no sandbox capabilities", async () => {
   const source = await Bun.file(

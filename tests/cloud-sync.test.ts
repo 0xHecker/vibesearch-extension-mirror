@@ -1,3 +1,5 @@
+import { EXTENSION_POLICY_KEY } from "@src/services/extension-policy";
+import { CloudAuthService } from "@src/services/cloud-auth";
 import { expect, test } from "bun:test";
 import {
   cloudSyncRefsForDocs,
@@ -250,6 +252,7 @@ test("cloud item normalization preserves polymorphic content and archive metadat
 test("manual cloud sync backfills every local collection under the signed-in user", async () => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
   const storage = new Map<string, unknown>();
+  storage.set(EXTENSION_POLICY_KEY, { version: 1, mode: "legacy-browser", legacyCloudEnabled: true });
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
@@ -379,14 +382,19 @@ test("manual cloud sync refuses to scan local data without a signed-in account",
     },
   });
 
-  await expect(service.syncAll()).rejects.toThrow("CLOUD_SYNC_AUTH_REQUIRED");
-  expect(collectionReads).toBe(0);
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "chrome");
+  Object.defineProperty(globalThis, "chrome", { configurable: true, value: { storage: { local: { get: async (key: string) => ({ [key]: { version: 1, mode: "legacy-browser", legacyCloudEnabled: true } }) } } } });
+  try {
+    await expect(service.syncAll()).rejects.toThrow("CLOUD_SYNC_AUTH_REQUIRED");
+    expect(collectionReads).toBe(0);
+  } finally { if (previous) Object.defineProperty(globalThis, "chrome", previous); else Reflect.deleteProperty(globalThis, "chrome"); }
 });
 
 test("manual cloud sync never uploads a scan after the signed-in account changes", async () => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
   const queuedItem = item({ id: "account-bound", updatedAt: 100 });
   const storage = new Map<string, unknown>();
+  storage.set(EXTENSION_POLICY_KEY, { version: 1, mode: "legacy-browser", legacyCloudEnabled: true });
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
@@ -468,6 +476,7 @@ test("qualified acknowledgements cannot clear the same id in another collection"
 test("malformed qualified acknowledgements leave the entire pushed batch queued", async () => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
   const storage = new Map<string, unknown>();
+  storage.set(EXTENSION_POLICY_KEY, { version: 1, mode: "legacy-browser", legacyCloudEnabled: true });
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
@@ -607,6 +616,7 @@ test("an old live acknowledgment cannot clear a newer tombstone", () => {
 test("concurrent outbox enqueues retain both local mutations", async () => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
   const storage = new Map<string, unknown>();
+  storage.set(EXTENSION_POLICY_KEY, { version: 1, mode: "legacy-browser", legacyCloudEnabled: true });
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
@@ -648,6 +658,7 @@ test("reset cancellation aborts a stalled cloud request and removes its durable 
   const storage = new Map<string, unknown>([
     [CLOUD_SYNC_QUEUE_KEY, [ref("stalled", 100)]],
   ]);
+  storage.set(EXTENSION_POLICY_KEY, { version: 1, mode: "legacy-browser", legacyCloudEnabled: true });
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
@@ -702,9 +713,121 @@ test("reset cancellation aborts a stalled cloud request and removes its durable 
   }
 });
 
+for (const reconnect of [false, true]) {
+  test(`disconnect${reconnect ? " and same-owner reconnect" : ""} rejects a delayed acknowledgement and preserves queued rows`, async () => {
+    const fixture = await connectedDrainFixture();
+    let releaseResponse!: (response: Response) => void;
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolve) => { requestStarted = resolve; });
+    const response = new Promise<Response>((resolve) => { releaseResponse = resolve; });
+    const batches: CloudSyncChange[][] = [];
+    try {
+      const service = fixture.service(async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { changes: CloudSyncChange[] };
+        batches.push(body.changes);
+        requestStarted();
+        return response;
+      });
+      const draining = service.drain({ batchSize: 10, maxBatches: 2 });
+      await started;
+      await fixture.auth.disconnect();
+      if (reconnect) await fixture.auth.connect();
+      releaseResponse(pushAcknowledgement(batches[0]));
+      expect(await draining).toMatchObject({ reason: "cancelled", pushed: 0, remaining: 11 });
+      expect(batches).toHaveLength(1);
+      expect(fixture.values.get(CLOUD_SYNC_QUEUE_KEY)).toEqual(fixture.queued);
+    } finally {
+      fixture.restore();
+    }
+  });
+}
+
+test("disconnect during the policy read prevents the push from leaving", async () => {
+  const fixture = await connectedDrainFixture();
+  let requests = 0;
+  let queueRead = false;
+  fixture.hooks.beforeGet = async (keys) => {
+    if (keys === CLOUD_SYNC_QUEUE_KEY) queueRead = true;
+    if (keys === EXTENSION_POLICY_KEY && queueRead) await fixture.auth.disconnect();
+  };
+  try {
+    const result = await fixture.service(async () => {
+      requests += 1;
+      throw new Error("Retired request reached the transport");
+    }).drain({ batchSize: 10, maxBatches: 2 });
+    expect(result).toMatchObject({ reason: "cancelled", pushed: 0, remaining: 11 });
+    expect(requests).toBe(0);
+    expect(fixture.values.get(CLOUD_SYNC_QUEUE_KEY)).toEqual(fixture.queued);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("disconnect during the acknowledgement queue read preserves all queued rows", async () => {
+  const fixture = await connectedDrainFixture();
+  let requests = 0;
+  try {
+    const result = await fixture.service(async (_input, init) => {
+      requests += 1;
+      const body = JSON.parse(String(init?.body)) as { changes: CloudSyncChange[] };
+      fixture.hooks.beforeGet = async (keys) => {
+        if (keys !== CLOUD_SYNC_QUEUE_KEY) return;
+        fixture.hooks.beforeGet = undefined;
+        await fixture.auth.disconnect();
+      };
+      return pushAcknowledgement(body.changes);
+    }).drain({ batchSize: 10, maxBatches: 2 });
+    expect(result).toMatchObject({ reason: "cancelled", remaining: 11 });
+    expect(requests).toBe(1);
+    expect(fixture.values.get(CLOUD_SYNC_QUEUE_KEY)).toEqual(fixture.queued);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("an acknowledgement write already dispatched before disconnect may finish without another push", async () => {
+  const fixture = await connectedDrainFixture();
+  let requests = 0;
+  fixture.hooks.beforeSet = async (entries) => {
+    if (!(CLOUD_SYNC_QUEUE_KEY in entries)) return;
+    fixture.hooks.beforeSet = undefined;
+    await fixture.auth.disconnect();
+  };
+  try {
+    const result = await fixture.service(async (_input, init) => {
+      requests += 1;
+      const body = JSON.parse(String(init?.body)) as { changes: CloudSyncChange[] };
+      return pushAcknowledgement(body.changes);
+    }).drain({ batchSize: 10, maxBatches: 2 });
+    expect(result).toMatchObject({ reason: "cancelled", pushed: 10, remaining: 1 });
+    expect(requests).toBe(1);
+    expect(fixture.values.get(CLOUD_SYNC_QUEUE_KEY)).toEqual(fixture.queued.slice(10));
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("same-owner token refresh accepts the pending acknowledgement and completes the drain", async () => {
+  const fixture = await connectedDrainFixture();
+  let requests = 0;
+  try {
+    const result = await fixture.service(async (_input, init) => {
+      requests += 1;
+      const body = JSON.parse(String(init?.body)) as { changes: CloudSyncChange[] };
+      if (requests === 1) await fixture.auth.getCredentials(true);
+      return pushAcknowledgement(body.changes);
+    }).drain({ batchSize: 10, maxBatches: 2 });
+    expect(result).toMatchObject({ pushed: 11, remaining: 0 });
+    expect(requests).toBe(2);
+  } finally {
+    fixture.restore();
+  }
+});
+
 test("cloud push drains 10,000 queued bookmarks with indexed reads per network batch", async () => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
   const storage = new Map<string, unknown>([[CLOUD_SYNC_TOKEN_KEY, "test-token"]]);
+  storage.set(EXTENSION_POLICY_KEY, { version: 1, mode: "legacy-browser", legacyCloudEnabled: true });
   Object.defineProperty(globalThis, "chrome", {
     configurable: true,
     value: {
@@ -806,4 +929,69 @@ const fakeCollections = (seed: Partial<Record<CloudSyncQueueRef["collection"], I
   });
 
   return { calls, docs, resolve };
+};
+
+const pushAcknowledgement = (changes: CloudSyncChange[]) => Response.json({
+  checkpoint: 1,
+  applied: changes.length,
+  conflicts: 0,
+  acceptedRefs: changes.map(({ collection, id }) => ({ collection, id })),
+  conflictRefs: [],
+});
+
+const connectedDrainFixture = async () => {
+  const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
+  const values = new Map<string, unknown>([
+    [EXTENSION_POLICY_KEY, { version: 1, mode: "legacy-browser", legacyCloudEnabled: true }],
+  ]);
+  const hooks: {
+    beforeGet?: (keys: string | string[]) => Promise<void>;
+    beforeSet?: (entries: Record<string, unknown>) => Promise<void>;
+  } = {};
+  const local = {
+    async get(keys: string | string[]) {
+      await hooks.beforeGet?.(keys);
+      return Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, values.get(key)]));
+    },
+    async set(entries: Record<string, unknown>) {
+      await hooks.beforeSet?.(entries);
+      for (const [key, value] of Object.entries(entries)) values.set(key, value);
+    },
+    async remove(keys: string | string[]) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) values.delete(key);
+    },
+  };
+  Object.defineProperty(globalThis, "chrome", {
+    configurable: true,
+    value: { storage: { local }, runtime: { sendMessage: async () => undefined } },
+  });
+  let issued = 0;
+  const auth = new CloudAuthService({
+    storage: local,
+    requestHostedToken: async () => ({
+      token: `token-${++issued}`,
+      expiresAt: Date.now() + 3_600_000,
+      user: { uid: "user-1", name: "Synthetic", email: null, photoURL: null },
+    }),
+  });
+  await auth.connect();
+  const items = Array.from({ length: 11 }, (_, index) => item({ id: `queued-${index}`, updatedAt: index + 1 }));
+  const queued = items.map((entry) => ref(entry.id, entry.updatedAt));
+  values.set(CLOUD_SYNC_QUEUE_KEY, queued);
+  const fake = fakeCollections({ items });
+  return {
+    auth,
+    values,
+    queued,
+    hooks,
+    service: (fetcher: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) => new CloudSyncService({
+      getCredentials: () => auth.getCredentials(),
+      getCollectionResolver: async () => fake.resolve,
+      fetcher,
+    }),
+    restore() {
+      if (originalChrome) Object.defineProperty(globalThis, "chrome", originalChrome);
+      else Reflect.deleteProperty(globalThis, "chrome");
+    },
+  };
 };

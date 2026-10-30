@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { CloudAuthCredentials } from "@src/services/cloud-auth";
 import {
   CLOUD_SYNC_PULL_STATE_KEY,
   CloudSyncService,
@@ -63,6 +64,8 @@ const harness = (options: {
   local?: Partial<Record<CloudSyncCollectionName, FakeCollection>>;
   /** Omit to opt this device into incoming rows; false keeps the default. */
   pullEnabled?: false;
+  getCredentials?: () => Promise<CloudAuthCredentials>;
+  fetcher?: typeof fetch;
 }) => {
   const store = new Map<string, unknown>(
     options.pullEnabled === false ? [] : [["vibesearch:cloudPullEnabled:v1", true]],
@@ -96,9 +99,9 @@ const harness = (options: {
   const requests: string[] = [];
   let page = 0;
   const service = new CloudSyncService({
-    getCredentials: async () => ({ token: "token", userId: "user-1" }),
+    getCredentials: options.getCredentials ?? (async () => ({ token: "token", userId: "user-1" })),
     getCollectionResolver: async () => (collection) => collections[collection] as CloudSyncLocalCollection,
-    fetcher: (async (input: RequestInfo | URL) => {
+    fetcher: options.fetcher ?? (async (input: RequestInfo | URL) => {
       requests.push(String(input));
       const body = options.pages[Math.min(page, options.pages.length - 1)];
       page += 1;
@@ -121,6 +124,47 @@ test("a pull is off by default: backup leaves this device one-way", async () => 
   // No opt-in stored, so nothing is even requested.
   expect(await service.pull()).toMatchObject({ reason: "disabled", inserted: 0 });
   expect(requests).toEqual([]);
+});
+
+test("a retired pull cannot insert its old page or advance its checkpoint", async () => {
+  let current = true;
+  const { service, store, collections } = harness({
+    pages: [],
+    getCredentials: async () => ({ token: "old-token", userId: "user-1", isCurrent: () => current }),
+    fetcher: async () => {
+      current = false;
+      return Response.json({ changes: [{ collection: "spaces", id: "old-space", doc: { id: "old-space", updatedAt: 10, syncOrigin: "extension" }, updatedAt: 10, deletedAt: 0 }], checkpoint: 10, hasMore: true });
+    },
+  });
+  expect(await service.pull()).toMatchObject({ inserted: 0, reason: "cancelled" });
+  expect(collections.spaces?.inserted).toEqual([]);
+  expect(store.has(CLOUD_SYNC_PULL_STATE_KEY)).toBe(false);
+});
+
+test("a pull retired during its local lookup cannot publish the received row", async () => {
+  let current = true;
+  const local = new FakeCollection();
+  local.findByIds = () => ({ exec: async () => { current = false; return new Map<string, CloudSyncLocalDocument>(); } });
+  const { service, store } = harness({
+    local: { spaces: local },
+    getCredentials: async () => ({ token: "old-token", userId: "user-1", isCurrent: () => current }),
+    pages: [{ changes: [{ collection: "spaces", id: "old-space", doc: { id: "old-space", updatedAt: 10, syncOrigin: "extension" }, updatedAt: 10, deletedAt: 0 }], checkpoint: 10, hasMore: false }],
+  });
+  expect(await service.pull()).toMatchObject({ inserted: 0, reason: "cancelled" });
+  expect(local.inserted).toEqual([]);
+  expect(store.has(CLOUD_SYNC_PULL_STATE_KEY)).toBe(false);
+});
+
+test("a delayed pull refusal cannot reject the replacement connection", async () => {
+  let current = true;
+  let rejections = 0;
+  const { service } = harness({
+    pages: [],
+    getCredentials: async () => ({ token: "old-token", userId: "user-1", isCurrent: () => current, reject: async () => { rejections += 1; } }),
+    fetcher: async () => { current = false; return new Response(null, { status: 401 }); },
+  });
+  expect(await service.pull()).toMatchObject({ reason: "cancelled" });
+  expect(rejections).toBe(0);
 });
 
 test("a pull adds rows from another device and never touches local ones", async () => {

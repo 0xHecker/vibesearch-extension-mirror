@@ -89,6 +89,17 @@ const deferred = <T,>() => {
   return { promise, resolve };
 };
 
+test("a cloud cache write retired during OPFS output removes its scratch file before publication", async () => {
+  const harness = createHarness();
+  let current = true;
+  const write = harness.files.write.bind(harness.files);
+  harness.files.write = async (name, body) => { await write(name, body); current = false; };
+  const assertCurrent = async () => { if (!current) throw new Error("CLOUD_CONNECTION_RETIRED"); };
+  await expect(harness.cache.putCloud("old-account", new Blob(["<html>old account</html>"]), 1_000, assertCurrent)).rejects.toThrow("CLOUD_CONNECTION_RETIRED");
+  expect(await harness.cache.list()).toEqual([]);
+  expect(harness.files.files.size).toBe(0);
+});
+
 test("archive cache keeps a successful snapshot readable after the network is gone", async () => {
   const harness = createHarness();
   const original = new Blob(["<html>offline archive</html>"], { type: "text/html" });

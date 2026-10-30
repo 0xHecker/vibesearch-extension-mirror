@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { EXTENSION_POLICY_KEY } from "@src/services/extension-policy";
+import { beforeEach, afterEach, expect, test } from "bun:test";
 import {
   ArchiveOutbox,
   ARCHIVE_CAPTURE_MAX_ATTEMPTS,
@@ -11,6 +12,66 @@ import {
   type ArchiveOutboxConnection,
   type ArchiveOutboxStorage,
 } from "@src/services/archive-outbox";
+
+let previousChrome: PropertyDescriptor | undefined;
+beforeEach(() => { previousChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome"); Object.defineProperty(globalThis, "chrome", { configurable: true, value: { storage: { local: { get: async (key: string) => ({ [key]: key === EXTENSION_POLICY_KEY ? { version: 1, mode: "legacy-browser", legacyCloudEnabled: true } : undefined }) } } } }); });
+afterEach(() => { if (previousChrome) Object.defineProperty(globalThis, "chrome", previousChrome); else Reflect.deleteProperty(globalThis, "chrome"); });
+
+test("retiring the cloud connection during a file read preserves the archive job", async () => {
+  let current = true;
+  let requests = 0;
+  const harness = createHarness({
+    getConnection: async () => ({ token: "old-account", apiBase: "https://api.example", isCurrent: () => current }),
+    fetcher: async () => { requests += 1; return new Response(null, { status: 204 }); },
+  });
+  const html = "<html><body>durable account work</body></html>";
+  await harness.files.put("held.html", html);
+  await harness.outbox.enqueueUpload({ itemId: "held", sourceUrl: "https://example.com/held", fileName: "held.html", byteSize: new Blob([html]).size });
+  const read = harness.files.read.bind(harness.files);
+  harness.files.read = async (name) => { current = false; return read(name); };
+
+  await harness.outbox.drain();
+
+  expect(requests).toBe(0);
+  expect(await harness.outbox.list()).toHaveLength(1);
+  expect(await harness.files.read("held.html")).not.toBeNull();
+});
+
+test("a late archive acknowledgement cannot settle a retired account's durable job", async () => {
+  let current = true;
+  let requests = 0;
+  const harness = createHarness({
+    getConnection: async () => ({ token: "old-account", apiBase: "https://api.example", isCurrent: () => current }),
+    fetcher: async () => { requests += 1; current = false; return new Response(null, { status: 204 }); },
+  });
+  await harness.outbox.enqueueServerCapture("first", "https://example.com/first");
+  await harness.outbox.enqueueServerCapture("second", "https://example.com/second");
+
+  const result = await harness.outbox.drain(2);
+
+  expect(requests).toBe(1);
+  expect(result.uploaded).toBe(0);
+  expect((await harness.outbox.list()).map((job) => job.itemId)).toEqual(["first", "second"]);
+});
+
+test("archive acknowledgement retirement during the locked queue read retains the job", async () => {
+  let current = true;
+  let responded = false;
+  let readsAfterResponse = 0;
+  const harness = createHarness({
+    getConnection: async () => ({ token: "old-account", apiBase: "https://api.example", isCurrent: () => current }),
+    fetcher: async () => { responded = true; return new Response(null, { status: 204 }); },
+  });
+  await harness.outbox.enqueueServerCapture("first", "https://example.com/first");
+  const read = harness.storage.read.bind(harness.storage);
+  harness.storage.read = async () => {
+    if (responded && ++readsAfterResponse === 3) current = false;
+    return read();
+  };
+  const result = await harness.outbox.drain();
+  expect(result).toMatchObject({ uploaded: 0, reason: "cancelled" });
+  expect(await harness.outbox.list()).toHaveLength(1);
+});
 
 class MemoryStorage implements ArchiveOutboxStorage {
   value: unknown = [];

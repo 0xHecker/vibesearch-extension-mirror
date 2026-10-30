@@ -1,3 +1,6 @@
+import { requireLegacyCloud } from "./extension-policy";
+import { z } from "zod";
+import { FIREFOX_RUNTIME_FRAME_ID, setupOffscreenDocument } from "./offscreen-helper";
 import {
   CLOUD_SYNC_TOKEN_KEY,
   DEVELOPMENT_CLOUD_AUTH_ENABLED,
@@ -37,10 +40,24 @@ export type CloudAuthToken = {
   user: CloudAuthProfile;
 };
 
-export type CloudAuthCredentials = {
+export type CloudAuthCredentials = CloudConnectionLifetime & {
   token: string;
   userId: string;
+  isCurrent?: () => boolean;
 };
+
+export const cloudAuthConnectionSchema = z.object({
+  token: z.string(),
+  userId: z.string(),
+  leaseId: z.string().max(200),
+});
+export type CloudAuthConnectionDescriptor = z.infer<typeof cloudAuthConnectionSchema>;
+export type CloudConnectionLifetime = {
+  isCurrent?: () => boolean;
+  validate?: () => Promise<boolean>;
+  reject?: () => Promise<void>;
+};
+export type CloudAuthConnection = CloudAuthCredentials & CloudConnectionLifetime;
 
 export type CloudAuthStatus = {
   connected: boolean;
@@ -203,6 +220,7 @@ const ensureAuthFrame = (): Promise<HTMLIFrameElement> => {
 };
 
 export const requestHostedCloudToken = async (request: HostedAuthRequest): Promise<CloudAuthToken> => {
+  await requireLegacyCloud();
   const frame = await ensureAuthFrame();
   const authUrl = new URL(DEFAULT_VIBESEARCH_AUTH_URL);
   const requestId = typeof crypto.randomUUID === "function"
@@ -270,6 +288,9 @@ export class CloudAuthService {
   private readonly onDisconnected?: () => Promise<void>;
   private refreshInFlight: Promise<string> | null = null;
   private mutationGeneration = 0;
+  private completedMutationGeneration = 0;
+  private storageMutationTail: Promise<void> = Promise.resolve();
+  private readonly instanceId = crypto.randomUUID();
 
   constructor(options: CloudAuthServiceOptions = {}) {
     this.storage = options.storage ?? chromeStorage;
@@ -305,14 +326,29 @@ export class CloudAuthService {
     };
   }
 
-  private async persist(result: CloudAuthToken): Promise<void> {
-    await this.storage.set({
-      [CLOUD_SYNC_TOKEN_KEY]: result.token,
-      [CLOUD_AUTH_EXPIRES_AT_KEY]: result.expiresAt,
-      [CLOUD_AUTH_PROFILE_KEY]: result.user,
-      [CLOUD_AUTH_OPT_IN_KEY]: true,
-      // A freshly issued token clears any previous refusal.
-      [CLOUD_AUTH_REJECTED_AT_KEY]: 0,
+  private async mutateStorage(operation: () => Promise<void>): Promise<void> {
+    let release!: () => void;
+    const previous = this.storageMutationTail;
+    this.storageMutationTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async persist(result: CloudAuthToken, generation: number): Promise<void> {
+    await this.mutateStorage(async () => {
+      if (generation !== this.mutationGeneration) return;
+      await this.storage.set({
+        [CLOUD_SYNC_TOKEN_KEY]: result.token,
+        [CLOUD_AUTH_EXPIRES_AT_KEY]: result.expiresAt,
+        [CLOUD_AUTH_PROFILE_KEY]: result.user,
+        [CLOUD_AUTH_OPT_IN_KEY]: true,
+        // A freshly issued token clears any previous refusal.
+        [CLOUD_AUTH_REJECTED_AT_KEY]: 0,
+      });
     });
   }
 
@@ -323,24 +359,35 @@ export class CloudAuthService {
    * dropped. `optedIn` survives, so the UI asks for a reconnect instead of
    * pretending the account was never connected.
    */
-  async markSessionRejected(): Promise<void> {
+  async markSessionRejected(leaseId?: string, rejectedToken?: string): Promise<void> {
+    if (leaseId !== undefined && !this.validateConnection(leaseId)) return;
     const current = await this.read();
+    if (leaseId !== undefined && !this.validateConnection(leaseId)) return;
+    if (rejectedToken !== undefined && current.token !== rejectedToken) return;
     if (!current.optedIn && !current.token) return;
-    this.mutationGeneration += 1;
+    const generation = ++this.mutationGeneration;
     this.refreshInFlight = null;
-    await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY]);
-    await this.storage.set({ [CLOUD_AUTH_REJECTED_AT_KEY]: this.now() });
+    await this.mutateStorage(async () => {
+      await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY]);
+      await this.storage.set({ [CLOUD_AUTH_REJECTED_AT_KEY]: this.now() });
+    });
+    if (generation === this.mutationGeneration) this.completedMutationGeneration = generation;
   }
 
   async connect(): Promise<CloudAuthStatus> {
     const generation = ++this.mutationGeneration;
-    const result = normalizeHostedToken(
-      // An explicit connect always confirms the account, so reconnecting after
-      // a disconnect never silently reuses the previous one.
-      await this.requestToken({ interactive: true, forceRefresh: true, selectAccount: true }),
-      this.now(),
-    );
-    if (generation === this.mutationGeneration) await this.persist(result);
+    try {
+      const result = normalizeHostedToken(
+        // An explicit connect always confirms the account, so reconnecting after
+        // a disconnect never silently reuses the previous one.
+        await this.requestToken({ interactive: true, forceRefresh: true, selectAccount: true }),
+        this.now(),
+      );
+      await this.persist(result, generation);
+    } finally {
+      await this.storageMutationTail;
+      if (generation === this.mutationGeneration) this.completedMutationGeneration = generation;
+    }
     try {
       void chrome.runtime.sendMessage({ target: "background", type: "CLOUD_SYNC_QUEUED" });
     } catch {}
@@ -348,17 +395,21 @@ export class CloudAuthService {
   }
 
   async disconnect(): Promise<CloudAuthStatus> {
-    this.mutationGeneration += 1;
-    await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY, CLOUD_AUTH_PROFILE_KEY]);
-    await this.storage.set({ [CLOUD_AUTH_OPT_IN_KEY]: false, [CLOUD_AUTH_REJECTED_AT_KEY]: 0 });
+    const generation = ++this.mutationGeneration;
+    await this.mutateStorage(async () => {
+      await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY, CLOUD_AUTH_PROFILE_KEY]);
+      await this.storage.set({ [CLOUD_AUTH_OPT_IN_KEY]: false, [CLOUD_AUTH_REJECTED_AT_KEY]: 0 });
+    });
+    if (generation === this.mutationGeneration) this.completedMutationGeneration = generation;
     // A read position belongs to the account that produced it.
     await this.onDisconnected?.().catch(() => undefined);
     return this.status();
   }
 
   async invalidate(): Promise<void> {
-    this.mutationGeneration += 1;
-    await this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY]);
+    const generation = ++this.mutationGeneration;
+    await this.mutateStorage(() => this.storage.remove([CLOUD_SYNC_TOKEN_KEY, CLOUD_AUTH_EXPIRES_AT_KEY]));
+    if (generation === this.mutationGeneration) this.completedMutationGeneration = generation;
   }
 
   async getToken(forceRefresh = false): Promise<string> {
@@ -383,7 +434,11 @@ export class CloudAuthService {
             ? latest.token
             : "";
         }
-        await this.persist(normalized);
+        if (current.user && current.user.uid !== normalized.user.uid) this.mutationGeneration += 1;
+        const persistedGeneration = this.mutationGeneration;
+        await this.persist(normalized, persistedGeneration);
+        if (persistedGeneration !== this.mutationGeneration) return "";
+        this.completedMutationGeneration = persistedGeneration;
         return normalized.token;
       })
       .catch(async () => {
@@ -404,19 +459,36 @@ export class CloudAuthService {
   }
 
   async getCredentials(forceRefresh = false): Promise<CloudAuthCredentials> {
+    const generation = this.mutationGeneration;
+    if (generation !== this.completedMutationGeneration) return { token: "", userId: "" };
     const token = await this.getToken(forceRefresh);
+    if (generation !== this.mutationGeneration) return { token: "", userId: "" };
     if (!token) return { token: "", userId: "" };
     const state = await this.read();
     // Token and profile are persisted together. If another connect/disconnect
     // wins between getToken() and this read, fail closed instead of pairing one
     // account's bearer token with another account's document ownership.
-    if (state.token !== token) return { token: "", userId: "" };
+    if (generation !== this.mutationGeneration || state.token !== token) return { token: "", userId: "" };
     const tokenUserId = firebaseTokenUserId(token);
     const profileUserId = state.user?.uid || "";
     if (tokenUserId && profileUserId && tokenUserId !== profileUserId) {
       return { token: "", userId: "" };
     }
-    return { token, userId: tokenUserId || profileUserId };
+    return { token, userId: tokenUserId || profileUserId, isCurrent: () => generation === this.mutationGeneration };
+  }
+
+  async getConnection(forceRefresh = false): Promise<CloudAuthConnectionDescriptor> {
+    const generation = this.mutationGeneration;
+    const credentials = await this.getCredentials(forceRefresh);
+    if (generation !== this.mutationGeneration || generation !== this.completedMutationGeneration) {
+      return { token: "", userId: "", leaseId: "" };
+    }
+    return { token: credentials.token, userId: credentials.userId, leaseId: `${this.instanceId}:${generation}` };
+  }
+
+  validateConnection(leaseId: string): boolean {
+    return this.mutationGeneration === this.completedMutationGeneration &&
+      leaseId === `${this.instanceId}:${this.mutationGeneration}`;
   }
 
   async status(options: { refresh?: boolean } = {}): Promise<CloudAuthStatus> {
@@ -439,14 +511,53 @@ export class CloudAuthService {
 }
 
 export const cloudAuthService = new CloudAuthService();
-export const getCloudAuthToken = (forceRefresh = false): Promise<string> =>
-  cloudAuthService.getToken(forceRefresh);
-export const getCloudAuthCredentials = (forceRefresh = false): Promise<CloudAuthCredentials> =>
-  cloudAuthService.getCredentials(forceRefresh);
-/**
- * Record that the API refused the stored session, so every surface stops
- * claiming "Connected" and asks for a reconnect instead. Safe to call from any
- * context that sees a 401/403 from a cloud route.
- */
-export const markCloudSessionRejected = (): Promise<void> =>
-  cloudAuthService.markSessionRejected();
+let localAuthAuthority = false;
+
+export const useLocalCloudAuthAuthority = (): void => { localAuthAuthority = true; };
+
+const authRpcResponseSchema = z.object({ success: z.boolean(), payload: z.unknown().optional(), error: z.string().optional() });
+const requestAuthAuthority = async (type: string, payload: Record<string, string | boolean> = {}): Promise<unknown> => {
+  const backgroundContext = typeof document === "undefined" || Boolean(document.getElementById(FIREFOX_RUNTIME_FRAME_ID));
+  if (backgroundContext) await setupOffscreenDocument();
+  const response = authRpcResponseSchema.parse(await chrome.runtime.sendMessage({
+    target: "offscreen", service: "cloudAuth", type, payload,
+    ...(backgroundContext ? { isForwarded: true } : {}),
+  }));
+  if (!response.success) throw new Error(response.error || "CLOUD_AUTH_AUTHORITY_UNAVAILABLE");
+  return response.payload;
+};
+
+export const getCloudAuthConnection = async (forceRefresh = false): Promise<CloudAuthConnection> => {
+  const descriptor = localAuthAuthority
+    ? await cloudAuthService.getConnection(forceRefresh)
+    : cloudAuthConnectionSchema.parse(await requestAuthAuthority("connection", { forceRefresh }));
+  let current = descriptor.leaseId !== "";
+  const localCurrent = () => current && (!localAuthAuthority || cloudAuthService.validateConnection(descriptor.leaseId));
+  return {
+    token: descriptor.token,
+    userId: descriptor.userId,
+    isCurrent: localCurrent,
+    validate: async () => {
+      if (!localCurrent()) return false;
+      try {
+        current = localAuthAuthority
+          ? cloudAuthService.validateConnection(descriptor.leaseId)
+          : z.boolean().parse(await requestAuthAuthority("validateConnection", { leaseId: descriptor.leaseId }));
+      } catch { current = false; }
+      return localCurrent();
+    },
+    reject: async () => {
+      if (!localCurrent() || !descriptor.token) return;
+      if (localAuthAuthority) await cloudAuthService.markSessionRejected(descriptor.leaseId, descriptor.token);
+      else await requestAuthAuthority("rejectConnection", { leaseId: descriptor.leaseId, token: descriptor.token });
+      current = false;
+    },
+  };
+};
+
+export const getCloudAuthToken = async (forceRefresh = false): Promise<string> =>
+  (await getCloudAuthConnection(forceRefresh)).token;
+export const getCloudAuthCredentials = async (forceRefresh = false): Promise<CloudAuthCredentials> => {
+  const connection = await getCloudAuthConnection(forceRefresh);
+  return connection.token ? connection : { token: "", userId: "" };
+};

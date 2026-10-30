@@ -62,6 +62,7 @@ import {
   writeQueue,
 } from "@src/services/cloud-sync/runtime";
 import { z } from "zod";
+import { requireLegacyCloud } from "@src/services/extension-policy";
 
 export type CloudSyncServiceOptions = {
   fetcher?: typeof fetch;
@@ -229,6 +230,7 @@ export const normalizePulledPage = (value: JsonValue): CloudSyncPullPage | null 
 const applyPulledChanges = async (
   changes: CloudPullChange[],
   resolveCollection: CloudSyncCollectionResolver,
+  isCurrent: () => boolean,
 ): Promise<{ inserted: number; skipped: number; rejected: number }> => {
   if (changes.length === 0) return { inserted: 0, skipped: 0, rejected: 0 };
 
@@ -290,6 +292,7 @@ const applyPulledChanges = async (
     // RxDB bulk writes report per-row outcomes instead of throwing, so a
     // conflict must not be counted as an insert (the checkpoint would advance
     // past a row that was never written).
+    if (!isCurrent()) throw new DOMException("Cloud connection retired", "AbortError");
     const outcome = await target.bulkInsert(docs);
     const failures = outcome.error?.length ?? 0;
     inserted += Math.max(0, docs.length - failures);
@@ -323,7 +326,9 @@ export class CloudSyncService {
     return createCloudSyncCollectionResolver(db);
   }
 
-  private request(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  private async request(input: RequestInfo | URL, init?: RequestInit, canRequest?: () => boolean): Promise<Response> {
+    await requireLegacyCloud();
+    if (canRequest?.() === false) throw new DOMException("Cloud sync cancelled", "AbortError");
     // Bound like archive-preview: a detached fetch reference throws
     // "Illegal invocation" in window contexts.
     return (this.options.fetcher ?? fetch.bind(globalThis))(input, init);
@@ -345,6 +350,7 @@ export class CloudSyncService {
     refs: CloudSyncQueueRef[],
     notify = true,
   ): Promise<{ queued: number; added: number }> {
+    await requireLegacyCloud();
     if (refs.length === 0) {
       const queue = await readQueue();
       return { queued: queue.length, added: 0 };
@@ -375,6 +381,7 @@ export class CloudSyncService {
    * run re-reads that page instead of skipping it.
    */
   async pull(payload: { maxPages?: number } = {}): Promise<CloudSyncPullResult> {
+    await requireLegacyCloud();
     const maxPages = Math.max(1, Math.min(
       CLOUD_SYNC_PULL_MAX_PAGES,
       Math.floor(payload.maxPages ?? 4),
@@ -382,7 +389,7 @@ export class CloudSyncService {
     // Backup is one-way out of this extension unless the user turned the return
     // direction on, so the default costs no network call at all.
     const enabled = await isCloudPullEnabled();
-    const credentials = enabled
+    const credentials: CloudAuthCredentials = enabled
       ? await (this.options.getCredentials ?? getCloudAuthCredentials)()
       : { token: "", userId: "" };
     // The read position belongs to one account: sequence numbers are per user,
@@ -398,10 +405,12 @@ export class CloudSyncService {
     };
     if (!enabled) return { ...result, reason: "disabled" };
     if (!credentials.token) return { ...result, reason: "missing-token" };
+    const isCurrent = () => credentials.isCurrent?.() !== false;
     const [apiBase, clientId] = await Promise.all([getApiBase(), getClientId()]);
     const resolveCollection = await this.getCollectionResolver();
 
     while (result.pages < maxPages) {
+      if (!isCurrent()) return { ...result, reason: "cancelled" };
       const query = new URLSearchParams({
         since: String(state.checkpoint),
         limit: String(CLOUD_SYNC_PULL_PAGE_SIZE),
@@ -419,9 +428,12 @@ export class CloudSyncService {
           credentials: "omit",
           cache: "no-store",
           signal: controller.signal,
-        });
+        }, isCurrent);
+        if (!isCurrent()) { await response.body?.cancel().catch(() => {}); return { ...result, reason: "cancelled" }; }
         if (response.status === 401 || response.status === 403) {
           await response.body?.cancel().catch(() => {});
+          if (!isCurrent()) return { ...result, reason: "cancelled" };
+          await credentials.reject?.();
           return { ...result, reason: "invalid-auth" };
         }
         if (!response.ok) {
@@ -430,6 +442,7 @@ export class CloudSyncService {
         }
         body = await readBoundedCloudSyncJson(response, controller.signal);
       } catch (cause) {
+        if (!isCurrent()) return { ...result, reason: "cancelled" };
         return {
           ...result,
           reason: "network-error",
@@ -439,10 +452,14 @@ export class CloudSyncService {
         clearTimeout(timeout);
       }
 
+      if (!isCurrent()) return { ...result, reason: "cancelled" };
+
       const page = normalizePulledPage(body);
       if (!page) return { ...result, reason: "invalid-response" };
 
-      const applied = await applyPulledChanges(page.changes, resolveCollection);
+      let applied: Awaited<ReturnType<typeof applyPulledChanges>>;
+      try { applied = await applyPulledChanges(page.changes, resolveCollection, isCurrent); }
+      catch (error) { if (!isCurrent()) return { ...result, reason: "cancelled" }; throw error; }
       result.inserted += applied.inserted;
       result.skipped += applied.skipped;
       result.rejected += applied.rejected;
@@ -458,7 +475,9 @@ export class CloudSyncService {
         state.bootstrapCursor = page.bootstrap.cursor;
       }
       if (credentials.userId) state.userId = credentials.userId;
+      if (!isCurrent()) return { ...result, reason: "cancelled" };
       await writePullState(state);
+      if (!isCurrent()) return { ...result, reason: "cancelled" };
       result.checkpoint = state.checkpoint;
       result.hasMore = page.hasMore;
       if (!page.hasMore) break;
@@ -497,6 +516,7 @@ export class CloudSyncService {
   }
 
   async syncAll(payload: CloudSyncAllOptions = {}): Promise<CloudSyncAllResult> {
+    await requireLegacyCloud();
     const credentials = this.options.getCredentials
       ? await this.options.getCredentials(true)
       : await getCloudAuthCredentials(true);
@@ -558,6 +578,7 @@ export class CloudSyncService {
   }
 
   async drain(payload?: CloudSyncBatchOptions): Promise<CloudSyncDrainResult> {
+    await requireLegacyCloud();
     if (drainInFlight) {
       if (!payload?.expectedUserId) return drainInFlight;
       await drainInFlight;
@@ -585,6 +606,7 @@ export class CloudSyncService {
 
   /** Ensure one local item reaches the API before a dependent archive upload. */
   async pushItem(itemIdRaw: string): Promise<CloudSyncPushItemResult> {
+    await requireLegacyCloud();
     const itemId = itemIdRaw.trim();
     if (!itemId) return { ready: false, reason: "missing-local-item" };
     const resolveCollection = await this.getCollectionResolver();
@@ -617,6 +639,7 @@ export class CloudSyncService {
     signal: AbortSignal,
     generation: number,
   ): Promise<CloudSyncDrainResult> {
+    await requireLegacyCloud();
     const credentials = this.options.getCredentials
       ? await this.options.getCredentials()
       : await getCloudAuthCredentials();
@@ -689,16 +712,18 @@ export class CloudSyncService {
       remaining: queue.length,
       reason: "cancelled",
     });
+    const isCurrent = () => !signal.aborted && generation === drainGeneration && credentials.isCurrent?.() !== false;
 
     while (queue.length > 0 && batches < maxBatches) {
-      if (signal.aborted || generation !== drainGeneration) return cancelled();
+      if (!isCurrent()) return cancelled();
       const refs = selectCloudSyncBatch(queue, batchSize, payload?.priorityRefs);
       const changes = await buildCloudSyncChanges(refs, resolveCollection, credentials.userId);
-      if (signal.aborted || generation !== drainGeneration) return cancelled();
+      if (!isCurrent()) return cancelled();
       const missingRefs = refs.filter((ref) => !changes.some((change) => change.collection === ref.collection && change.id === ref.id));
       if (missingRefs.length > 0) {
         skipped += missingRefs.length;
-        queue = await removeQueueRefs(missingRefs);
+        queue = await removeQueueRefs(missingRefs, isCurrent);
+        if (!isCurrent()) return cancelled();
       }
       if (changes.length === 0) {
         continue;
@@ -723,14 +748,14 @@ export class CloudSyncService {
           },
           body: JSON.stringify({ clientId, changes }),
           signal: requestController.signal,
-        });
+        }, isCurrent);
         if (response.ok) {
           responseBody = await readBoundedCloudSyncJson(response, requestController.signal);
         } else {
           await response.body?.cancel().catch(() => {});
         }
       } catch (error) {
-        if (signal.aborted || generation !== drainGeneration) return cancelled();
+        if (!isCurrent()) return cancelled();
         return {
           pushed,
           skipped,
@@ -748,9 +773,10 @@ export class CloudSyncService {
         signal.removeEventListener("abort", forwardAbort);
       }
 
-      if (signal.aborted || generation !== drainGeneration) return cancelled();
+      if (!isCurrent()) return cancelled();
 
       if (!response.ok) {
+        if (response.status === 401 || response.status === 403) await credentials.reject?.();
         return {
           pushed,
           skipped,
@@ -794,7 +820,8 @@ export class CloudSyncService {
 
       pushed += result.applied;
       conflicts += result.conflicts;
-      queue = await removeQueueRefs(acknowledgedRefs);
+      queue = await removeQueueRefs(acknowledgedRefs, isCurrent);
+      if (!isCurrent()) return cancelled();
     }
 
     // A queued ref whose local document cannot be read is dropped from the queue

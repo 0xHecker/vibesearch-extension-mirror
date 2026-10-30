@@ -152,6 +152,7 @@ export type CloudSyncPullResult = {
   reason?:
     | "empty"
     | "disabled"
+    | "cancelled"
     | "missing-token"
     | "invalid-auth"
     | "http-error"

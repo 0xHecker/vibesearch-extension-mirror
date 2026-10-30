@@ -6,9 +6,10 @@ import {
   type JsonValue,
 } from "@src/common/json-value";
 import { getCloudAuthToken } from "@src/services/cloud-auth";
+import { runtimeOffscreenStorage } from "@src/services/offscreen-storage-bridge";
 import {
   CLOUD_SYNC_API_BASE_KEY,
-  DEFAULT_VIBESEARCH_API_BASE,
+  resolveVibeSearchApiBase,
 } from "@src/services/cloud-config";
 import {
   CLOUD_PULL_ENABLED_KEY,
@@ -40,20 +41,23 @@ const storageAvailable = (): boolean => typeof chrome !== "undefined" && Boolean
 
 const jsonValueSchema: z.ZodType<JsonValue> = z.json();
 
+const storageReadRow = (key: string): Promise<Record<string, unknown>> => storageAvailable()
+  ? chrome.storage.local.get(key)
+  : runtimeOffscreenStorage.get(key);
+
 const storageGet = async (key: string): Promise<JsonValue | undefined> => {
-  if (!storageAvailable()) return undefined;
-  const row = await chrome.storage.local.get(key);
+  const row = await storageReadRow(key);
   const parsed = jsonValueSchema.safeParse(row?.[key]);
   return parsed.success ? parsed.data : undefined;
 };
 
 const storageSet = async (key: string, value: JsonValue): Promise<void> => {
-  if (!storageAvailable()) return;
-  await chrome.storage.local.set({ [key]: value });
+  if (storageAvailable()) await chrome.storage.local.set({ [key]: value });
+  else await runtimeOffscreenStorage.set(key, value);
 };
 
 export const storageRemove = async (key: string): Promise<void> => {
-  if (!storageAvailable()) return;
+  if (!storageAvailable()) return runtimeOffscreenStorage.remove(key);
   if (chrome.storage.local.remove) {
     await chrome.storage.local.remove(key);
     return;
@@ -72,8 +76,7 @@ export const readQueue = async (): Promise<CloudSyncQueueRef[]> => {
  * while reserving full dedupe/normalization for queue hydration and enqueue.
  */
 const readQueueForMutation = async (): Promise<CloudSyncQueueRef[]> => {
-  if (!storageAvailable()) return [];
-  const row = await chrome.storage.local.get(CLOUD_SYNC_QUEUE_KEY);
+  const row = await storageReadRow(CLOUD_SYNC_QUEUE_KEY);
   const stored = row?.[CLOUD_SYNC_QUEUE_KEY];
   if (!Array.isArray(stored)) return [];
   // SAFETY: The drain validates this outbox through `readQueue` before its first
@@ -120,7 +123,7 @@ export const getApiBase = async (): Promise<string> => {
   const configured = (jsonString(await storageGet(CLOUD_SYNC_API_BASE_KEY)) ?? "")
     .trim()
     .replace(/\/+$/, "");
-  return configured || DEFAULT_VIBESEARCH_API_BASE;
+  return resolveVibeSearchApiBase(configured);
 };
 
 export const getToken = (): Promise<string> => getCloudAuthToken();
@@ -369,10 +372,12 @@ export const buildCloudSyncChanges = async (
   return changes;
 };
 
-export const removeQueueRefs = async (refs: CloudSyncQueueRef[]): Promise<CloudSyncQueueRef[]> => {
+export const removeQueueRefs = async (refs: CloudSyncQueueRef[], canRemove: () => boolean = () => true): Promise<CloudSyncQueueRef[]> => {
   return withQueueMutationLock(async () => {
     const current = await readQueueForMutation();
+    if (!canRemove()) return current;
     const next = removeAcknowledgedQueueRefs(current, refs);
+    // The guarded storage write starts here; later cancellation cannot undo it.
     await writeQueue(next);
     return next;
   });
