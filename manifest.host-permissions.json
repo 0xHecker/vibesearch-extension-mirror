@@ -1,5 +1,10 @@
 [
   "https://huggingface.co/*",
+  "https://metadata-worker.shanmukh6789op.workers.dev/*",
+  "https://share-worker.shanmukh6789op.workers.dev/*",
+  "https://share.shanmukh6789op.workers.dev/*",
+  "https://api.vibesearch.app/*",
+  "https://app.vibesearch.app/*",
   "https://metadata-worker.watermelons.workers.dev/*",
   "https://meta.vibesearch.app/*",
   "https://share-worker.watermelons.workers.dev/*",

@@ -7,6 +7,8 @@ import { isLikelyDirectResourceUrl } from "@src/utils/metadata-url";
 export const LOCAL_IMPORT_HOST = "local.vibesearch.invalid";
 
 const SHARE_URL_HOSTS = new Set([
+  "share-worker.shanmukh6789op.workers.dev",
+  "share.shanmukh6789op.workers.dev",
   "share-worker.watermelons.workers.dev",
   "share.watermelons.workers.dev",
   "share.vibesearch.app",

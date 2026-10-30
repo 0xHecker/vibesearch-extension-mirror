@@ -1,4 +1,4 @@
-const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
+const METADATA_WORKER_BASE_URL = "https://metadata-worker.shanmukh6789op.workers.dev";
 
 const YOUTUBE_VIDEO_ID_PATTERN = /^[a-zA-Z0-9_-]{6,20}$/;
 
@@ -65,6 +65,8 @@ export const isYouTubeShortsUrl = (value: string | undefined): boolean => {
  * fall back to thumbnails or native <video> rendering instead.
  */
 const FRAMEABLE_HOSTS = new Set([
+  "app.vibesearch.app",
+  "metadata-worker.shanmukh6789op.workers.dev",
   "vibesearch-web.watermelons.workers.dev",
   "metadata-worker.watermelons.workers.dev",
 ]);

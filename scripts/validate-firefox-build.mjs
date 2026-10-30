@@ -2,7 +2,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-const buildRoot = fileURLToPath(new URL("../dist_firefox/", import.meta.url));
+const buildRoot = process.argv[2] ? path.resolve(process.argv[2]) : fileURLToPath(new URL("../dist_firefox/", import.meta.url));
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(`Firefox build validation failed: ${message}`);
@@ -96,8 +96,5 @@ assert(
 );
 
 console.log(
-  `Validated genuine Firefox MV3 build (${relativeFiles.length} files, ${(
-    wasmSize /
-    1_000_000
-  ).toFixed(1)} MB ONNX WASM).`
+  `Validated genuine Firefox MV3 build (${relativeFiles.length} files, ${(wasmSize / 1_000_000).toFixed(1)} MB ONNX WASM).`
 );

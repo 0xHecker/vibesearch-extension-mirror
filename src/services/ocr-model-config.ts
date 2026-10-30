@@ -1,6 +1,6 @@
 export const OCR_MODEL_VERSION = "pp-ocrv6-small-hf-2026-06-12";
 
-export const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
+export const METADATA_WORKER_BASE_URL = "https://metadata-worker.shanmukh6789op.workers.dev";
 export const OCR_MODEL_BASE_URL = `${METADATA_WORKER_BASE_URL}/ocr-model`;
 // The retired custom domain (meta.vibesearch.app) no longer resolves. Models are
 // served from the metadata worker's stable workers.dev origin, so the "fallback"

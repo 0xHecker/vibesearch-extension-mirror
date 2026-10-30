@@ -11,7 +11,7 @@ import type { ShareSnapshotV1, ShareSourceKind } from "@src/services/share-snaps
 
 const SHARE_WORKER_BASE =
   (import.meta as any).env?.VITE_SHARE_API_BASE ??
-  "https://share-worker.watermelons.workers.dev";
+  "https://share-worker.shanmukh6789op.workers.dev";
 
 const OWNER_TOKEN_STORAGE_KEY = "shareOwnerToken";
 const OWNER_HINT_STORAGE_KEY = "shareOwnerHint";

@@ -19,7 +19,7 @@ const SHARE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024;
 const SHARE_SNAPSHOT_FETCH_TIMEOUT_MS = 60_000;
 const ShareEnvelopeSchema = z.object({ snapshot: z.unknown() });
 
-const SHARE_WORKER_JSON_BASE = "https://share-worker.watermelons.workers.dev";
+const SHARE_WORKER_JSON_BASE = "https://share-worker.shanmukh6789op.workers.dev";
 const sharePairFromShareUrl = (url: string): string | null => {
   try {
     const { pathname } = new URL(url);

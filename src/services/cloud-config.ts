@@ -13,10 +13,17 @@ export const DEVELOPMENT_CLOUD_AUTH_UID = (
 export const DEFAULT_VIBESEARCH_API_BASE = (
   env.VITE_VIBESEARCH_API_BASE ||
   env.VITE_API_BASE ||
-  "https://vibesearch-api.watermelons.workers.dev"
+  "https://api.vibesearch.app"
 ).trim().replace(/\/+$/, "");
 
 export const DEFAULT_VIBESEARCH_AUTH_URL = (
   env.VITE_VIBESEARCH_AUTH_URL ||
-  "https://vibesearch-web.watermelons.workers.dev/extension-auth"
+  "https://app.vibesearch.app/extension-auth"
 ).trim();
+
+export const resolveVibeSearchApiBase = (configured: string): string => {
+  const base = configured.trim().replace(/\/+$/, "");
+  return !base || base === "https://vibesearch-api.watermelons.workers.dev"
+    ? DEFAULT_VIBESEARCH_API_BASE
+    : base;
+};

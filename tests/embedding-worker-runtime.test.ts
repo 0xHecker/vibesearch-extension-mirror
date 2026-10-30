@@ -31,7 +31,7 @@ test("embedding worker resolves model files from the R2-backed worker, not the C
   const r = runtime as Record<string, unknown>;
   expect(r.allowRemoteModels).toBe(true);
   expect(r.allowLocalModels).toBe(false);
-  expect(r.remoteHost).toBe("https://metadata-worker.watermelons.workers.dev");
+  expect(r.remoteHost).toBe("https://metadata-worker.shanmukh6789op.workers.dev");
   expect(r.remotePathTemplate).toBe("r2/{model}/");
 });
 

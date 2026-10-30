@@ -10,7 +10,7 @@
 // MODEL_ID="models/mdbr-leaf-ir-onnx" (see embedding.worker.ts), a request for
 // `onnx/model.onnx` resolves to:
 //   https://metadata-worker.watermelons.workers.dev/r2/models/mdbr-leaf-ir-onnx/onnx/model.onnx
-export const MODEL_REMOTE_HOST = "https://metadata-worker.watermelons.workers.dev";
+export const MODEL_REMOTE_HOST = "https://metadata-worker.shanmukh6789op.workers.dev";
 export const MODEL_REMOTE_PATH_TEMPLATE = "r2/{model}/";
 
 // ORT asyncify build filenames. The embedding worker pins device "wasm", so

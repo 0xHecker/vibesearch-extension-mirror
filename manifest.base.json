@@ -43,6 +43,7 @@
     "cookies",
     "identity"
   ],
+  "optional_permissions": ["nativeMessaging"],
   "content_scripts": [
     {
       "matches": [
@@ -56,6 +57,7 @@
     },
     {
       "matches": [
+        "https://share.shanmukh6789op.workers.dev/*",
         "https://share.watermelons.workers.dev/*",
         "https://share.vibesearch.app/*"
       ],
@@ -67,8 +69,8 @@
   ],
   "devtools_page": "src/pages/devtools/index.html",
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; frame-src 'self' blob: https://vibesearch-web.watermelons.workers.dev https://metadata-worker.watermelons.workers.dev; connect-src 'self' data: https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://metadata-worker.watermelons.workers.dev https://meta.vibesearch.app https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://vibesearch-api.watermelons.workers.dev https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://api.notion.com https://api.github.com https://x.com https://twitter.com https://api.x.com https://api.twitter.com https://www.reddit.com https://oauth.reddit.com https://www.instagram.com https://i.instagram.com",
-    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self' blob:; connect-src 'self' data: https://metadata-worker.watermelons.workers.dev https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; frame-src 'self' blob: https://app.vibesearch.app https://metadata-worker.shanmukh6789op.workers.dev https://vibesearch-web.watermelons.workers.dev https://metadata-worker.watermelons.workers.dev; connect-src 'self' data: https://api.vibesearch.app https://app.vibesearch.app https://metadata-worker.shanmukh6789op.workers.dev https://share-worker.shanmukh6789op.workers.dev https://share.shanmukh6789op.workers.dev https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://metadata-worker.watermelons.workers.dev https://meta.vibesearch.app https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://vibesearch-api.watermelons.workers.dev https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com https://api.notion.com https://api.github.com https://x.com https://twitter.com https://api.x.com https://api.twitter.com https://www.reddit.com https://oauth.reddit.com https://www.instagram.com https://i.instagram.com",
+    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self' blob:; connect-src 'self' data: https://api.vibesearch.app https://app.vibesearch.app https://metadata-worker.shanmukh6789op.workers.dev https://share-worker.shanmukh6789op.workers.dev https://share.shanmukh6789op.workers.dev https://metadata-worker.watermelons.workers.dev https://share-worker.watermelons.workers.dev https://share.watermelons.workers.dev https://share.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app https://accounts.google.com https://www.googleapis.com"
   },
   "sandbox": {
     "pages": ["src/pages/ocr-sandbox/index.html"]
