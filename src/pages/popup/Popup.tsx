@@ -1,4 +1,7 @@
 import * as React from "react";
+import LocalSavePanel from "@src/pages/local/LocalSavePanel";
+import { readExtensionPolicy, type ExtensionPolicy } from "@src/services/extension-policy";
+import { LOCAL_LIBRARY_PATH } from "@src/services/local-companion-protocol";
 import { v4 as uuidv4 } from "uuid";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
@@ -1148,15 +1151,23 @@ const SaveTabsPopup = () => {
 };
 
 const Popup = () => {
+  const [policy, setPolicy] = React.useState<ExtensionPolicy | null>(null);
+  React.useEffect(() => { void readExtensionPolicy().then(setPolicy); }, []);
   const params = React.useMemo(() => new URLSearchParams(window.location.search), []);
   const mode = params.get("mode");
   const draftId = params.get("draftId");
 
+  if (!policy) {
+    return <div className="w-[340px] bg-background-page p-4 text-sm text-foreground-secondary" role="status">Opening VibeSearch...</div>;
+  }
+  if (policy.mode === "local-only") {
+    return <div className="w-[340px] bg-background-page p-4"><h1 className="mb-3 text-lg font-semibold text-foreground-neutral">VibeSearch</h1><LocalSavePanel /><p className="text-xs text-foreground-secondary">Local-only mode is selected. Your browser library and account are preserved. You can switch back in the local library.</p><button type="button" className="mt-3 text-sm underline" onClick={() => void chrome.tabs.create({ url: chrome.runtime.getURL(LOCAL_LIBRARY_PATH) })}>Search and manage local saves</button></div>;
+  }
   if (mode === "import") {
     return <ImportEditor requestedDraftId={draftId} />;
   }
 
-  return <SaveTabsPopup />;
+  return <><SaveTabsPopup /><div className="w-[340px] bg-background-page px-4 pb-3"><button type="button" className="text-xs text-foreground-secondary hover:text-foreground-neutral" onClick={() => void chrome.tabs.create({ url: chrome.runtime.getURL(LOCAL_LIBRARY_PATH) })}>Desktop companion</button></div></>;
 };
 
 export default Popup;

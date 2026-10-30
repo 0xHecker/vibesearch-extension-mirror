@@ -1,4 +1,7 @@
+import { EXTENSION_POLICY_KEY, legacyBrowserEnabled } from "@src/services/extension-policy";
+import { LOCAL_LIBRARY_PATH } from "@src/services/local-companion-protocol";
 import { OPEN_ON_NEW_TAB_STORAGE_KEY } from "@src/common/new-tab-pref";
+import { LOCAL_COMPANION_RETRY_ALARM } from "@src/services/local-companion-outbox";
 import { PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { retryStoredFailedMetadataUrls } from "@src/services/metadata-pipeline";
 import { setupOffscreenDocument } from "@src/services/offscreen-helper";
@@ -54,29 +57,39 @@ type BackgroundLifecycleDependencies = {
 export const registerBackgroundLifecycle = (
   dependencies: BackgroundLifecycleDependencies,
 ): void => {
+  const reconcileModeAlarms = async () => {
+    if (await legacyBrowserEnabled()) {
+      const existing = new Set((await chrome.alarms.getAll()).map(alarm => alarm.name));
+      const schedules: [string, number][] = [
+        [SYNC_ALARM_NAME, 6 * 60], [EMBEDDING_ALARM_NAME, 5],
+        [CLOUD_SYNC_ALARM_NAME, 15], [METADATA_RETRY_ALARM_NAME, 30],
+        [ARCHIVE_OUTBOX_ALARM_NAME, 10], ["opfs-promote-alarm", 30],
+      ];
+      await Promise.all(schedules.filter(([name]) => !existing.has(name)).map(([name, periodInMinutes]) => chrome.alarms.create(name, { periodInMinutes })));
+      if (!existing.has(CONNECTOR_SYNC_ALARM)) await setupConnectorScheduler();
+      return;
+    }
+    const names = [SYNC_ALARM_NAME, CLOUD_SYNC_ALARM_NAME, EMBEDDING_ALARM_NAME, METADATA_RETRY_ALARM_NAME, ARCHIVE_OUTBOX_ALARM_NAME, ARCHIVE_OUTBOX_RETRY_ALARM_NAME, CLOUD_SYNC_CONTINUATION_ALARM_NAME, CONNECTOR_SYNC_ALARM, CONNECTOR_CONTINUATION_ALARM, "opfs-promote-alarm", OPFS_MEDIA_RECONCILE_CONTINUATION_ALARM_NAME, BROWSER_BOOKMARK_RESYNC_ALARM_NAME];
+    await Promise.all(names.map(name => chrome.alarms.clear(name)));
+  };
+  void reconcileModeAlarms().catch(() => {});
   chrome.runtime.onInstalled.addListener((details) => {
-    chrome.alarms.create(SYNC_ALARM_NAME, { periodInMinutes: 6 * 60 });
-    chrome.alarms.create(CLOUD_SYNC_ALARM_NAME, { periodInMinutes: 15 });
-    chrome.alarms.create(EMBEDDING_ALARM_NAME, { periodInMinutes: 5 });
-    chrome.alarms.create(METADATA_RETRY_ALARM_NAME, { periodInMinutes: 30 });
-    void setupConnectorScheduler();
-    chrome.alarms.create(ARCHIVE_OUTBOX_ALARM_NAME, { periodInMinutes: 10 });
-    void retryStoredFailedMetadataUrls().catch(() => {});
-    void retryPendingLocalMetadataUrls().catch(() => {});
-    if (details.reason !== "install")
-      dependencies.requestBrowserBookmarkResync();
-    scheduleContextMenuRefresh("high");
+    void (async () => {
+      await reconcileModeAlarms();
+      if (!await legacyBrowserEnabled()) { scheduleContextMenuRefresh("high"); return; }
+      void retryStoredFailedMetadataUrls().catch(() => {});
+      void retryPendingLocalMetadataUrls().catch(() => {});
+      if (details.reason !== "install") dependencies.requestBrowserBookmarkResync();
+      scheduleContextMenuRefresh("high");
+    })().catch(() => {});
   });
 
   chrome.runtime.onStartup.addListener(() => {
     void (async () => {
+      if (!await legacyBrowserEnabled()) return;
       if (await dependencies.recoverInterruptedLocalDataReset()) return;
       await setupOffscreenDocument();
-      await chrome.runtime.sendMessage({
-        type: "TRIGGER_EMBEDDING",
-        target: "offscreen",
-        isForwarded: true,
-      });
+      await chrome.runtime.sendMessage({ type: "TRIGGER_EMBEDDING", target: "offscreen", isForwarded: true });
       await retryStoredFailedMetadataUrls();
       await retryPendingLocalMetadataUrls();
       await triggerCloudSync();
@@ -90,43 +103,36 @@ export const registerBackgroundLifecycle = (
   });
 
   const onBrowserBookmarkMutation = () => {
-    dependencies.requestBrowserBookmarkResync();
+    void legacyBrowserEnabled().then(enabled => { if (enabled) dependencies.requestBrowserBookmarkResync(); });
   };
 
   registerBrowserBookmarkEvents({
     onMutation: onBrowserBookmarkMutation,
     onImportBegan: () => {
-      void dependencies.onBrowserBookmarkImportBegan();
+      void legacyBrowserEnabled().then(enabled => { if (enabled) return dependencies.onBrowserBookmarkImportBegan(); });
     },
     onImportEnded: () => {
-      void dependencies.onBrowserBookmarkImportEnded();
+      void legacyBrowserEnabled().then(enabled => { if (enabled) return dependencies.onBrowserBookmarkImportEnded(); });
     },
   });
 
   chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === LOCAL_COMPANION_RETRY_ALARM) return;
     void (async () => {
+      if (!await legacyBrowserEnabled()) { await chrome.alarms.clear(alarm.name); return; }
       if (alarm.name === BROWSER_BOOKMARK_RESYNC_ALARM_NAME) {
         await dependencies.onBrowserBookmarkResyncAlarm();
         return;
       }
       await setupOffscreenDocument();
       if (alarm.name === SYNC_ALARM_NAME) {
-        await chrome.runtime.sendMessage({
-          service: "sync",
-          type: "rebuildAndCompact",
-          target: "offscreen",
-          isForwarded: true,
-        });
+        await chrome.runtime.sendMessage({ service: "sync", type: "rebuildAndCompact", target: "offscreen", isForwarded: true });
+      } else if (alarm.name === EMBEDDING_ALARM_NAME) {
+        await chrome.runtime.sendMessage({ type: "TRIGGER_EMBEDDING", target: "offscreen", isForwarded: true });
       } else if (alarm.name === CLOUD_SYNC_ALARM_NAME) {
         await triggerCloudSync();
       } else if (alarm.name === CLOUD_SYNC_CONTINUATION_ALARM_NAME) {
         await triggerCloudSync();
-      } else if (alarm.name === EMBEDDING_ALARM_NAME) {
-        await chrome.runtime.sendMessage({
-          type: "TRIGGER_EMBEDDING",
-          target: "offscreen",
-          isForwarded: true,
-        });
       } else if (alarm.name === METADATA_RETRY_ALARM_NAME) {
         await retryStoredFailedMetadataUrls();
         await retryPendingLocalMetadataUrls();
@@ -157,6 +163,7 @@ export const registerBackgroundLifecycle = (
   // takes precedence over every sync/import path and is completed before any of
   // them are allowed to start.
   void (async () => {
+    if (!await legacyBrowserEnabled()) return;
     if (await dependencies.recoverInterruptedLocalDataReset()) return;
     void triggerOpfsPromotion();
     void triggerCloudSync();
@@ -174,15 +181,25 @@ export const registerBackgroundLifecycle = (
 
   // Service workers receive the same online event through their global scope.
   globalThis.addEventListener("online", () => {
-    void triggerOpfsPromotion();
-    void triggerCloudSync();
-    void triggerArchiveOutboxDrain();
+    void legacyBrowserEnabled().then(enabled => { if (enabled) { void triggerOpfsPromotion(); void triggerCloudSync(); void triggerArchiveOutboxDrain(); } });
   });
 
-  chrome.alarms.create("opfs-promote-alarm", { periodInMinutes: 30 });
-  chrome.alarms.create(ARCHIVE_OUTBOX_ALARM_NAME, { periodInMinutes: 10 });
-
   chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === "local" && changes[EXTENSION_POLICY_KEY]) {
+      void (async () => {
+        await reconcileModeAlarms();
+        scheduleContextMenuRefresh("high");
+        if (!await legacyBrowserEnabled()) return;
+        if (await dependencies.recoverInterruptedLocalDataReset()) return;
+        await setupOffscreenDocument();
+        await chrome.runtime.sendMessage({ type: "TRIGGER_EMBEDDING", target: "offscreen", isForwarded: true });
+        await retryStoredFailedMetadataUrls();
+        await retryPendingLocalMetadataUrls();
+        await triggerCloudSync();
+        await triggerArchiveOutboxDrain();
+        dependencies.requestBrowserBookmarkResync();
+      })().catch(() => {});
+    }
     if (areaName === "local" && changes[CLOUD_SYNC_TOKEN_KEY]?.newValue) {
       void triggerArchiveOutboxDrain();
     }
@@ -203,9 +220,7 @@ export const registerBackgroundLifecycle = (
       if (tabId === undefined) return;
       chrome.storage.local.get(OPEN_ON_NEW_TAB_STORAGE_KEY, (result) => {
         if (result?.[OPEN_ON_NEW_TAB_STORAGE_KEY] !== true) return;
-        void chrome.tabs.update(tabId, {
-          url: chrome.runtime.getURL("src/pages/search/index.html"),
-        });
+        void legacyBrowserEnabled().then(legacy => chrome.tabs.update(tabId, { url: chrome.runtime.getURL(legacy ? "src/pages/search/index.html" : LOCAL_LIBRARY_PATH) }));
       });
     } catch {}
   });

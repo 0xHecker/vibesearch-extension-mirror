@@ -33,6 +33,7 @@ const firefoxConfig = defineConfig({
     assetsInlineLimit: 0,
     rollupOptions: {
       input: {
+        local: resolve(__dirname, "src/pages/local/index.html"),
         search: resolve(__dirname, "src/pages/search/index.html"),
         offscreen: resolve(__dirname, "src/pages/offscreen/offscreen.html"),
       },
@@ -44,7 +45,7 @@ const firefoxConfig = defineConfig({
   resolve: {
     // Firefox MV3 does not implement Chrome's manifest sandbox pages. Replace
     // the unsafe-eval PaddleOCR implementation so the Gecko package remains
-    // loadable and AMO-reviewable; local semantic embeddings remain enabled.
+    // loadable and AMO-reviewable.
     alias: [
       {
         // The app never enables FlexSearch's optional nested worker. Its compact

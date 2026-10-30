@@ -1,4 +1,6 @@
 import { PUBLIC_SPACE_ID } from "@src/common/spaces";
+import { legacyBrowserEnabled } from "@src/services/extension-policy";
+import { saveLocalContext, saveLocalScreenshot } from "./local-companion";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { scheduleForProcessing } from "@src/services/metadata-pipeline";
@@ -278,11 +280,18 @@ const runImportActionImpl = async (
   );
 };
 
-export const runImportAction = (
+export const runImportAction = async (
   target: ImportTarget,
   context: ImportClickContext,
   tab?: chrome.tabs.Tab,
-) => runBackgroundDataJob(() => runImportActionImpl(target, context, tab));
+) => {
+  if (!await legacyBrowserEnabled()) {
+    const saved = await saveLocalContext(context, tab);
+    await showBrandedToast(tab, saved.state === "saved" ? "Saved to your local library." : "Capture preserved in your local queue.");
+    return;
+  }
+  return runBackgroundDataJob(() => runImportActionImpl(target, context, tab));
+};
 
 // Re-file an already-saved item into a folder chosen from the post-save picker.
 // The item was saved immediately, so this is an optional correction — it never
@@ -573,11 +582,19 @@ const runScreenshotActionImpl = async (
   );
 };
 
-export const runScreenshotAction = (
+export const runScreenshotAction = async (
   target: ImportTarget,
   context: ImportClickContext,
   tab?: chrome.tabs.Tab,
-) => runBackgroundDataJob(() => runScreenshotActionImpl(target, context, tab));
+) => {
+  if (!await legacyBrowserEnabled()) {
+    if (tab?.id === undefined) throw new Error("LOCAL_PAGE_UNAVAILABLE");
+    const saved = await saveLocalScreenshot(tab.id, target.screenshotMode ?? "visible");
+    await showBrandedToast(tab, saved.state === "saved" ? "Screenshot saved to your local library." : "Screenshot preserved in your local queue.");
+    return;
+  }
+  return runBackgroundDataJob(() => runScreenshotActionImpl(target, context, tab));
+};
 
 export const finalizeScreenshotSave = async (
   pendingId: string,
@@ -707,6 +724,11 @@ export const runArchiveSnapshotAction = async (
   context: ImportClickContext,
   tab?: chrome.tabs.Tab,
 ): Promise<void> => {
+  if (!await legacyBrowserEnabled()) {
+    const saved = await saveLocalContext(context, tab);
+    await showBrandedToast(tab, saved.state === "saved" ? "Page text saved to your local library." : "Page text preserved in your local queue.");
+    return;
+  }
   const job = {
     id: `archive-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     label: `Archive • ${pickHostLabel(context)}`,
@@ -791,6 +813,12 @@ export const runTargetAction = async (
   context: ImportClickContext,
   tab?: chrome.tabs.Tab,
 ) => {
+  if (!await legacyBrowserEnabled()) {
+    if (target.mode === "shot") return runScreenshotAction(target, context, tab);
+    const saved = await saveLocalContext(context, tab);
+    await showBrandedToast(tab, saved.state === "saved" ? "Saved to your local library." : "Capture preserved in your local queue.");
+    return;
+  }
   if (target.mode === "shot") {
     await runScreenshotAction(target, context, tab);
     return;

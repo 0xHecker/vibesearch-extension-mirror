@@ -1,3 +1,4 @@
+import { importLegacyToCompanion } from "@src/services/local-companion-migration";
 import type { JsonValue } from "@src/common/json-value";
 import { binController } from "@src/services/controllers/bin.controller";
 import { foldersController } from "@src/services/controllers/folders.controller";
@@ -7,6 +8,7 @@ import { spacesController } from "@src/services/controllers/spaces.controller";
 import { tagsController } from "@src/services/controllers/tags.controller";
 import { browserBookmarkImportService } from "@src/services/browser-bookmark-import";
 import { cloudAuthService } from "@src/services/cloud-auth";
+import { createCloudAuthAuthority } from "@src/services/cloud-auth-authority";
 import {
   clearCloudPullState,
   cloudSyncService,
@@ -112,6 +114,7 @@ function createCloudControllers() {
   };
 
   const cloudAuth = {
+    ...createCloudAuthAuthority(),
     async status(payload: JsonValue | undefined) {
       return cloudAuthService.status(
         authStatusSchema.parse(payloadOrEmpty(payload)),
@@ -143,6 +146,7 @@ export function registerOffscreenServices(
   changes: DatabaseChangePublisher,
 ): OffscreenRouter {
   const router = new OffscreenRouter();
+  router.registerService("companionMigration", { importBatch: importLegacyToCompanion }, { methods: ["importBatch"] });
   const imports = createImportControllers(changes);
   const cloud = createCloudControllers();
 
@@ -185,7 +189,7 @@ export function registerOffscreenServices(
     ],
   });
   router.registerService("cloudAuth", cloud.cloudAuth, {
-    methods: ["status", "connect", "disconnect"],
+    methods: ["status", "connect", "disconnect", "connection", "validateConnection", "rejectConnection"],
   });
   router.registerService("sync", syncService, {
     methods: ["rebuildAndCompact"],

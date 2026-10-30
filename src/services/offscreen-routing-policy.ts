@@ -14,6 +14,7 @@ const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
 ]);
 
 const INTERNAL_ONLY_OFFSCREEN_METHODS = new Set<string>([
+  "companionMigration:importBatch",
   "items:saveFetchedMetadata",
   "items:findLiveByUrls",
   "cloudSync:syncAll",

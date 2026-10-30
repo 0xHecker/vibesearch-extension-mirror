@@ -1,3 +1,6 @@
+import "@src/workers/background/local-companion";
+import { EXTENSION_POLICY_KEY, EXTENSION_POLICY_READ_MESSAGE, legacyBrowserEnabled, parseExtensionPolicy } from "@src/services/extension-policy";
+import { LOCAL_LIBRARY_PATH } from "@src/services/local-companion-protocol";
 import { z } from "zod";
 import { scheduleForProcessing } from "@src/services/metadata-pipeline";
 import { setupOffscreenDocument } from "@src/services/offscreen-helper";
@@ -14,6 +17,7 @@ import {
   isCloudAuthStorageBridgeSender,
 } from "@src/services/cloud-auth-storage-bridge";
 import type { CloudAuthStatus } from "@src/services/cloud-auth";
+import { OFFSCREEN_STORAGE_BRIDGE_MESSAGE, handleOffscreenStorageBridge } from "@src/services/offscreen-storage-bridge";
 import {
   cancelConnectorSync,
   connect as connectConnector,
@@ -206,6 +210,29 @@ registerBackgroundLifecycle({
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.target === "background" && message?.type === OFFSCREEN_STORAGE_BRIDGE_MESSAGE) {
+    if (!isCloudAuthStorageBridgeSender(sender, chrome.runtime.id, chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH))) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void handleOffscreenStorageBridge(message.payload)
+      .then(payload => sendResponse({ success: true, payload }))
+      .catch(error => sendResponse({ success: false, error: error instanceof Error ? error.message : "Offscreen storage bridge failed" }));
+    return true;
+  }
+  if (message?.target === "background" && message?.type === EXTENSION_POLICY_READ_MESSAGE) {
+    if (!isCloudAuthStorageBridgeSender(sender, chrome.runtime.id, chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH))) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void (async () => {
+      const row = await chrome.storage.local.get(EXTENSION_POLICY_KEY);
+      return parseExtensionPolicy(row[EXTENSION_POLICY_KEY]);
+    })().then(payload => sendResponse({ success: true, payload })).catch(error => sendResponse({
+      success: false, error: error instanceof Error ? error.message : "Extension policy read failed",
+    }));
+    return true;
+  }
   if (
     message?.target === "background" &&
     message?.type === CLOUD_AUTH_STORAGE_BRIDGE_MESSAGE
@@ -439,9 +466,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (request.target === "background" && request.type === "OPEN_SEARCH") {
-    void chrome.tabs.create({
-      url: chrome.runtime.getURL("src/pages/search/index.html"),
-    });
+    void legacyBrowserEnabled().then(legacy => chrome.tabs.create({ url: chrome.runtime.getURL(legacy ? "src/pages/search/index.html" : LOCAL_LIBRARY_PATH) }));
     return;
   }
 

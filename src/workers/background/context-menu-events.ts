@@ -1,4 +1,6 @@
 import { PUBLIC_SPACE_ID } from "@src/common/spaces";
+import { legacyBrowserEnabled } from "@src/services/extension-policy";
+import { LOCAL_LIBRARY_PATH } from "@src/services/local-companion-protocol";
 import {
   MENU_EXTRACT_TEXT_ID,
   MENU_IMPORT_SHARED_ID,
@@ -43,7 +45,7 @@ export const registerContextMenuEvents = (): void => {
       const menuId = String(info.menuItemId);
       if (menuId === MENU_OPEN_SEARCH_ID) {
         await chrome.tabs.create({
-          url: chrome.runtime.getURL("src/pages/search/index.html"),
+          url: chrome.runtime.getURL(await legacyBrowserEnabled() ? "src/pages/search/index.html" : LOCAL_LIBRARY_PATH),
         });
         return;
       }

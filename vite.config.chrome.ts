@@ -36,6 +36,7 @@ const chromeConfig = defineConfig({
     assetsInlineLimit: 0,
     rollupOptions: {
       input: {
+        local: resolve(__dirname, "src/pages/local/index.html"),
         search: resolve(__dirname, "src/pages/search/index.html"),
         offscreen: resolve(__dirname, "src/pages/offscreen/offscreen.html"),
         ocrSandbox: resolve(__dirname, "src/pages/ocr-sandbox/index.html"),
