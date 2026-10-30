@@ -1,4 +1,5 @@
 import { EmbeddingWorkerClient } from "./embedding-worker-client";
+import { requireLegacyBrowser } from "./extension-policy";
 import type { EmbeddingRequestPriority } from "./workers/embedding-worker-protocol";
 
 class EmbeddingService {
@@ -9,6 +10,7 @@ class EmbeddingService {
     priority?: EmbeddingRequestPriority;
     signal?: AbortSignal;
   }): Promise<Float32Array> => {
+    await requireLegacyBrowser();
     return this.worker.embed(payload.sentences, payload.priority || "background", payload.signal);
   };
 }

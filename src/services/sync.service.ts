@@ -1,3 +1,4 @@
+import { requireLegacyBrowser } from "./extension-policy";
 import { databaseManager } from "./db-manager";
 import {
   isVectorStoreIntegrityError,
@@ -168,6 +169,7 @@ class SyncService {
    * replaces the old one only upon successful completion, preventing data loss.
    */
   public async rebuildAndCompact(options?: { reembedMissing?: boolean }) {
+    await requireLegacyBrowser();
     if (this.isSyncing) {
       console.log("Sync already in progress. Skipping.");
       sendProcessStatus({

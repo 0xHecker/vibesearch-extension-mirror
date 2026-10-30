@@ -1,3 +1,4 @@
+import { requireLegacyBrowser } from "@src/services/extension-policy";
 import type { OcrResultItem } from "@paddleocr/paddleocr-js";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { readOpfsFile } from "@src/services/media-storage";
@@ -100,6 +101,7 @@ const isLikelyDirectFetchable = (value: string): boolean => {
     const hostname = new URL(value).hostname.toLowerCase();
     return (
       hostname === "metadata-worker.watermelons.workers.dev" ||
+      hostname === "metadata-worker.shanmukh6789op.workers.dev" ||
       hostname === "bucket.vibesearch.app" ||
       hostname === "preview-bucket.vibesearch.app"
     );
@@ -360,6 +362,7 @@ export class OcrSandboxClient {
   }
 
   public async prepare(): Promise<void> {
+    await requireLegacyBrowser();
     await this.ensureReady();
   }
 
@@ -522,6 +525,7 @@ export class OcrService {
    * re-downloads the models without an extension reload.
    */
   public async ensureModelsCached(): Promise<void> {
+    await requireLegacyBrowser();
     if (typeof caches === "undefined") return;
     await this.prefetchModelAssets();
   }
@@ -752,12 +756,14 @@ export class OcrService {
   }
 
   public async processItem(item: ItemDocType): Promise<ItemOcrResult> {
+    await requireLegacyBrowser();
     const candidates = this.getImageCandidates(item);
     const sourceHash = this.getSourceHashForCandidates(candidates);
     return this.withActiveOperation(() => this.processCandidates(candidates, sourceHash));
   }
 
   public async processImageUrl(url: string): Promise<ItemOcrResult> {
+    await requireLegacyBrowser();
     const trimmed = (url || "").trim();
     const candidates: ImageCandidate[] = isHttpUrl(trimmed)
       ? [{ url: trimmed, source: "original", capturedAt: Date.now() }]

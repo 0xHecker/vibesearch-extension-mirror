@@ -10,6 +10,7 @@ import type {
   RankableItem,
 } from "@src/search-core/contracts";
 import { resolveEffectiveQueryChannels } from "@src/search-core/contracts";
+import { legacyBrowserEnabled } from "@src/services/extension-policy";
 import {
   deleteItem,
   deleteItemForever,
@@ -318,6 +319,7 @@ export class ItemsController {
         },
         query: this.resolveVectorQueryText(payload),
         vectorMinChars: VECTOR_QUERY_MIN_CHARS,
+        vectorAvailable: await legacyBrowserEnabled(),
       });
       if (requestedChannels.vector) {
         vectorQueryLease = await this.vectorStore.acquireQueryLease(searchSignal);

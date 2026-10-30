@@ -1,4 +1,5 @@
 import { OCR_SUPPORTED } from "@src/services/ocr.service";
+import { requireLegacyBrowser } from "@src/services/extension-policy";
 import { z } from "zod";
 import { isTrustedForwarderSender } from "./message-security";
 import type { ProcessingQueues } from "./processing-queues";
@@ -30,31 +31,35 @@ export function listenForProcessingTriggers(queues: ProcessingQueues): void {
       return true;
     }
 
-    if (parsed.data.type === "TRIGGER_EMBEDDING") {
-      console.log("[Offscreen] Received TRIGGER_EMBEDDING message");
-      queues.embedding.trigger();
-      sendResponse({ success: true });
-      return true;
-    }
+    void requireLegacyBrowser().then(() => {
+      if (parsed.data.type === "TRIGGER_EMBEDDING") {
+        console.log("[Offscreen] Received TRIGGER_EMBEDDING message");
+        queues.embedding.trigger();
+        sendResponse({ success: true });
+        return;
+      }
 
-    if (!OCR_SUPPORTED) {
-      sendResponse({
-        success: false,
-        error: "Local image OCR is unavailable in this browser build.",
-      });
-      return true;
-    }
+      if (!OCR_SUPPORTED) {
+        sendResponse({
+          success: false,
+          error: "Local image OCR is unavailable in this browser build.",
+        });
+        return;
+      }
 
-    const { itemId = "", force = false } = parsed.data.payload ?? {};
-    if (itemId) {
-      queues.ocr.enqueue(itemId, force);
+      const { itemId = "", force = false } = parsed.data.payload ?? {};
+      if (itemId) {
+        queues.ocr.enqueue(itemId, force);
+        queues.ocr.trigger();
+        sendResponse({ success: true, payload: { status: "queued" } });
+        return;
+      }
+
       queues.ocr.trigger();
-      sendResponse({ success: true, payload: { status: "queued" } });
-      return true;
-    }
-
-    queues.ocr.trigger();
-    sendResponse({ success: true });
+      sendResponse({ success: true });
+    }).catch(error => {
+      sendResponse({ success: false, error: error instanceof Error ? error.message : "Processing trigger failed." });
+    });
     return true;
   });
 }

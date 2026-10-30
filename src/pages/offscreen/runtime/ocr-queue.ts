@@ -1,3 +1,4 @@
+import { legacyBrowserEnabled } from "@src/services/extension-policy";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { getDb } from "@src/services/DatabaseService";
 import { databaseManager } from "@src/services/db-manager";
@@ -40,22 +41,29 @@ export class OcrQueue {
 
   trigger(): void {
     if (!OCR_SUPPORTED) return;
-    if (this.running) {
-      this.rerunRequested = true;
-      return;
-    }
-    window.setTimeout(() => void this.process(), 500);
+    void legacyBrowserEnabled().then(enabled => {
+      if (!enabled) return;
+      if (this.running) {
+        this.rerunRequested = true;
+        return;
+      }
+      window.setTimeout(() => void this.process(), 500);
+    });
   }
 
   scheduleIfNeeded(): void {
-    if (!OCR_SUPPORTED || this.backlogCheckTimer !== null) return;
-    this.backlogCheckTimer = window.setTimeout(() => {
-      this.backlogCheckTimer = null;
-      void this.triggerWhenBacklogExists();
-    }, 1_000);
+    if (!OCR_SUPPORTED) return;
+    void legacyBrowserEnabled().then(enabled => {
+      if (!enabled || this.backlogCheckTimer !== null) return;
+      this.backlogCheckTimer = window.setTimeout(() => {
+        this.backlogCheckTimer = null;
+        void this.triggerWhenBacklogExists();
+      }, 1_000);
+    });
   }
 
   private async process(): Promise<void> {
+    if (!await legacyBrowserEnabled()) return;
     if (this.running) {
       this.rerunRequested = true;
       return;
@@ -280,6 +288,7 @@ export class OcrQueue {
   }
 
   private async triggerWhenBacklogExists(): Promise<void> {
+    if (!await legacyBrowserEnabled()) return;
     try {
       const items = await this.findBacklogItems(1);
       if (items.length > 0) this.trigger();

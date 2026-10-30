@@ -1,3 +1,4 @@
+import { legacyCloudEnabled } from "@src/services/extension-policy";
 import { z } from "zod";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import {
@@ -25,6 +26,7 @@ type OpfsMediaPromotionPage = {
 };
 
 const promoteOpfsMediaToR2 = async (): Promise<void> => {
+  if (!await legacyCloudEnabled()) return;
   if (!isOnline()) return;
   let afterId = "";
   const cleanupBatch = new BoundedOpfsCleanupBatch(

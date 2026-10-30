@@ -11,6 +11,7 @@ import { MAX_GRID_QUERY_LIMIT, splitLookaheadPage } from "@src/search-core/pagin
 import type { MyDatabase } from "@src/services/DatabaseService";
 import { applyItemQueryFilters } from "@src/services/items/query-filters";
 import { buildItemQuerySelector } from "@src/services/items/query-selector";
+import { legacyBrowserEnabled } from "@src/services/extension-policy";
 import {
   type CandidateDocument,
   type QueryHashInput,
@@ -134,6 +135,7 @@ export async function runLocalQueryWithVectorLease(
       },
       query: vectorQuery,
       vectorMinChars: VECTOR_QUERY_MIN_CHARS,
+      vectorAvailable: await legacyBrowserEnabled(),
     });
     const useKeyword = effectiveChannels.keyword;
     const useFuzzy = effectiveChannels.fuzzy;

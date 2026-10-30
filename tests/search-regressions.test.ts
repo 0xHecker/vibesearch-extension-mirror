@@ -56,6 +56,15 @@ describe("search regressions", () => {
     ).toEqual({ keyword: false, fuzzy: false, vector: true });
   });
 
+  test("uses keyword fallback when vector processing is unavailable", () => {
+    expect(resolveEffectiveQueryChannels({
+      requested: { keyword: false, fuzzy: false, vector: true },
+      query: "agents",
+      vectorMinChars: 3,
+      vectorAvailable: false,
+    })).toEqual({ keyword: true, fuzzy: false, vector: false });
+  });
+
   test("does not acquire a vector lease for the short-query keyword fallback", async () => {
     const controller = new ItemsController() as any;
     let leaseAttempts = 0;

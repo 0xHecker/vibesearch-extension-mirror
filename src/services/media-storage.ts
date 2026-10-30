@@ -1,3 +1,4 @@
+import { requireLegacyCloud } from "./extension-policy";
 import type { ItemDocType } from "@src/schemas/item_schema";
 
 const MEDIA_DIR = "media";
@@ -268,7 +269,7 @@ export const canAddMedia = (
 
 // --- R2 promotion ---
 
-const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
+const METADATA_WORKER_BASE_URL = "https://metadata-worker.shanmukh6789op.workers.dev";
 const IMPORT_MEDIA_ENDPOINT = `${METADATA_WORKER_BASE_URL}/import-media`;
 const IMPORT_MEDIA_UPLOAD_TOKEN = import.meta.env.VITE_IMPORT_MEDIA_UPLOAD_TOKEN?.trim() || "";
 const IMPORT_MEDIA_UPLOAD_RETRIES = 2;
@@ -304,6 +305,7 @@ const describeUploadError = (error: unknown): string => {
 };
 
 const fetchWithTimeout = async (endpoint: string, init: RequestInit): Promise<Response> => {
+  await requireLegacyCloud();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IMPORT_MEDIA_UPLOAD_TIMEOUT_MS);
   try {

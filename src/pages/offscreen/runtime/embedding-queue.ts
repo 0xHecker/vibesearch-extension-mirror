@@ -8,12 +8,14 @@ import type { BulkItemUpdate } from "@src/services/database/item-writes";
 import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordinator";
 import { vectorStoreService } from "@src/services/vector-store.service";
 import { z } from "zod";
+import { legacyBrowserEnabled, requireLegacyBrowser } from "@src/services/extension-policy";
+import {
+  EMBEDDING_STATE_REPAIR_KEY, EMBEDDING_TEXT_VERSION_KEY, runtimeOffscreenStorage,
+} from "@src/services/offscreen-storage-bridge";
 import { sendProcessStatus, sendStatusUpdate } from "./process-status";
 
 const EMBEDDING_BATCH_SIZE = 20;
 const MAX_SENTENCES_PER_WORKER_REQUEST = 16;
-const EMBEDDING_TEXT_VERSION_KEY = "vibe.search.embeddingTextVersion";
-const EMBEDDING_STATE_REPAIR_KEY = "vibe.search.embeddingStateRepairVersion";
 const EMBEDDING_STATE_REPAIR_VERSION = "v2-vector-bounds";
 const storedStringSchema = z.string();
 
@@ -59,28 +61,34 @@ export class EmbeddingQueue {
   }
 
   async prepare(): Promise<void> {
+    if (!await legacyBrowserEnabled()) return;
     await this.ensureTextVersion();
     await this.ensureVectorReferences();
   }
 
   trigger(): void {
-    if (this.running) {
-      this.rerunRequested = true;
-      return;
-    }
-    window.setTimeout(() => void this.process(), 200);
+    void legacyBrowserEnabled().then(enabled => {
+      if (!enabled) return;
+      if (this.running) {
+        this.rerunRequested = true;
+        return;
+      }
+      window.setTimeout(() => void this.process(), 200);
+    });
   }
 
   scheduleIfNeeded(): void {
-    if (this.backlogCheckTimer !== null) return;
-
-    this.backlogCheckTimer = window.setTimeout(() => {
-      this.backlogCheckTimer = null;
-      void this.triggerWhenBacklogExists();
-    }, 250);
+    void legacyBrowserEnabled().then(enabled => {
+      if (!enabled || this.backlogCheckTimer !== null) return;
+      this.backlogCheckTimer = window.setTimeout(() => {
+        this.backlogCheckTimer = null;
+        void this.triggerWhenBacklogExists();
+      }, 250);
+    });
   }
 
   async process(): Promise<void> {
+    if (!await legacyBrowserEnabled()) return;
     if (this.running) {
       this.rerunRequested = true;
       return;
@@ -201,6 +209,7 @@ export class EmbeddingQueue {
   }
 
   private async runBatch(batch: EmbeddingBatchItem[]): Promise<number> {
+    await requireLegacyBrowser();
     this.reportCompactionWait();
 
     return vectorPipelineCoordinator.runExclusive("embedding", async () => {
@@ -266,6 +275,7 @@ export class EmbeddingQueue {
   }
 
   private async triggerWhenBacklogExists(): Promise<void> {
+    if (!await legacyBrowserEnabled()) return;
     try {
       const [newItems, dirtyItems] = await Promise.all([
         databaseManager.getItemsToEmbed({ limit: 1 }),
@@ -375,12 +385,12 @@ export class EmbeddingQueue {
   }
 
   private async readStoredString(key: string): Promise<string> {
-    const values = await chrome.storage.local.get(key);
+    const values = await runtimeOffscreenStorage.get(key);
     const value = storedStringSchema.safeParse(values[key]);
     return value.success ? value.data : "";
   }
 
   private async writeStoredString(key: string, value: string): Promise<void> {
-    await chrome.storage.local.set({ [key]: value });
+    await runtimeOffscreenStorage.set(key, value);
   }
 }

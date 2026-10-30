@@ -139,9 +139,10 @@ export const resolveEffectiveQueryChannels = (input: {
   requested: QueryModeFeatures;
   query: string;
   vectorMinChars: number;
+  vectorAvailable?: boolean;
 }): QueryModeFeatures => {
   const queryLength = input.query.trim().length;
-  const vector = input.requested.vector && queryLength >= input.vectorMinChars;
+  const vector = input.vectorAvailable !== false && input.requested.vector && queryLength >= input.vectorMinChars;
   const fuzzy = input.requested.fuzzy;
   const needsKeywordFallback =
     queryLength > 0 && !input.requested.keyword && !fuzzy && !vector;

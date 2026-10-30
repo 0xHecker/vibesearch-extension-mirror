@@ -1,4 +1,5 @@
 import { getDb } from "@src/services/DatabaseService";
+import { legacyBrowserEnabled } from "@src/services/extension-policy";
 import { spacesController } from "@src/services/controllers/spaces.controller";
 import { queryRankerService } from "@src/services/query-ranker.service";
 import { syncService } from "@src/services/sync.service";
@@ -10,6 +11,7 @@ import { sendProcessStatus, sendStatusUpdate } from "./process-status";
 const BIN_PURGE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 
 async function purgeExpiredSpaces(): Promise<void> {
+  if (!await legacyBrowserEnabled()) return;
   try {
     const purge = await spacesController.purgeExpired();
     if (purge.purgedSpaceIds.length > 0) {
@@ -27,7 +29,8 @@ export async function initializeOffscreen(
   queues: ProcessingQueues,
 ): Promise<void> {
   try {
-    queryRankerService.prewarm();
+    const legacy = await legacyBrowserEnabled();
+    if (legacy) queryRankerService.prewarm();
     sendStatusUpdate("Initializing database...");
     sendProcessStatus({
       id: "offscreen-runtime",
@@ -38,21 +41,25 @@ export async function initializeOffscreen(
 
     const db = await getDb();
     await spacesController.ensureDefaults();
-    await spacesController.maybeRepairFolderAndItemSpaceAssignments();
+    if (legacy) await spacesController.maybeRepairFolderAndItemSpaceAssignments();
     await purgeExpiredSpaces();
     sendStatusUpdate("Database initialized.");
     console.log("[Offscreen] Database ready.");
 
-    await syncService.recoverInterruptedMaintenance();
-    await queues.embedding.prepare();
-    await queues.embedding.process();
-    queues.ocr.scheduleIfNeeded();
+    if (legacy) {
+      await syncService.recoverInterruptedMaintenance();
+      await queues.embedding.prepare();
+      await queues.embedding.process();
+      queues.ocr.scheduleIfNeeded();
+    }
 
     subscribeToDatabaseChanges(db, changes, queues);
     window.setInterval(() => void purgeExpiredSpaces(), BIN_PURGE_INTERVAL_MS);
 
     console.log(
-      "[Offscreen] Initialization complete with auto-embedding enabled.",
+      legacy
+        ? "[Offscreen] Initialization complete with auto-embedding enabled."
+        : "[Offscreen] Initialization complete in local-only mode.",
     );
     sendProcessStatus({
       id: "offscreen-runtime",

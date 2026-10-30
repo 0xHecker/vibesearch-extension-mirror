@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { requireLegacyBrowser } from "@src/services/extension-policy";
 import { setupOffscreenDocument } from "@src/services/offscreen-helper";
 
 export type ProcessingTriggerType = "TRIGGER_EMBEDDING" | "TRIGGER_OCR";
@@ -22,6 +23,7 @@ export const forwardProcessingTriggerToOffscreen = async (
   type: ProcessingTriggerType,
   payload?: ProcessingTriggerPayload,
 ): Promise<void> => {
+  await requireLegacyBrowser();
   await setupOffscreenDocument();
   const rawResponse = await chrome.runtime.sendMessage({
     type,
